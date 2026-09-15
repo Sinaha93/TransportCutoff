@@ -23,8 +23,14 @@ DEFAULT_TOTAL_RULES: Final = {
     "당진": {"quantity": False, "cost": True, "sales": False}
 }
 
-_MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
-_UNSET = object()
+_MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+
+
+class _UnsetType:
+    __slots__ = ()
+
+
+_UNSET = _UnsetType()
 
 
 class MasterDataError(Exception):
@@ -69,6 +75,15 @@ class MasterRepository:
     ) -> Destination:
         clean_name = _clean_text(name, "destination name")
         _validate_display_order(display_order)
+        _validate_optional_text(representative_item, "representative_item")
+        for field, value in (
+            ("active", active),
+            ("required_for_report", required_for_report),
+            ("include_quantity_total", include_quantity_total),
+            ("include_cost_total", include_cost_total),
+            ("include_sales_total", include_sales_total),
+        ):
+            _validate_bool(value, field)
         parameters = (
             clean_name,
             display_order,
@@ -81,26 +96,24 @@ class MasterRepository:
         )
         with self.database.connection() as connection:
             try:
-                cursor = connection.execute(
+                row = connection.execute(
                     "INSERT INTO destinations"
                     "(name, display_order, representative_item, active, "
                     "required_for_report, include_quantity_total, "
                     "include_cost_total, include_sales_total) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
                     parameters,
-                )
+                ).fetchone()
                 connection.commit()
             except sqlite3.IntegrityError as error:
                 connection.rollback()
                 raise MasterDataError(
                     f"Destination could not be created: {error}"
                 ) from error
-            row = connection.execute(
-                "SELECT * FROM destinations WHERE id = ?", (cursor.lastrowid,)
-            ).fetchone()
         return _destination_from_row(row)
 
     def get_destination(self, destination_id: int) -> Destination | None:
+        _validate_id(destination_id, "destination_id")
         with self.database.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM destinations WHERE id = ?", (destination_id,)
@@ -118,15 +131,16 @@ class MasterRepository:
         self,
         destination_id: int,
         *,
-        name: str | object = _UNSET,
-        display_order: int | object = _UNSET,
-        active: bool | object = _UNSET,
-        required_for_report: bool | object = _UNSET,
-        representative_item: str | None | object = _UNSET,
-        include_quantity_total: bool | object = _UNSET,
-        include_cost_total: bool | object = _UNSET,
-        include_sales_total: bool | object = _UNSET,
+        name: str | _UnsetType = _UNSET,
+        display_order: int | _UnsetType = _UNSET,
+        active: bool | _UnsetType = _UNSET,
+        required_for_report: bool | _UnsetType = _UNSET,
+        representative_item: str | None | _UnsetType = _UNSET,
+        include_quantity_total: bool | _UnsetType = _UNSET,
+        include_cost_total: bool | _UnsetType = _UNSET,
+        include_sales_total: bool | _UnsetType = _UNSET,
     ) -> Destination:
+        _validate_id(destination_id, "destination_id")
         values: dict[str, object] = {}
         if name is not _UNSET:
             values["name"] = _clean_text(name, "destination name")
@@ -141,8 +155,10 @@ class MasterRepository:
             ("include_sales_total", include_sales_total),
         ):
             if value is not _UNSET:
-                values[column] = int(bool(value))
+                _validate_bool(value, column)
+                values[column] = int(value)
         if representative_item is not _UNSET:
+            _validate_optional_text(representative_item, "representative_item")
             values["representative_item"] = representative_item
         self._update_by_id("destinations", destination_id, values, "destination")
         result = self.get_destination(destination_id)
@@ -151,6 +167,7 @@ class MasterRepository:
         return result
 
     def delete_destination(self, destination_id: int) -> None:
+        _validate_id(destination_id, "destination_id")
         reference_tables = (
             "destination_aliases",
             "vehicle_rates",
@@ -161,37 +178,53 @@ class MasterRepository:
             "transport_entries",
         )
         with self.database.connection() as connection:
-            referenced_by = [
-                table
-                for table in reference_tables
-                if connection.execute(
-                    f"SELECT 1 FROM {table} WHERE destination_id = ? LIMIT 1",
-                    (destination_id,),
-                ).fetchone()
-                is not None
-            ]
-            if referenced_by:
-                raise DestinationInUseError(
-                    "Destination cannot be deleted because it is referenced by: "
-                    + ", ".join(referenced_by)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                referenced_by = [
+                    table
+                    for table in reference_tables
+                    if connection.execute(
+                        f"SELECT 1 FROM {table} WHERE destination_id = ? LIMIT 1",
+                        (destination_id,),
+                    ).fetchone()
+                    is not None
+                ]
+                if referenced_by:
+                    raise DestinationInUseError(
+                        "Destination cannot be deleted because it is referenced by: "
+                        + ", ".join(referenced_by)
+                    )
+                cursor = connection.execute(
+                    "DELETE FROM destinations WHERE id = ?", (destination_id,)
                 )
-            connection.execute(
-                "DELETE FROM destinations WHERE id = ?", (destination_id,)
-            )
-            connection.commit()
+                if cursor.rowcount == 0:
+                    raise MasterDataNotFoundError(
+                        f"Destination {destination_id} does not exist"
+                    )
+                connection.commit()
+            except (DestinationInUseError, MasterDataNotFoundError):
+                connection.rollback()
+                raise
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise DestinationInUseError(
+                    "Destination cannot be deleted because it is referenced"
+                ) from error
 
     def add_alias(
         self, destination_id: int, raw_name: str, source_type: str
     ) -> DestinationAlias:
+        _validate_id(destination_id, "destination_id")
         clean_raw_name = _normalize_alias_text(raw_name, "raw_name")
         clean_source_type = _normalize_alias_text(source_type, "source_type")
         with self.database.connection() as connection:
             try:
-                cursor = connection.execute(
+                row = connection.execute(
                     "INSERT INTO destination_aliases"
-                    "(destination_id, raw_name, source_type) VALUES (?, ?, ?)",
+                    "(destination_id, raw_name, source_type) VALUES (?, ?, ?) "
+                    "RETURNING *",
                     (destination_id, clean_raw_name, clean_source_type),
-                )
+                ).fetchone()
                 connection.commit()
             except sqlite3.IntegrityError as error:
                 connection.rollback()
@@ -200,21 +233,20 @@ class MasterRepository:
                         "Alias already exists for this raw_name and source_type"
                     ) from error
                 raise MasterDataError(f"Alias could not be created: {error}") from error
-            row = connection.execute(
-                "SELECT * FROM destination_aliases WHERE id = ?", (cursor.lastrowid,)
-            ).fetchone()
         return _alias_from_row(row)
 
     def update_alias(
         self,
         alias_id: int,
         *,
-        destination_id: int | object = _UNSET,
-        raw_name: str | object = _UNSET,
-        source_type: str | object = _UNSET,
+        destination_id: int | _UnsetType = _UNSET,
+        raw_name: str | _UnsetType = _UNSET,
+        source_type: str | _UnsetType = _UNSET,
     ) -> DestinationAlias:
+        _validate_id(alias_id, "alias_id")
         values: dict[str, object] = {}
         if destination_id is not _UNSET:
+            _validate_id(destination_id, "destination_id")
             values["destination_id"] = destination_id
         if raw_name is not _UNSET:
             values["raw_name"] = _normalize_alias_text(raw_name, "raw_name")
@@ -237,6 +269,7 @@ class MasterRepository:
         return _alias_from_row(row)
 
     def get_alias(self, alias_id: int) -> DestinationAlias | None:
+        _validate_id(alias_id, "alias_id")
         with self.database.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM destination_aliases WHERE id = ?", (alias_id,)
@@ -244,10 +277,14 @@ class MasterRepository:
         return None if row is None else _alias_from_row(row)
 
     def remove_alias(self, alias_id: int) -> None:
+        _validate_id(alias_id, "alias_id")
         with self.database.connection() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "DELETE FROM destination_aliases WHERE id = ?", (alias_id,)
             )
+            if cursor.rowcount == 0:
+                connection.rollback()
+                raise MasterDataNotFoundError(f"Alias {alias_id} does not exist")
             connection.commit()
 
     def list_aliases(
@@ -256,6 +293,7 @@ class MasterRepository:
         sql = "SELECT * FROM destination_aliases"
         parameters: tuple[object, ...] = ()
         if destination_id is not None:
+            _validate_id(destination_id, "destination_id")
             sql += " WHERE destination_id = ?"
             parameters = (destination_id,)
         sql += " ORDER BY source_type, raw_name, id"
@@ -286,15 +324,19 @@ class MasterRepository:
         source_note: str | None = None,
         active: bool = True,
     ) -> VehicleRate:
+        _validate_id(destination_id, "destination_id")
         clean_vehicle_type = _clean_text(vehicle_type, "vehicle_type")
         _validate_rate(rate_won)
         _validate_month_range(effective_from_month, effective_to_month)
+        _validate_bool(active, "active")
+        _validate_optional_text(source_note, "source_note")
         with self.database.connection() as connection:
             try:
-                cursor = connection.execute(
+                row = connection.execute(
                     "INSERT INTO vehicle_rates"
                     "(destination_id, vehicle_type, unit_rate_won, effective_from, "
-                    "effective_to, source_note, active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "effective_to, source_note, active) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "RETURNING *",
                     (
                         destination_id,
                         clean_vehicle_type,
@@ -304,14 +346,11 @@ class MasterRepository:
                         source_note,
                         int(active),
                     ),
-                )
+                ).fetchone()
                 connection.commit()
             except sqlite3.IntegrityError as error:
                 connection.rollback()
                 _raise_rate_error(error)
-            row = connection.execute(
-                "SELECT * FROM vehicle_rates WHERE id = ?", (cursor.lastrowid,)
-            ).fetchone()
         return _rate_from_row(row)
 
     def list_vehicle_rates(
@@ -320,6 +359,7 @@ class MasterRepository:
         sql = "SELECT * FROM vehicle_rates"
         parameters: tuple[object, ...] = ()
         if destination_id is not None:
+            _validate_id(destination_id, "destination_id")
             sql += " WHERE destination_id = ?"
             parameters = (destination_id,)
         sql += " ORDER BY destination_id, vehicle_type, effective_from, id"
@@ -328,6 +368,7 @@ class MasterRepository:
         return [_rate_from_row(row) for row in rows]
 
     def get_vehicle_rate(self, rate_id: int) -> VehicleRate | None:
+        _validate_id(rate_id, "rate_id")
         with self.database.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM vehicle_rates WHERE id = ?", (rate_id,)
@@ -335,6 +376,7 @@ class MasterRepository:
         return None if row is None else _rate_from_row(row)
 
     def delete_vehicle_rate(self, rate_id: int) -> None:
+        _validate_id(rate_id, "rate_id")
         with self.database.connection() as connection:
             cursor = connection.execute(
                 "DELETE FROM vehicle_rates WHERE id = ?", (rate_id,)
@@ -348,14 +390,15 @@ class MasterRepository:
         self,
         rate_id: int,
         *,
-        destination_id: int | object = _UNSET,
-        vehicle_type: str | object = _UNSET,
-        rate_won: int | object = _UNSET,
-        effective_from_month: str | object = _UNSET,
-        effective_to_month: str | None | object = _UNSET,
-        source_note: str | None | object = _UNSET,
-        active: bool | object = _UNSET,
+        destination_id: int | _UnsetType = _UNSET,
+        vehicle_type: str | _UnsetType = _UNSET,
+        rate_won: int | _UnsetType = _UNSET,
+        effective_from_month: str | _UnsetType = _UNSET,
+        effective_to_month: str | None | _UnsetType = _UNSET,
+        source_note: str | None | _UnsetType = _UNSET,
+        active: bool | _UnsetType = _UNSET,
     ) -> VehicleRate:
+        _validate_id(rate_id, "rate_id")
         current = self.get_vehicle_rate(rate_id)
         if current is None:
             raise MasterDataError(f"Vehicle rate {rate_id} does not exist")
@@ -372,6 +415,7 @@ class MasterRepository:
         _validate_month_range(new_from, new_to)
         values: dict[str, object] = {}
         if destination_id is not _UNSET:
+            _validate_id(destination_id, "destination_id")
             values["destination_id"] = destination_id
         if vehicle_type is not _UNSET:
             values["vehicle_type"] = _clean_text(vehicle_type, "vehicle_type")
@@ -383,9 +427,11 @@ class MasterRepository:
         if effective_to_month is not _UNSET:
             values["effective_to"] = effective_to_month
         if source_note is not _UNSET:
+            _validate_optional_text(source_note, "source_note")
             values["source_note"] = source_note
         if active is not _UNSET:
-            values["active"] = int(bool(active))
+            _validate_bool(active, "active")
+            values["active"] = int(active)
         try:
             self._update_by_id("vehicle_rates", rate_id, values, "vehicle rate")
         except MasterDataError as error:
@@ -402,6 +448,7 @@ class MasterRepository:
     def resolve_vehicle_rate(
         self, destination_id: int, vehicle_type: str, month: str
     ) -> VehicleRate | None:
+        _validate_id(destination_id, "destination_id")
         clean_vehicle_type = _clean_text(vehicle_type, "vehicle_type")
         _validate_month(month)
         with self.database.connection() as connection:
@@ -422,23 +469,22 @@ class MasterRepository:
     ) -> ReportGroup:
         clean_name = _clean_text(name, "group name")
         _validate_display_order(display_order)
+        _validate_bool(active, "active")
         with self.database.connection() as connection:
             try:
-                cursor = connection.execute(
+                row = connection.execute(
                     "INSERT INTO report_groups(name, display_order, active) "
-                    "VALUES (?, ?, ?)",
+                    "VALUES (?, ?, ?) RETURNING *",
                     (clean_name, display_order, int(active)),
-                )
+                ).fetchone()
                 connection.commit()
             except sqlite3.IntegrityError as error:
                 connection.rollback()
                 raise MasterDataError(f"Group could not be created: {error}") from error
-            row = connection.execute(
-                "SELECT * FROM report_groups WHERE id = ?", (cursor.lastrowid,)
-            ).fetchone()
         return _group_from_row(row)
 
     def get_group(self, group_id: int) -> ReportGroup | None:
+        _validate_id(group_id, "group_id")
         with self.database.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM report_groups WHERE id = ?", (group_id,)
@@ -456,10 +502,11 @@ class MasterRepository:
         self,
         group_id: int,
         *,
-        name: str | object = _UNSET,
-        display_order: int | object = _UNSET,
-        active: bool | object = _UNSET,
+        name: str | _UnsetType = _UNSET,
+        display_order: int | _UnsetType = _UNSET,
+        active: bool | _UnsetType = _UNSET,
     ) -> ReportGroup:
+        _validate_id(group_id, "group_id")
         values: dict[str, object] = {}
         if name is not _UNSET:
             values["name"] = _clean_text(name, "group name")
@@ -467,7 +514,8 @@ class MasterRepository:
             _validate_display_order(display_order)
             values["display_order"] = display_order
         if active is not _UNSET:
-            values["active"] = int(bool(active))
+            _validate_bool(active, "active")
+            values["active"] = int(active)
         self._update_by_id("report_groups", group_id, values, "group")
         result = self.get_group(group_id)
         if result is None:
@@ -475,6 +523,7 @@ class MasterRepository:
         return result
 
     def delete_group(self, group_id: int) -> None:
+        _validate_id(group_id, "group_id")
         with self.database.connection() as connection:
             try:
                 connection.execute("BEGIN")
@@ -503,6 +552,7 @@ class MasterRepository:
         group_id: int,
         members: Sequence[int | tuple[int, bool, bool]],
     ) -> None:
+        _validate_id(group_id, "group_id")
         normalized = [_normalize_group_member(member) for member in members]
         destination_ids = [member[0] for member in normalized]
         if len(destination_ids) != len(set(destination_ids)):
@@ -547,6 +597,7 @@ class MasterRepository:
                 ) from error
 
     def group_members(self, group_id: int) -> list[GroupMember]:
+        _validate_id(group_id, "group_id")
         with self.database.connection() as connection:
             rows = connection.execute(
                 "SELECT gm.*, d.name FROM report_group_members AS gm "
@@ -565,6 +616,84 @@ class MasterRepository:
             )
             for row in rows
         ]
+
+    def seed_defaults(self) -> None:
+        with self.database.connection() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                destination_rows = connection.execute(
+                    "SELECT id, name, display_order FROM destinations"
+                ).fetchall()
+                destination_ids = {
+                    str(row["name"]): int(row["id"]) for row in destination_rows
+                }
+                next_destination_order = (
+                    max(
+                        (int(row["display_order"]) for row in destination_rows),
+                        default=0,
+                    )
+                    + 1
+                )
+                required_names = [
+                    name for members in DEFAULT_GROUPS.values() for name in members
+                ] + list(DEFAULT_TOTAL_RULES)
+                for name in dict.fromkeys(required_names):
+                    if name in destination_ids:
+                        continue
+                    cursor = connection.execute(
+                        "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+                        (name, next_destination_order),
+                    )
+                    destination_ids[name] = int(cursor.lastrowid)
+                    next_destination_order += 1
+
+                for name, rules in DEFAULT_TOTAL_RULES.items():
+                    connection.execute(
+                        "UPDATE destinations SET include_quantity_total = ?, "
+                        "include_cost_total = ?, include_sales_total = ? WHERE id = ?",
+                        (
+                            int(rules["quantity"]),
+                            int(rules["cost"]),
+                            int(rules["sales"]),
+                            destination_ids[name],
+                        ),
+                    )
+
+                group_rows = connection.execute(
+                    "SELECT id, name, display_order FROM report_groups"
+                ).fetchall()
+                existing_group_names = {str(row["name"]) for row in group_rows}
+                next_group_order = (
+                    max(
+                        (int(row["display_order"]) for row in group_rows), default=0
+                    )
+                    + 1
+                )
+                for name, member_names in DEFAULT_GROUPS.items():
+                    if name in existing_group_names:
+                        continue
+                    group_id = connection.execute(
+                        "INSERT INTO report_groups(name, display_order) VALUES (?, ?)",
+                        (name, next_group_order),
+                    ).lastrowid
+                    next_group_order += 1
+                    connection.executemany(
+                        "INSERT INTO report_group_members"
+                        "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+                        (
+                            (group_id, destination_ids[member_name], display_order)
+                            for display_order, member_name in enumerate(
+                                member_names, start=1
+                            )
+                        ),
+                    )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise MasterDataError(f"Defaults could not be seeded: {error}") from error
+            except Exception:
+                connection.rollback()
+                raise
 
     def _update_by_id(
         self, table: str, record_id: int, values: dict[str, object], label: str
@@ -592,44 +721,7 @@ class MasterRepository:
 
 
 def seed_default_masters(repository: MasterRepository) -> None:
-    existing_destinations = {
-        destination.name: destination for destination in repository.list_destinations()
-    }
-    next_destination_order = (
-        max((item.display_order for item in existing_destinations.values()), default=0) + 1
-    )
-    required_names = [
-        name for members in DEFAULT_GROUPS.values() for name in members
-    ] + list(DEFAULT_TOTAL_RULES)
-    for name in dict.fromkeys(required_names):
-        if name not in existing_destinations:
-            existing_destinations[name] = repository.create_destination(
-                name, next_destination_order
-            )
-            next_destination_order += 1
-
-    for name, rules in DEFAULT_TOTAL_RULES.items():
-        destination = existing_destinations[name]
-        existing_destinations[name] = repository.update_destination(
-            destination.id,
-            include_quantity_total=rules["quantity"],
-            include_cost_total=rules["cost"],
-            include_sales_total=rules["sales"],
-        )
-
-    existing_groups = {group.name: group for group in repository.list_groups()}
-    next_group_order = max(
-        (item.display_order for item in existing_groups.values()), default=0
-    ) + 1
-    for name, member_names in DEFAULT_GROUPS.items():
-        if name in existing_groups:
-            continue
-        group = repository.create_group(name, next_group_order)
-        next_group_order += 1
-        repository.replace_group_members(
-            group.id,
-            [existing_destinations[member_name].id for member_name in member_names],
-        )
+    repository.seed_defaults()
 
 
 def _clean_text(value: object, field: str) -> str:
@@ -647,6 +739,21 @@ def _normalize_alias_text(value: object, field: str) -> str:
 def _validate_display_order(value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValidationError("display_order must be a nonnegative integer")
+
+
+def _validate_id(value: object, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError(f"{field} must be a positive integer")
+
+
+def _validate_bool(value: object, field: str) -> None:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field} must be a boolean")
+
+
+def _validate_optional_text(value: object, field: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ValidationError(f"{field} must be text or None")
 
 
 def _validate_rate(value: object) -> None:
@@ -673,14 +780,14 @@ def _normalize_group_member(
     if isinstance(member, bool):
         raise ValidationError("Group member destination id must be an integer")
     if isinstance(member, int):
+        _validate_id(member, "destination_id")
         return member, True, True
     if not isinstance(member, tuple) or len(member) != 3:
         raise ValidationError(
             "Group member must be an id or (id, include_quantity, include_cost)"
         )
     destination_id, include_quantity, include_cost = member
-    if isinstance(destination_id, bool) or not isinstance(destination_id, int):
-        raise ValidationError("Group member destination id must be an integer")
+    _validate_id(destination_id, "destination_id")
     if not isinstance(include_quantity, bool) or not isinstance(include_cost, bool):
         raise ValidationError("Group member inclusion flags must be booleans")
     return destination_id, include_quantity, include_cost

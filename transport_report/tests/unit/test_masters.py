@@ -1,5 +1,7 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from threading import Event
 
 import pytest
 
@@ -90,6 +92,111 @@ def test_destinations_have_deterministic_order_and_can_be_updated(repo):
         updated.name = "changed"
 
 
+def test_updates_reject_non_boolean_flags_and_boolean_ids(repo):
+    destination = repo.create_destination("Destination", 1)
+    group = repo.create_group("Group", 1)
+    rate = repo.create_vehicle_rate(destination.id, "5톤", 1000, "2026-01")
+
+    invalid_updates = [
+        lambda: repo.update_destination(destination.id, active="false"),
+        lambda: repo.update_destination(True, name="Wrong"),
+        lambda: repo.update_group(group.id, active="false"),
+        lambda: repo.update_group(True, name="Wrong"),
+        lambda: repo.update_vehicle_rate(rate.id, active="false"),
+        lambda: repo.update_vehicle_rate(True, rate_won=2000),
+    ]
+    for update in invalid_updates:
+        with pytest.raises(ValidationError):
+            update()
+
+    assert repo.get_destination(destination.id) == destination
+    assert repo.get_group(group.id) == group
+    assert repo.get_vehicle_rate(rate.id) == rate
+
+
+def test_updates_reject_malformed_strings_money_orders_and_months(repo):
+    destination = repo.create_destination("Destination", 1)
+    group = repo.create_group("Group", 1)
+    rate = repo.create_vehicle_rate(destination.id, "5톤", 1000, "2026-01")
+
+    invalid_updates = [
+        lambda: repo.update_destination(destination.id, representative_item=123),
+        lambda: repo.update_destination(destination.id, display_order=True),
+        lambda: repo.update_group(group.id, name=123),
+        lambda: repo.update_group(group.id, display_order=True),
+        lambda: repo.update_vehicle_rate(rate.id, vehicle_type=123),
+        lambda: repo.update_vehicle_rate(rate.id, rate_won=True),
+        lambda: repo.update_vehicle_rate(rate.id, effective_to_month=123),
+        lambda: repo.update_vehicle_rate(rate.id, source_note=123),
+    ]
+    for update in invalid_updates:
+        with pytest.raises(ValidationError):
+            update()
+
+    assert repo.get_destination(destination.id) == destination
+    assert repo.get_group(group.id) == group
+    assert repo.get_vehicle_rate(rate.id) == rate
+
+
+def test_create_methods_require_actual_boolean_flags(repo):
+    with pytest.raises(ValidationError, match="active"):
+        repo.create_destination("Destination", 1, active="false")
+    assert repo.list_destinations() == []
+
+    with pytest.raises(ValidationError, match="active"):
+        repo.create_group("Group", 1, active="false")
+    assert repo.list_groups() == []
+
+    destination = repo.create_destination("Destination", 1)
+    with pytest.raises(ValidationError, match="active"):
+        repo.create_vehicle_rate(
+            destination.id, "5톤", 1000, "2026-01", active="false"
+        )
+    assert repo.list_vehicle_rates(destination.id) == []
+
+
+def test_create_methods_reject_non_string_optional_text(repo):
+    with pytest.raises(ValidationError, match="representative_item"):
+        repo.create_destination("Destination", 1, representative_item=123)
+    assert repo.list_destinations() == []
+
+    destination = repo.create_destination("Destination", 1)
+    with pytest.raises(ValidationError, match="source_note"):
+        repo.create_vehicle_rate(
+            destination.id, "5톤", 1000, "2026-01", source_note=123
+        )
+    assert repo.list_vehicle_rates(destination.id) == []
+
+
+def test_public_id_inputs_require_positive_non_boolean_integers(repo):
+    destination = repo.create_destination("Destination", 1)
+    alias = repo.add_alias(destination.id, "raw", "source")
+    rate = repo.create_vehicle_rate(destination.id, "5톤", 1000, "2026-01")
+    group = repo.create_group("Group", 1)
+
+    invalid_calls = [
+        lambda: repo.get_destination(True),
+        lambda: repo.delete_destination(True),
+        lambda: repo.add_alias(True, "other", "source"),
+        lambda: repo.get_alias(True),
+        lambda: repo.remove_alias(True),
+        lambda: repo.create_vehicle_rate(True, "5톤", 2000, "2027-01"),
+        lambda: repo.get_vehicle_rate(True),
+        lambda: repo.delete_vehicle_rate(True),
+        lambda: repo.get_group(True),
+        lambda: repo.delete_group(True),
+        lambda: repo.replace_group_members(True, [destination.id]),
+        lambda: repo.group_members(True),
+    ]
+    for call in invalid_calls:
+        with pytest.raises(ValidationError):
+            call()
+
+    assert repo.get_alias(alias.id) == alias
+    assert repo.get_vehicle_rate(rate.id) == rate
+    assert repo.get_group(group.id) == group
+
+
 def test_alias_matching_uses_nfkc_and_trim_without_removing_punctuation(repo):
     destination = repo.create_destination("포레시아 영천", 1)
     alias = repo.add_alias(
@@ -125,6 +232,8 @@ def test_aliases_can_be_listed_updated_and_removed(repo):
 
     repo.remove_alias(updated.id)
     assert repo.list_aliases(second.id) == []
+    with pytest.raises(MasterDataNotFoundError, match="Alias"):
+        repo.remove_alias(updated.id)
 
 
 def test_alias_can_be_read_by_id_and_missing_returns_none(repo):
@@ -211,6 +320,47 @@ def test_seed_preserves_user_customized_membership_after_group_exists(repo):
     ]
 
 
+def test_seed_rolls_back_completely_on_failure_and_can_be_retried(repo):
+    with repo.database.connection() as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_seed_member BEFORE INSERT ON report_group_members "
+            "BEGIN SELECT RAISE(ABORT, 'forced seed failure'); END"
+        )
+        connection.commit()
+
+    with pytest.raises(MasterDataError, match="forced seed failure"):
+        seed_default_masters(repo)
+
+    assert repo.list_destinations() == []
+    assert repo.list_groups() == []
+
+    with repo.database.connection() as connection:
+        connection.execute("DROP TRIGGER fail_seed_member")
+        connection.commit()
+    seed_default_masters(repo)
+
+    group = next(item for item in repo.list_groups() if item.name == "영남권")
+    assert [item.name for item in repo.group_members(group.id)] == DEFAULT_GROUPS["영남권"]
+
+
+def test_concurrent_seed_calls_create_one_complete_set_of_defaults(repo):
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(seed_default_masters, repo) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    destinations = repo.list_destinations()
+    assert [item.name for item in destinations] == [
+        "현대 울산",
+        "포레시아 영천",
+        "세종공업",
+        "당진",
+    ]
+    assert [item.name for item in repo.list_groups()] == ["영남권"]
+    group = repo.list_groups()[0]
+    assert [item.name for item in repo.group_members(group.id)] == DEFAULT_GROUPS["영남권"]
+
+
 def test_rate_lookup_honors_boundaries_and_rates_can_be_updated(repo):
     destination = repo.create_destination("Destination", 1)
     first = repo.create_vehicle_rate(
@@ -243,6 +393,32 @@ def test_rate_validation_and_overlap_errors_are_clear(repo):
         repo.create_vehicle_rate(destination.id, "5톤", 1, "2026-13", None)
     with pytest.raises(ValidationError, match="range"):
         repo.create_vehicle_rate(destination.id, "5톤", 1, "2026-08", "2026-07")
+
+
+def test_rate_months_reject_unicode_digits_on_create_and_update(repo):
+    destination = repo.create_destination("Destination", 1)
+    rate = repo.create_vehicle_rate(destination.id, "5톤", 1000, "2026-01")
+
+    with pytest.raises(ValidationError, match="YYYY-MM"):
+        repo.create_vehicle_rate(destination.id, "8톤", 1000, "２０２６-01")
+    with pytest.raises(ValidationError, match="YYYY-MM"):
+        repo.update_vehicle_rate(rate.id, effective_from_month="２０２６-01")
+
+
+def test_rate_update_overlap_is_translated_and_rolled_back(repo):
+    destination = repo.create_destination("Destination", 1)
+    first = repo.create_vehicle_rate(
+        destination.id, "5톤", 1000, "2026-01", "2026-06"
+    )
+    second = repo.create_vehicle_rate(
+        destination.id, "5톤", 2000, "2026-07", "2026-12"
+    )
+
+    with pytest.raises(VehicleRateOverlapError, match="overlap"):
+        repo.update_vehicle_rate(first.id, effective_to_month="2026-08")
+
+    assert repo.get_vehicle_rate(first.id) == first
+    assert repo.get_vehicle_rate(second.id) == second
 
 
 def test_vehicle_rate_can_be_read_and_deleted_without_affecting_other_rates(repo):
@@ -312,6 +488,46 @@ def test_unreferenced_destination_can_be_deleted(repo):
     assert repo.get_destination(destination.id) is None
 
 
+def test_deleting_missing_destination_raises_not_found(repo):
+    with pytest.raises(MasterDataNotFoundError, match="Destination"):
+        repo.delete_destination(999999)
+
+
+def test_destination_delete_sees_reference_committed_by_competing_connection(repo):
+    destination = repo.create_destination("Destination", 1)
+    reference_inserted = Event()
+    allow_reference_commit = Event()
+    delete_started = Event()
+
+    def create_reference():
+        with repo.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO destination_aliases(raw_name, source_type, destination_id) "
+                "VALUES (?, ?, ?)",
+                ("raw", "source", destination.id),
+            )
+            reference_inserted.set()
+            assert allow_reference_commit.wait(timeout=5)
+            connection.commit()
+
+    def delete_destination():
+        delete_started.set()
+        repo.delete_destination(destination.id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reference_future = executor.submit(create_reference)
+        assert reference_inserted.wait(timeout=5)
+        delete_future = executor.submit(delete_destination)
+        assert delete_started.wait(timeout=5)
+        allow_reference_commit.set()
+        reference_future.result()
+        with pytest.raises(DestinationInUseError):
+            delete_future.result()
+
+    assert repo.get_destination(destination.id) == destination
+
+
 def test_repository_closes_connections_after_success(tmp_path):
     class TrackingDatabase(Database):
         last_connection = None
@@ -330,6 +546,50 @@ def test_repository_closes_connections_after_success(tmp_path):
     assert database.last_connection is not None
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         database.last_connection.execute("SELECT 1")
+
+
+def test_create_methods_materialize_inserted_rows_before_commit(tmp_path):
+    events = []
+
+    class OrderingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = super().execute(sql, parameters)
+            normalized = " ".join(sql.upper().split())
+            if " RETURNING " in f" {normalized} " or (
+                normalized.startswith("SELECT * FROM") and "WHERE ID = ?" in normalized
+            ):
+                events.append("read")
+            return cursor
+
+        def commit(self):
+            events.append("commit")
+            return super().commit()
+
+    class OrderingDatabase(Database):
+        def connect(self):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(self.path, factory=OrderingConnection)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+
+    database = OrderingDatabase(tmp_path / "app.db")
+    database.migrate()
+    repo = MasterRepository(database)
+    base_destination = repo.create_destination("Base", 1)
+
+    operations = [
+        lambda: repo.create_destination("Other", 2),
+        lambda: repo.add_alias(base_destination.id, "raw", "source"),
+        lambda: repo.create_vehicle_rate(
+            base_destination.id, "5톤", 1000, "2026-01"
+        ),
+        lambda: repo.create_group("Group", 1),
+    ]
+    for operation in operations:
+        events.clear()
+        operation()
+        assert events.index("read") < events.index("commit")
 
 
 def _add_destination_reference(database, destination_id, reference_type):
