@@ -10,6 +10,7 @@ from app.repositories.masters import (
     DestinationInUseError,
     DuplicateAliasError,
     MasterDataError,
+    MasterDataNotFoundError,
     MasterRepository,
     ValidationError,
     VehicleRateOverlapError,
@@ -126,7 +127,15 @@ def test_aliases_can_be_listed_updated_and_removed(repo):
     assert repo.list_aliases(second.id) == []
 
 
-def test_group_order_flags_and_group_crud(repo):
+def test_alias_can_be_read_by_id_and_missing_returns_none(repo):
+    destination = repo.create_destination("Destination", 1)
+    alias = repo.add_alias(destination.id, "raw", "source")
+
+    assert repo.get_alias(alias.id) == alias
+    assert repo.get_alias(999999) is None
+
+
+def test_group_order_flags_and_group_read_update_listing(repo):
     group = repo.create_group("  Group  ", 20)
     first = repo.create_destination("First", 1)
     second = repo.create_destination("Second", 2)
@@ -234,6 +243,42 @@ def test_rate_validation_and_overlap_errors_are_clear(repo):
         repo.create_vehicle_rate(destination.id, "5톤", 1, "2026-13", None)
     with pytest.raises(ValidationError, match="range"):
         repo.create_vehicle_rate(destination.id, "5톤", 1, "2026-08", "2026-07")
+
+
+def test_vehicle_rate_can_be_read_and_deleted_without_affecting_other_rates(repo):
+    destination = repo.create_destination("Destination", 1)
+    removed = repo.create_vehicle_rate(
+        destination.id, "5톤", 1000, "2026-01", "2026-06"
+    )
+    retained = repo.create_vehicle_rate(
+        destination.id, "5톤", 2000, "2026-07", None
+    )
+
+    assert repo.get_vehicle_rate(removed.id) == removed
+    assert repo.get_vehicle_rate(999999) is None
+
+    repo.delete_vehicle_rate(removed.id)
+
+    assert repo.get_vehicle_rate(removed.id) is None
+    assert repo.list_vehicle_rates(destination.id) == [retained]
+    with pytest.raises(MasterDataNotFoundError, match="Vehicle rate"):
+        repo.delete_vehicle_rate(removed.id)
+
+
+def test_group_delete_removes_members_but_preserves_destinations(repo):
+    group = repo.create_group("Group", 1)
+    first = repo.create_destination("First", 1)
+    second = repo.create_destination("Second", 2)
+    repo.replace_group_members(group.id, [first.id, second.id])
+
+    repo.delete_group(group.id)
+
+    assert repo.get_group(group.id) is None
+    assert repo.group_members(group.id) == []
+    assert repo.get_destination(first.id) == first
+    assert repo.get_destination(second.id) == second
+    with pytest.raises(MasterDataNotFoundError, match="Group"):
+        repo.delete_group(group.id)
 
 
 @pytest.mark.parametrize(

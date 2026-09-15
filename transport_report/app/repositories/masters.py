@@ -31,6 +31,10 @@ class MasterDataError(Exception):
     """Base error for invalid or unsuccessful master-data operations."""
 
 
+class MasterDataNotFoundError(MasterDataError):
+    """Raised when a requested master-data record does not exist."""
+
+
 class ValidationError(MasterDataError):
     """Raised when a master-data value is invalid."""
 
@@ -232,6 +236,13 @@ class MasterRepository:
             raise MasterDataError(f"Alias {alias_id} does not exist")
         return _alias_from_row(row)
 
+    def get_alias(self, alias_id: int) -> DestinationAlias | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM destination_aliases WHERE id = ?", (alias_id,)
+            ).fetchone()
+        return None if row is None else _alias_from_row(row)
+
     def remove_alias(self, alias_id: int) -> None:
         with self.database.connection() as connection:
             connection.execute(
@@ -316,6 +327,23 @@ class MasterRepository:
             rows = connection.execute(sql, parameters).fetchall()
         return [_rate_from_row(row) for row in rows]
 
+    def get_vehicle_rate(self, rate_id: int) -> VehicleRate | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM vehicle_rates WHERE id = ?", (rate_id,)
+            ).fetchone()
+        return None if row is None else _rate_from_row(row)
+
+    def delete_vehicle_rate(self, rate_id: int) -> None:
+        with self.database.connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM vehicle_rates WHERE id = ?", (rate_id,)
+            )
+            if cursor.rowcount == 0:
+                connection.rollback()
+                raise MasterDataNotFoundError(f"Vehicle rate {rate_id} does not exist")
+            connection.commit()
+
     def update_vehicle_rate(
         self,
         rate_id: int,
@@ -328,7 +356,7 @@ class MasterRepository:
         source_note: str | None | object = _UNSET,
         active: bool | object = _UNSET,
     ) -> VehicleRate:
-        current = self._get_vehicle_rate(rate_id)
+        current = self.get_vehicle_rate(rate_id)
         if current is None:
             raise MasterDataError(f"Vehicle rate {rate_id} does not exist")
         new_from = (
@@ -366,7 +394,7 @@ class MasterRepository:
                     "Vehicle rate effective period overlap"
                 ) from error
             raise
-        result = self._get_vehicle_rate(rate_id)
+        result = self.get_vehicle_rate(rate_id)
         if result is None:
             raise MasterDataError(f"Vehicle rate {rate_id} does not exist")
         return result
@@ -446,6 +474,30 @@ class MasterRepository:
             raise MasterDataError(f"Group {group_id} does not exist")
         return result
 
+    def delete_group(self, group_id: int) -> None:
+        with self.database.connection() as connection:
+            try:
+                connection.execute("BEGIN")
+                if connection.execute(
+                    "SELECT 1 FROM report_groups WHERE id = ?", (group_id,)
+                ).fetchone() is None:
+                    raise MasterDataNotFoundError(
+                        f"Group {group_id} does not exist"
+                    )
+                connection.execute(
+                    "DELETE FROM report_group_members WHERE group_id = ?", (group_id,)
+                )
+                connection.execute(
+                    "DELETE FROM report_groups WHERE id = ?", (group_id,)
+                )
+                connection.commit()
+            except MasterDataNotFoundError:
+                connection.rollback()
+                raise
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise MasterDataError(f"Group could not be deleted: {error}") from error
+
     def replace_group_members(
         self,
         group_id: int,
@@ -513,13 +565,6 @@ class MasterRepository:
             )
             for row in rows
         ]
-
-    def _get_vehicle_rate(self, rate_id: int) -> VehicleRate | None:
-        with self.database.connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM vehicle_rates WHERE id = ?", (rate_id,)
-            ).fetchone()
-        return None if row is None else _rate_from_row(row)
 
     def _update_by_id(
         self, table: str, record_id: int, values: dict[str, object], label: str
