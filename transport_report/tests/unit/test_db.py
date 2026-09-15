@@ -76,6 +76,32 @@ def test_monthly_actual_costs_store_authoritative_totals_with_provenance(tmp_pat
             connection.execute("DELETE FROM destinations WHERE id = ?", (destination_id,))
 
 
+def test_monthly_actual_costs_require_nonblank_source_type(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    with db.connection() as connection:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        sql = (
+            "INSERT INTO monthly_actual_costs"
+            "(report_month, destination_id, cost_won, source_type) "
+            "VALUES (?, ?, ?, ?)"
+        )
+        connection.execute(
+            sql,
+            ("2026-08", destination_id, 1200, "legacy"),
+        )
+
+        for report_month, source_type in (("2026-09", ""), ("2026-10", "   ")):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    sql,
+                    (report_month, destination_id, 1300, source_type),
+                )
+
+
 def test_transport_entry_month_must_match_its_import_batch(tmp_path):
     db = Database(tmp_path / "app.db")
     db.migrate()

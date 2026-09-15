@@ -231,7 +231,9 @@ CREATE TABLE monthly_actual_costs(
   cost_won INTEGER NOT NULL CHECK(
     typeof(cost_won) = 'integer' AND cost_won >= 0
   ),
-  source_type TEXT NOT NULL,
+  source_type TEXT NOT NULL CHECK(
+    typeof(source_type) = 'text' AND length(trim(source_type)) > 0
+  ),
   source_note TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
