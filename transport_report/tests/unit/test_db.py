@@ -21,11 +21,273 @@ def test_initial_migration_creates_required_tables(tmp_path):
         "report_group_members",
         "monthly_plans",
         "monthly_actual_quantities",
+        "monthly_actual_costs",
         "monthly_sales",
         "transport_entries",
         "import_batches",
         "report_runs",
     } <= names
+
+
+def test_monthly_actual_costs_store_authoritative_totals_with_provenance(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    with db.connection() as connection:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO monthly_actual_costs"
+            "(report_month, destination_id, cost_won, source_type, source_note) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", destination_id, 1200, "legacy", "confirmed ledger"),
+        )
+        row = connection.execute(
+            "SELECT typeof(cost_won), source_type, source_note, created_at, updated_at "
+            "FROM monthly_actual_costs"
+        ).fetchone()
+        assert tuple(row[:3]) == ("integer", "legacy", "confirmed ledger")
+        assert row["created_at"]
+        assert row["updated_at"]
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO monthly_actual_costs"
+                "(report_month, destination_id, cost_won, source_type) "
+                "VALUES (?, ?, ?, ?)",
+                ("2026-08", destination_id, 1300, "finalized_import"),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO monthly_actual_costs"
+                "(report_month, destination_id, cost_won, source_type) "
+                "VALUES (?, ?, ?, ?)",
+                ("2026-09", destination_id, "not-integer", "legacy"),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO monthly_actual_costs"
+                "(report_month, destination_id, cost_won, source_type) "
+                "VALUES (?, ?, ?, ?)",
+                ("2026-09", destination_id, -1, "legacy"),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM destinations WHERE id = ?", (destination_id,))
+
+
+def test_transport_entry_month_must_match_its_import_batch(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "test", "source.xlsx", "a" * 64, "staged"),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, destination_id, source_sheet, source_row, "
+            "transport_day, transport_type, trip_count_text, cost_won) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (batch_id, "2026-08", destination_id, "Sheet1", 2, 1, "regular", "1", 1000),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO transport_entries"
+                "(import_batch_id, report_month, destination_id, source_sheet, source_row, "
+                "transport_day, transport_type, trip_count_text, cost_won) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (batch_id, "2026-09", destination_id, "Sheet1", 3, 1, "regular", "1", 1000),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("existing_from", "existing_to", "new_from", "new_to", "overlaps"),
+    [
+        ("2026-03", "2026-06", "2026-07", "2026-08", False),
+        ("2026-03", "2026-06", "2026-06", "2026-08", True),
+        ("2026-03", "2026-06", "2026-04", "2026-05", True),
+        ("2026-03", "2026-06", "2026-01", "2026-08", True),
+        ("2026-03", None, "2027-01", None, True),
+    ],
+)
+def test_vehicle_rate_inserts_reject_overlapping_effective_periods(
+    tmp_path, existing_from, existing_to, new_from, new_to, overlaps
+):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO vehicle_rates"
+            "(destination_id, vehicle_type, unit_rate_won, effective_from, effective_to) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (destination_id, "5-ton", 1000, existing_from, existing_to),
+        )
+        parameters = (destination_id, "5-ton", 1100, new_from, new_to)
+        sql = (
+            "INSERT INTO vehicle_rates"
+            "(destination_id, vehicle_type, unit_rate_won, effective_from, effective_to) "
+            "VALUES (?, ?, ?, ?, ?)"
+        )
+
+        if overlaps:
+            with pytest.raises(sqlite3.IntegrityError, match="overlap"):
+                connection.execute(sql, parameters)
+        else:
+            connection.execute(sql, parameters)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("existing_to", "updated_from", "updated_to", "overlaps"),
+    [
+        ("2026-06", "2026-07", "2026-08", False),
+        ("2026-06", "2026-06", "2026-08", True),
+        ("2026-06", "2026-04", "2026-05", True),
+        ("2026-06", "2026-01", "2026-08", True),
+        (None, "2027-03", None, True),
+    ],
+)
+def test_vehicle_rate_updates_reject_overlapping_effective_periods(
+    tmp_path, existing_to, updated_from, updated_to, overlaps
+):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO vehicle_rates"
+            "(destination_id, vehicle_type, unit_rate_won, effective_from, effective_to) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (destination_id, "5-ton", 1000, "2026-03", existing_to),
+        )
+        rate_id = connection.execute(
+            "INSERT INTO vehicle_rates"
+            "(destination_id, vehicle_type, unit_rate_won, effective_from, effective_to) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (destination_id, "5-ton", 1100, "2025-01", "2025-02"),
+        ).lastrowid
+        sql = (
+            "UPDATE vehicle_rates SET effective_from = ?, effective_to = ? WHERE id = ?"
+        )
+
+        if overlaps:
+            with pytest.raises(sqlite3.IntegrityError, match="overlap"):
+                connection.execute(sql, (updated_from, updated_to, rate_id))
+        else:
+            connection.execute(sql, (updated_from, updated_to, rate_id))
+    finally:
+        connection.close()
+
+
+def test_structural_integer_columns_reject_text_and_out_of_range_values(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        for explicit_id in (-1, "not-an-id"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO destinations(id, name, display_order) VALUES (?, ?, ?)",
+                    (explicit_id, f"Destination {explicit_id}", 1),
+                )
+        for display_order in (-1, "first"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+                    (f"Destination {display_order}", display_order),
+                )
+
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "test", "source.xlsx", "a" * 64, "staged"),
+        ).lastrowid
+        entry_sql = (
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, destination_id, source_sheet, source_row, "
+            "transport_day, transport_type, trip_count_text, cost_won) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        for source_row, transport_day in (("row", 1), (-1, 1), (2, "day"), (2, 0)):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    entry_sql,
+                    (
+                        batch_id,
+                        "2026-08",
+                        destination_id,
+                        "Sheet1",
+                        source_row,
+                        transport_day,
+                        "regular",
+                        "1",
+                        1000,
+                    ),
+                )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO report_runs(report_month, status, is_locked) VALUES (?, ?, ?)",
+                ("2026-08", "draft", "locked"),
+            )
+    finally:
+        connection.close()
+
+
+def test_import_batch_sha256_requires_exactly_64_hexadecimal_characters(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        sql = (
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)"
+        )
+        connection.execute(
+            sql,
+            ("2026-08", "test", "lower.xlsx", "abcdef0123456789" * 4, "staged"),
+        )
+        connection.execute(
+            sql,
+            ("2026-09", "test", "upper.xlsx", "ABCDEF0123456789" * 4, "staged"),
+        )
+        for report_month, invalid_hash in (
+            ("2026-10", "a" * 63),
+            ("2026-11", "a" * 65),
+            ("2026-12", "g" * 64),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    sql,
+                    (report_month, "test", "invalid.xlsx", invalid_hash, "staged"),
+                )
+    finally:
+        connection.close()
 
 
 def test_migrations_are_repeatable(tmp_path):
@@ -44,6 +306,21 @@ def test_migrations_are_repeatable(tmp_path):
     finally:
         connection.close()
     assert [row["version"] for row in versions] == [1]
+
+
+def test_migrate_rejects_schema_versions_newer_than_bundled_migrations(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    with db.connection() as connection:
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) "
+            "VALUES (?, datetime('now'))",
+            (999,),
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="newer.*bundled migrations"):
+        db.migrate()
 
 
 def test_report_group_members_store_a_valid_display_order(tmp_path):
@@ -184,6 +461,21 @@ def test_connections_enable_and_enforce_foreign_keys(tmp_path):
             )
     finally:
         connection.close()
+
+
+def test_connection_context_manager_closes_after_an_exception(tmp_path):
+    db = Database(tmp_path / "app.db")
+    owned_connection = None
+
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with db.connection() as connection:
+            owned_connection = connection
+            connection.execute("SELECT 1")
+            raise RuntimeError("caller failed")
+
+    assert owned_connection is not None
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        owned_connection.execute("SELECT 1")
 
 
 def test_schema_includes_required_business_and_audit_fields(tmp_path):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -14,16 +16,39 @@ class Database:
         self.migrations_dir = migrations_dir or Path(__file__).with_name("db") / "migrations"
 
     def connect(self) -> sqlite3.Connection:
+        """Return a configured connection whose lifetime is owned by the caller."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield a configured connection and always close it on exit."""
+        connection = self.connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def migrate(self) -> None:
         migrations = self._migration_files()
         connection = self.connect()
         try:
+            applied_versions = self._applied_versions(connection)
+            newest_bundled_version = migrations[-1][0]
+            forward_versions = sorted(
+                version
+                for version in applied_versions
+                if version > newest_bundled_version
+            )
+            if forward_versions:
+                raise RuntimeError(
+                    "Database schema version is newer than bundled migrations: "
+                    f"found {forward_versions[-1]}, bundled maximum is "
+                    f"{newest_bundled_version}"
+                )
             for version, migration_path in migrations:
                 sql = migration_path.read_text(encoding="utf-8")
                 try:
