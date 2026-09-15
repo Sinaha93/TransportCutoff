@@ -174,7 +174,7 @@ git commit -m "chore: scaffold portable reporting app"
 - Create: `transport_report/app/db/migrations/001_initial.sql`
 - Create: `transport_report/tests/unit/test_db.py`
 
-- [ ] **Step 1: Write the failing migration test**
+- [x] **Step 1: Write the failing migration test**
 
 ```python
 def test_initial_migration_creates_required_tables(tmp_path):
@@ -189,13 +189,13 @@ def test_initial_migration_creates_required_tables(tmp_path):
     } <= names
 ```
 
-- [ ] **Step 2: Run the test and verify failure**
+- [x] **Step 2: Run the test and verify failure**
 
 Run: `python -m pytest tests/unit/test_db.py::test_initial_migration_creates_required_tables -v`
 
 Expected: FAIL because `Database` is missing.
 
-- [ ] **Step 3: Create the versioned schema**
+- [x] **Step 3: Create the versioned schema**
 
 The migration must define:
 
@@ -235,11 +235,11 @@ CREATE TABLE report_group_members(
 
 Also create the monthly, transport, import, and report-run tables with `report_month` stored as `YYYY-MM`, monetary values stored as integer won, quantities stored as decimal text, and unique keys preventing duplicate month/destination records.
 
-- [ ] **Step 4: Implement transactional migrations**
+- [x] **Step 4: Implement transactional migrations**
 
 `Database.migrate()` must load migration files in numeric order, apply each migration inside one transaction, and record the version only after success.
 
-- [ ] **Step 5: Test repeatability**
+- [x] **Step 5: Test repeatability**
 
 Add and run a test that calls `migrate()` twice and confirms the second call makes no schema changes.
 
@@ -247,7 +247,7 @@ Run: `python -m pytest tests/unit/test_db.py -v`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the database foundation**
+- [x] **Step 6: Commit the database foundation**
 
 ```powershell
 git add transport_report/app/db.py transport_report/app/db/migrations transport_report/tests/unit/test_db.py
