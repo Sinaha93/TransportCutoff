@@ -261,7 +261,7 @@ git commit -m "feat: add portable sqlite schema"
 - Create: `transport_report/app/repositories/masters.py`
 - Create: `transport_report/tests/unit/test_masters.py`
 
-- [ ] **Step 1: Write failing alias and group tests**
+- [x] **Step 1: Write failing alias and group tests**
 
 ```python
 def test_alias_resolves_to_standard_destination(repo):
@@ -281,17 +281,17 @@ def test_group_members_can_be_changed_without_formula_edits(repo):
     ]
 ```
 
-- [ ] **Step 2: Run the tests and verify failure**
+- [x] **Step 2: Run the tests and verify failure**
 
 Run: `python -m pytest tests/unit/test_masters.py -v`
 
 Expected: FAIL because the repository is missing.
 
-- [ ] **Step 3: Implement destination, alias, rate, and group repositories**
+- [x] **Step 3: Implement destination, alias, rate, and group repositories**
 
 Use parameterized SQLite statements. Normalize aliases by trimming whitespace and Unicode-normalizing with NFKC, but do not remove meaningful punctuation automatically. Exact alias decisions remain user-controlled.
 
-- [ ] **Step 4: Seed the known group and exception**
+- [x] **Step 4: Seed the known group and exception**
 
 Provide an idempotent seed function that creates:
 
@@ -304,13 +304,13 @@ DEFAULT_TOTAL_RULES = {
 }
 ```
 
-- [ ] **Step 5: Run repository tests**
+- [x] **Step 5: Run repository tests**
 
 Run: `python -m pytest tests/unit/test_masters.py -v`
 
 Expected: PASS, including cascade-protection tests that prevent deleting a destination already used by monthly data.
 
-- [ ] **Step 6: Commit master-data support**
+- [x] **Step 6: Commit master-data support**
 
 ```powershell
 git add transport_report/app/domain transport_report/app/repositories/masters.py transport_report/tests/unit/test_masters.py
