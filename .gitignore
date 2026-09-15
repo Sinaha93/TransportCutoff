@@ -1,6 +1,7 @@
 *.xlsx
 *.xls
 *.pptx
+*.pdf
 transport_report/runtime/
 transport_report/dist/
 transport_report/build/
