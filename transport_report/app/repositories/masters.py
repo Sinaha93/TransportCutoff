@@ -627,6 +627,7 @@ class MasterRepository:
                 destination_ids = {
                     str(row["name"]): int(row["id"]) for row in destination_rows
                 }
+                created_destination_names: set[str] = set()
                 next_destination_order = (
                     max(
                         (int(row["display_order"]) for row in destination_rows),
@@ -645,9 +646,12 @@ class MasterRepository:
                         (name, next_destination_order),
                     )
                     destination_ids[name] = int(cursor.lastrowid)
+                    created_destination_names.add(name)
                     next_destination_order += 1
 
                 for name, rules in DEFAULT_TOTAL_RULES.items():
+                    if name not in created_destination_names:
+                        continue
                     connection.execute(
                         "UPDATE destinations SET include_quantity_total = ?, "
                         "include_cost_total = ?, include_sales_total = ? WHERE id = ?",

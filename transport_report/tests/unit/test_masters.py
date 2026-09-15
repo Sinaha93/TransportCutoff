@@ -320,6 +320,46 @@ def test_seed_preserves_user_customized_membership_after_group_exists(repo):
     ]
 
 
+def test_seed_preserves_customized_total_rules_on_reseed(repo):
+    seed_default_masters(repo)
+    dangjin = next(item for item in repo.list_destinations() if item.name == "당진")
+    customized = repo.update_destination(
+        dangjin.id,
+        include_quantity_total=True,
+        include_cost_total=False,
+        include_sales_total=True,
+    )
+
+    seed_default_masters(repo)
+
+    assert repo.get_destination(dangjin.id) == customized
+
+
+def test_seed_preserves_preexisting_destination_total_rules_on_first_seed(repo):
+    dangjin = repo.create_destination(
+        "당진",
+        50,
+        include_quantity_total=True,
+        include_cost_total=False,
+        include_sales_total=True,
+    )
+
+    seed_default_masters(repo)
+
+    assert repo.get_destination(dangjin.id) == dangjin
+
+
+def test_seed_applies_default_total_rules_to_new_destination(repo):
+    seed_default_masters(repo)
+
+    dangjin = next(item for item in repo.list_destinations() if item.name == "당진")
+    assert (
+        dangjin.include_quantity_total,
+        dangjin.include_cost_total,
+        dangjin.include_sales_total,
+    ) == (False, True, False)
+
+
 def test_seed_rolls_back_completely_on_failure_and_can_be_retried(repo):
     with repo.database.connection() as connection:
         connection.execute(
