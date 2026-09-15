@@ -46,6 +46,100 @@ def test_migrations_are_repeatable(tmp_path):
     assert [row["version"] for row in versions] == [1]
 
 
+def test_report_group_members_store_a_valid_display_order(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        group_id = connection.execute(
+            "INSERT INTO report_groups(name, display_order) VALUES (?, ?)",
+            ("Region A", 1),
+        ).lastrowid
+        destination_ids = [
+            connection.execute(
+                "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+                (name, order),
+            ).lastrowid
+            for order, name in enumerate(("Destination A", "Destination B"), start=1)
+        ]
+        connection.execute(
+            "INSERT INTO report_group_members"
+            "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+            (group_id, destination_ids[0], 2),
+        )
+        connection.execute(
+            "INSERT INTO report_group_members"
+            "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+            (group_id, destination_ids[1], 1),
+        )
+
+        ordered_ids = connection.execute(
+            "SELECT destination_id FROM report_group_members "
+            "WHERE group_id = ? ORDER BY display_order",
+            (group_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [row["destination_id"] for row in ordered_ids] == [
+        destination_ids[1],
+        destination_ids[0],
+    ]
+
+
+def test_report_group_member_order_is_unique_within_each_group(tmp_path):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        group_ids = [
+            connection.execute(
+                "INSERT INTO report_groups(name, display_order) VALUES (?, ?)",
+                (name, order),
+            ).lastrowid
+            for order, name in enumerate(("Region A", "Region B"), start=1)
+        ]
+        destination_ids = [
+            connection.execute(
+                "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+                (name, order),
+            ).lastrowid
+            for order, name in enumerate(("Destination A", "Destination B"), start=1)
+        ]
+        connection.execute(
+            "INSERT INTO report_group_members"
+            "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+            (group_ids[0], destination_ids[0], 1),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO report_group_members"
+                "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+                (group_ids[0], destination_ids[1], 1),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO report_group_members"
+                "(group_id, destination_id) VALUES (?, ?)",
+                (group_ids[0], destination_ids[1]),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO report_group_members"
+                "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+                (group_ids[0], destination_ids[1], -1),
+            )
+
+        connection.execute(
+            "INSERT INTO report_group_members"
+            "(group_id, destination_id, display_order) VALUES (?, ?, ?)",
+            (group_ids[1], destination_ids[1], 1),
+        )
+    finally:
+        connection.close()
+
+
 def test_failed_migration_rolls_back_schema_and_version(tmp_path):
     migrations = tmp_path / "migrations"
     migrations.mkdir()
@@ -347,6 +441,111 @@ def test_quantity_and_trip_values_require_nonnegative_decimal_text(tmp_path):
                 "regular",
                 "1.25",
                 1250,
+            ),
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    ["01", "01.20", "1.", ".5", "00", "0.0", "1.0", "1.20", "1.250"],
+)
+def test_decimal_text_columns_reject_noncanonical_values(tmp_path, invalid_value):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "test", "source.xlsx", "a" * 64, "staged"),
+        ).lastrowid
+        statements = [
+            (
+                "INSERT INTO monthly_plans"
+                "(report_month, destination_id, quantity_ea_text, cost_won) "
+                "VALUES (?, ?, ?, ?)",
+                ("2026-08", destination_id, invalid_value, 1000),
+            ),
+            (
+                "INSERT INTO monthly_actual_quantities"
+                "(report_month, destination_id, quantity_ea_text) VALUES (?, ?, ?)",
+                ("2026-08", destination_id, invalid_value),
+            ),
+            (
+                "INSERT INTO transport_entries"
+                "(import_batch_id, report_month, destination_id, source_sheet, "
+                "source_row, transport_day, transport_type, trip_count_text, cost_won) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    "2026-08",
+                    destination_id,
+                    "Sheet1",
+                    2,
+                    1,
+                    "regular",
+                    invalid_value,
+                    1000,
+                ),
+            ),
+        ]
+        for sql, parameters in statements:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(sql, parameters)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("valid_value", ["0", "1", "125", "0.5", "1.25"])
+def test_decimal_text_columns_accept_canonical_values(tmp_path, valid_value):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    connection = db.connect()
+    try:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination A", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "test", "source.xlsx", "a" * 64, "staged"),
+        ).lastrowid
+
+        connection.execute(
+            "INSERT INTO monthly_plans"
+            "(report_month, destination_id, quantity_ea_text, cost_won) "
+            "VALUES (?, ?, ?, ?)",
+            ("2026-08", destination_id, valid_value, 1000),
+        )
+        connection.execute(
+            "INSERT INTO monthly_actual_quantities"
+            "(report_month, destination_id, quantity_ea_text) VALUES (?, ?, ?)",
+            ("2026-08", destination_id, valid_value),
+        )
+        connection.execute(
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, destination_id, source_sheet, "
+            "source_row, transport_day, transport_type, trip_count_text, cost_won) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                "2026-08",
+                destination_id,
+                "Sheet1",
+                2,
+                1,
+                "regular",
+                valid_value,
+                1000,
             ),
         )
     finally:

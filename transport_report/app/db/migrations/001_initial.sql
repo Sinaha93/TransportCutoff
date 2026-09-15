@@ -64,9 +64,11 @@ CREATE TABLE report_group_members(
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   destination_id INTEGER NOT NULL REFERENCES destinations(id)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
+  display_order INTEGER NOT NULL CHECK(display_order >= 0),
   include_quantity INTEGER NOT NULL DEFAULT 1 CHECK(include_quantity IN (0, 1)),
   include_cost INTEGER NOT NULL DEFAULT 1 CHECK(include_cost IN (0, 1)),
-  PRIMARY KEY(group_id, destination_id)
+  PRIMARY KEY(group_id, destination_id),
+  UNIQUE(group_id, display_order)
 );
 
 CREATE TABLE monthly_plans(
@@ -82,9 +84,26 @@ CREATE TABLE monthly_plans(
   quantity_ea_text TEXT NOT NULL CHECK(
     typeof(quantity_ea_text) = 'text'
     AND quantity_ea_text = trim(quantity_ea_text)
-    AND quantity_ea_text GLOB '*[0-9]*'
     AND quantity_ea_text NOT GLOB '*[^0-9.]*'
     AND length(quantity_ea_text) - length(replace(quantity_ea_text, '.', '')) <= 1
+    AND (
+      (
+        instr(quantity_ea_text, '.') = 0
+        AND (
+          quantity_ea_text = '0'
+          OR substr(quantity_ea_text, 1, 1) BETWEEN '1' AND '9'
+        )
+      )
+      OR (
+        instr(quantity_ea_text, '.') > 1
+        AND (
+          substr(quantity_ea_text, 1, instr(quantity_ea_text, '.') - 1) = '0'
+          OR substr(quantity_ea_text, 1, 1) BETWEEN '1' AND '9'
+        )
+        AND length(substr(quantity_ea_text, instr(quantity_ea_text, '.') + 1)) > 0
+        AND substr(quantity_ea_text, -1, 1) BETWEEN '1' AND '9'
+      )
+    )
   ),
   cost_won INTEGER NOT NULL CHECK(typeof(cost_won) = 'integer' AND cost_won >= 0),
   representative_item TEXT,
@@ -106,9 +125,26 @@ CREATE TABLE monthly_actual_quantities(
   quantity_ea_text TEXT NOT NULL CHECK(
     typeof(quantity_ea_text) = 'text'
     AND quantity_ea_text = trim(quantity_ea_text)
-    AND quantity_ea_text GLOB '*[0-9]*'
     AND quantity_ea_text NOT GLOB '*[^0-9.]*'
     AND length(quantity_ea_text) - length(replace(quantity_ea_text, '.', '')) <= 1
+    AND (
+      (
+        instr(quantity_ea_text, '.') = 0
+        AND (
+          quantity_ea_text = '0'
+          OR substr(quantity_ea_text, 1, 1) BETWEEN '1' AND '9'
+        )
+      )
+      OR (
+        instr(quantity_ea_text, '.') > 1
+        AND (
+          substr(quantity_ea_text, 1, instr(quantity_ea_text, '.') - 1) = '0'
+          OR substr(quantity_ea_text, 1, 1) BETWEEN '1' AND '9'
+        )
+        AND length(substr(quantity_ea_text, instr(quantity_ea_text, '.') + 1)) > 0
+        AND substr(quantity_ea_text, -1, 1) BETWEEN '1' AND '9'
+      )
+    )
   ),
   source_note TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -170,9 +206,26 @@ CREATE TABLE transport_entries(
   trip_count_text TEXT NOT NULL CHECK(
     typeof(trip_count_text) = 'text'
     AND trip_count_text = trim(trip_count_text)
-    AND trip_count_text GLOB '*[0-9]*'
     AND trip_count_text NOT GLOB '*[^0-9.]*'
     AND length(trip_count_text) - length(replace(trip_count_text, '.', '')) <= 1
+    AND (
+      (
+        instr(trip_count_text, '.') = 0
+        AND (
+          trip_count_text = '0'
+          OR substr(trip_count_text, 1, 1) BETWEEN '1' AND '9'
+        )
+      )
+      OR (
+        instr(trip_count_text, '.') > 1
+        AND (
+          substr(trip_count_text, 1, instr(trip_count_text, '.') - 1) = '0'
+          OR substr(trip_count_text, 1, 1) BETWEEN '1' AND '9'
+        )
+        AND length(substr(trip_count_text, instr(trip_count_text, '.') + 1)) > 0
+        AND substr(trip_count_text, -1, 1) BETWEEN '1' AND '9'
+      )
+    )
   ),
   unit_rate_won INTEGER CHECK(
     unit_rate_won IS NULL OR (
