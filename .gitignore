@@ -1,0 +1,9 @@
+*.xlsx
+*.xls
+*.pptx
+transport_report/runtime/
+transport_report/dist/
+transport_report/build/
+transport_report/.pytest_cache/
+transport_report/**/__pycache__/
+transport_report/.venv/
