@@ -205,7 +205,7 @@ def test_invalid_money_is_rejected(repository, destinations, api, money):
         repository.save_plan("2026-09", destination.id, Decimal("1"), money, None)
 
 
-def test_sqlite_integer_maximum_is_accepted_for_ids_money_and_revision(repository):
+def test_sqlite_integer_maximum_is_accepted_for_ids_and_money(repository):
     maximum = 2**63 - 1
     with repository.database.connection() as connection:
         connection.execute(
@@ -216,11 +216,9 @@ def test_sqlite_integer_maximum_is_accepted_for_ids_money_and_revision(repositor
 
     quantity = repository.save_actual_quantity("2026-09", maximum, 1)
     sales = repository.save_sales("2026-09", maximum, None, "2026-09-15")
-    run = repository.finalize_month("2026-09", maximum)
 
     assert quantity.destination_id == maximum
     assert sales.amount_won == maximum
-    assert run.input_revision == maximum
 
 
 def test_sqlite_integer_overflow_is_rejected_before_binding(repository, api):
@@ -229,7 +227,6 @@ def test_sqlite_integer_overflow_is_rejected_before_binding(repository, api):
     operations = [
         lambda: repository.get_plan("2026-09", overflow),
         lambda: repository.save_sales("2026-09", overflow, None, "2026-09-15"),
-        lambda: repository.finalize_month("2026-09", overflow),
     ]
 
     for operation in operations:
@@ -271,6 +268,14 @@ def test_sales_timestamps_normalize_to_seoul_and_seconds(repository):
 
     assert from_string.confirmed_at == "2026-09-16T01:30:45+09:00"
     assert from_datetime.confirmed_at == from_string.confirmed_at
+
+
+def test_business_timezone_is_fixed_kst_without_zoneinfo(api):
+    _, monthly_inputs = api
+
+    assert "ZoneInfo" not in vars(monthly_inputs)
+    assert monthly_inputs._SEOUL.utcoffset(None) == timedelta(hours=9)
+    assert monthly_inputs._SEOUL.tzname(None) == "KST"
 
 
 def test_sales_rejects_naive_datetime(repository, api):
@@ -348,7 +353,7 @@ def test_locked_month_rejects_plan_and_sales_clears(repository, destinations, ap
     _, destination, _ = destinations
     repository.save_plan("2026-09", destination.id, 0, 0, None)
     repository.save_sales("2026-09", 0, None, "2026-09-15")
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
 
     with pytest.raises(monthly_inputs.MonthLockedError):
         repository.clear_plan("2026-09", destination.id)
@@ -379,7 +384,7 @@ def test_finalized_month_rejects_every_ordinary_write_and_clear(
     _, monthly_inputs = api
     _, destination, _ = destinations
     repository.save_actual_quantity("2026-09", destination.id, 1)
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
 
     operations = [
         lambda: repository.save_plan("2026-09", destination.id, 1, 1, None),
@@ -396,7 +401,7 @@ def test_finalized_month_rejects_every_ordinary_write_and_clear(
 
 def test_unlock_records_reason_and_time_then_allows_writes(repository, destinations):
     _, destination, _ = destinations
-    locked = repository.finalize_month("2026-09", 1)
+    locked = repository.finalize_month("2026-09", "revision-1")
     unlocked = repository.unlock_month("2026-09", "  corrected finance input  ")
 
     assert locked.is_locked is True
@@ -405,7 +410,7 @@ def test_unlock_records_reason_and_time_then_allows_writes(repository, destinati
     assert unlocked.locked_at is None
     assert unlocked.unlocked_at
     assert unlocked.unlock_reason == "corrected finance input"
-    assert unlocked.input_revision == 1
+    assert unlocked.input_revision == "revision-1"
     assert repository.is_month_locked("2026-09") is False
 
     repository.save_plan("2026-09", destination.id, 1, 1, None)
@@ -418,31 +423,45 @@ def test_unlock_requires_a_locked_month_and_nonblank_reason(repository, api):
     with pytest.raises(monthly_inputs.MonthLockError, match="not locked"):
         repository.unlock_month("2026-09", "correction")
 
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
     for reason in (None, "", "   "):
         with pytest.raises(monthly_inputs.MonthlyInputValidationError, match="reason"):
             repository.unlock_month("2026-09", reason)
     assert repository.is_month_locked("2026-09") is True
 
 
-@pytest.mark.parametrize("invalid_revision", [-1, True, 1.5, "1", " ", None])
+@pytest.mark.parametrize("invalid_revision", [-1, 1, True, 1.5, " ", None])
 def test_finalize_rejects_invalid_revision(repository, api, invalid_revision):
     _, monthly_inputs = api
     with pytest.raises(monthly_inputs.MonthlyInputValidationError, match="revision"):
         repository.finalize_month("2026-09", invalid_revision)
 
 
+def test_input_revision_preserves_nonblank_opaque_text_and_round_trips(repository):
+    locked = repository.finalize_month("2026-09", "  sha256:abc123  ")
+    unlocked = repository.unlock_month("2026-09", "correction")
+
+    assert locked.input_revision == "  sha256:abc123  "
+    assert unlocked.input_revision == "  sha256:abc123  "
+    with repository.database.connection() as connection:
+        state_revision = connection.execute(
+            "SELECT input_revision FROM month_locks WHERE report_month = ?",
+            ("2026-09",),
+        ).fetchone()[0]
+    assert state_revision == "  sha256:abc123  "
+
+
 def test_finalize_rejects_already_locked_month(repository, api):
     _, monthly_inputs = api
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
     with pytest.raises(monthly_inputs.MonthLockError, match="already locked"):
-        repository.finalize_month("2026-09", 2)
+        repository.finalize_month("2026-09", "revision-2")
 
 
 def test_lock_state_is_single_row_and_lock_audit_is_append_only(repository):
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
     repository.unlock_month("2026-09", "correction one")
-    repository.finalize_month("2026-09", 2)
+    repository.finalize_month("2026-09", "revision-2")
     repository.unlock_month("2026-09", "correction two")
 
     with repository.database.connection() as connection:
@@ -457,7 +476,7 @@ def test_lock_state_is_single_row_and_lock_audit_is_append_only(repository):
 
     assert len(locks) == 1
     assert locks[0]["is_locked"] == 0
-    assert locks[0]["input_revision"] == 2
+    assert locks[0]["input_revision"] == "revision-2"
     assert locks[0]["last_unlock_reason"] == "correction two"
     assert [row["status"] for row in events] == [
         "month_locked",
@@ -474,8 +493,12 @@ def test_concurrent_lock_transitions_have_one_winner(repository, api):
         finalize_results = [
             future.exception()
             for future in (
-                executor.submit(repository.finalize_month, "2026-09", 1),
-                executor.submit(repository.finalize_month, "2026-09", 2),
+                executor.submit(
+                    repository.finalize_month, "2026-09", "revision-1"
+                ),
+                executor.submit(
+                    repository.finalize_month, "2026-09", "revision-2"
+                ),
             )
         ]
     assert sum(result is None for result in finalize_results) == 1
@@ -504,7 +527,7 @@ def test_concurrent_lock_transitions_have_one_winner(repository, api):
 
 
 def test_unlock_does_not_rewrite_a_future_report_generation_row(repository):
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
     with repository.database.connection() as connection:
         future_run_id = connection.execute(
             "INSERT INTO report_runs"
@@ -534,7 +557,7 @@ def test_unlock_does_not_rewrite_a_future_report_generation_row(repository):
 
 
 def test_month_lock_audit_rows_are_immutable_but_other_report_runs_are_not(repository):
-    locked = repository.finalize_month("2026-09", 1)
+    locked = repository.finalize_month("2026-09", "revision-1")
     repository.unlock_month("2026-09", "correct inputs")
 
     with repository.database.connection() as connection:
@@ -597,7 +620,7 @@ def test_database_triggers_block_non_repository_month_writes_until_unlock(
             ),
         ).lastrowid
         connection.commit()
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
 
     with repository.database.connection() as connection:
         locked_writes = [
@@ -697,7 +720,7 @@ def test_database_triggers_cover_plan_quantity_sales_and_leave_batches_writable(
             ("2026-09", "test", "source.xlsx", "b" * 64, "staged"),
         ).lastrowid
         connection.commit()
-    repository.finalize_month("2026-09", 1)
+    repository.finalize_month("2026-09", "revision-1")
 
     locked_operations = [
         (

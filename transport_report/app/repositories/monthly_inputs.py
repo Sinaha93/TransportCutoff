@@ -3,9 +3,8 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 from app.db import Database
 from app.importers.protocols import QuantityRecord
@@ -13,7 +12,8 @@ from app.importers.protocols import QuantityRecord
 
 _MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
 _DEFAULT_QUANTITY_SOURCE = "ERP 수기 확인"
-_SEOUL = ZoneInfo("Asia/Seoul")
+# The report's business timezone is fixed KST (UTC+09:00), with no DST rules.
+_SEOUL = timezone(timedelta(hours=9), name="KST")
 
 
 class MonthlyInputError(Exception):
@@ -70,7 +70,7 @@ class ReportRun:
     locked_at: str | None
     unlocked_at: str | None
     unlock_reason: str | None
-    input_revision: int | None
+    input_revision: str | None
 
 
 class MonthLockGuard:
@@ -330,9 +330,9 @@ class MonthlyInputRepository:
         with self.database.connection() as connection:
             return self.lock_guard.is_locked(connection, report_month)
 
-    def finalize_month(self, report_month: str, input_revision: int) -> ReportRun:
+    def finalize_month(self, report_month: str, input_revision: str) -> ReportRun:
         _validate_month(report_month)
-        _validate_sqlite_integer(input_revision, "input_revision", minimum=0)
+        revision = _required_opaque_text(input_revision, "input_revision")
         with self.database.connection() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -349,13 +349,13 @@ class MonthlyInputRepository:
                     "is_locked = 1, locked_at = excluded.locked_at, "
                     "unlocked_at = NULL, input_revision = excluded.input_revision, "
                     "last_unlock_reason = NULL",
-                    (report_month, locked_at, input_revision),
+                    (report_month, locked_at, revision),
                 )
                 row = connection.execute(
                     "INSERT INTO report_runs"
                     "(report_month, status, is_locked, locked_at, input_revision) "
                     "VALUES (?, 'month_locked', 1, ?, ?) RETURNING *",
-                    (report_month, locked_at, input_revision),
+                    (report_month, locked_at, revision),
                 ).fetchone()
                 connection.commit()
             except Exception:
@@ -393,7 +393,7 @@ class MonthlyInputRepository:
                         report_month,
                         unlocked_at,
                         clean_reason,
-                        int(locked_row["input_revision"]),
+                        str(locked_row["input_revision"]),
                     ),
                 ).fetchone()
                 connection.commit()
@@ -511,6 +511,12 @@ def _required_text(value: object, field: str) -> str:
     return value.strip()
 
 
+def _required_opaque_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise MonthlyInputValidationError(f"{field} must be nonblank text")
+    return value
+
+
 def _normalize_confirmed_at(value: object) -> str:
     if isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
         try:
@@ -583,6 +589,6 @@ def _report_run_from_row(row: sqlite3.Row) -> ReportRun:
         unlocked_at=row["unlocked_at"],
         unlock_reason=row["unlock_reason"],
         input_revision=(
-            None if row["input_revision"] is None else int(row["input_revision"])
+            None if row["input_revision"] is None else str(row["input_revision"])
         ),
     )

@@ -10,9 +10,9 @@ CREATE TABLE month_locks(
   ),
   locked_at TEXT NOT NULL,
   unlocked_at TEXT,
-  input_revision INTEGER NOT NULL CHECK(
-    typeof(input_revision) = 'integer'
-    AND input_revision BETWEEN 0 AND 9223372036854775807
+  input_revision TEXT NOT NULL CHECK(
+    typeof(input_revision) = 'text'
+    AND length(trim(input_revision)) > 0
   ),
   last_unlock_reason TEXT,
   CHECK(
@@ -25,41 +25,6 @@ CREATE TABLE month_locks(
     )
   )
 );
-
-CREATE TABLE month_lock_migration_guard(value INTEGER);
-
-CREATE TRIGGER month_lock_migration_reject_invalid_revision
-BEFORE INSERT ON month_lock_migration_guard
-WHEN NEW.value = 0
-BEGIN
-  SELECT RAISE(ABORT, 'invalid legacy lock input_revision');
-END;
-
-INSERT INTO month_lock_migration_guard(value)
-SELECT CASE WHEN EXISTS (
-  SELECT 1
-  FROM report_runs AS candidate
-  WHERE candidate.is_locked = 1
-    AND candidate.id = (
-      SELECT MAX(latest.id)
-      FROM report_runs AS latest
-      WHERE latest.report_month = candidate.report_month
-        AND latest.is_locked = 1
-    )
-    AND (
-      candidate.input_revision IS NULL
-      OR length(trim(candidate.input_revision)) = 0
-      OR trim(candidate.input_revision) GLOB '*[^0-9]*'
-      OR length(ltrim(trim(candidate.input_revision), '0')) > 19
-      OR (
-        length(ltrim(trim(candidate.input_revision), '0')) = 19
-        AND ltrim(trim(candidate.input_revision), '0') > '9223372036854775807'
-      )
-    )
-) THEN 0 ELSE 1 END;
-
-DROP TRIGGER month_lock_migration_reject_invalid_revision;
-DROP TABLE month_lock_migration_guard;
 
 INSERT INTO month_locks(
   report_month,
@@ -74,7 +39,7 @@ SELECT
   1,
   legacy.locked_at,
   NULL,
-  CAST(trim(legacy.input_revision) AS INTEGER),
+  legacy.input_revision,
   NULL
 FROM report_runs AS legacy
 WHERE legacy.is_locked = 1
@@ -84,6 +49,21 @@ WHERE legacy.is_locked = 1
     WHERE latest.report_month = legacy.report_month
       AND latest.is_locked = 1
   );
+
+INSERT INTO report_runs(
+  report_month,
+  status,
+  is_locked,
+  locked_at,
+  input_revision
+)
+SELECT
+  report_month,
+  'month_locked',
+  1,
+  locked_at,
+  input_revision
+FROM month_locks;
 
 CREATE TRIGGER monthly_plans_reject_locked_insert
 BEFORE INSERT ON monthly_plans
@@ -239,6 +219,17 @@ CREATE TRIGGER report_runs_reject_month_lock_audit_update
 BEFORE UPDATE ON report_runs
 WHEN OLD.status IN ('month_locked', 'month_unlocked')
   OR NEW.status IN ('month_locked', 'month_unlocked')
+BEGIN
+  SELECT RAISE(ABORT, 'month lock audit immutable');
+END;
+
+CREATE TRIGGER report_runs_reject_month_lock_audit_replace
+BEFORE INSERT ON report_runs
+WHEN EXISTS (
+  SELECT 1
+  FROM report_runs
+  WHERE id = NEW.id AND status IN ('month_locked', 'month_unlocked')
+)
 BEGIN
   SELECT RAISE(ABORT, 'month lock audit immutable');
 END;

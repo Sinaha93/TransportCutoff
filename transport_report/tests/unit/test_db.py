@@ -7,6 +7,7 @@ import pytest
 
 import app.db as db_module
 from app.db import Database
+from app.repositories.monthly_inputs import MonthlyInputRepository
 
 
 def test_initial_migration_creates_required_tables(tmp_path):
@@ -82,7 +83,12 @@ def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp
     } <= trigger_names
 
 
-def test_month_lock_migration_backfills_latest_legacy_active_lock(tmp_path):
+@pytest.mark.parametrize(
+    "revision", ["revision-1", "sha256:abc123", "  revision-1  "]
+)
+def test_month_lock_migration_backfills_opaque_revision_and_appends_audit(
+    tmp_path, revision
+):
     migrations_dir = Database(tmp_path / "unused.db").migrations_dir
     first_only = tmp_path / "first-only"
     first_only.mkdir()
@@ -93,68 +99,55 @@ def test_month_lock_migration_backfills_latest_legacy_active_lock(tmp_path):
     legacy_database = Database(database_path, migrations_dir=first_only)
     legacy_database.migrate()
     with legacy_database.connection() as connection:
-        connection.execute(
+        original_id = connection.execute(
             "INSERT INTO report_runs"
             "(report_month, status, is_locked, locked_at, input_revision) "
             "VALUES (?, ?, 1, ?, ?)",
-            ("2026-09", "finalized", "2026-09-20T10:00:00+09:00", " 007 "),
-        )
-        connection.execute(
-            "INSERT INTO report_runs"
-            "(report_month, status, is_locked, locked_at, input_revision) "
-            "VALUES (?, ?, 1, ?, ?)",
-            ("2026-09", "regenerated", "2026-09-21T10:00:00+09:00", "8"),
-        )
+            ("2026-09", "finalized", "2026-09-20T10:00:00+09:00", revision),
+        ).lastrowid
         connection.commit()
 
     upgraded = Database(database_path)
     upgraded.migrate()
 
     with upgraded.connection() as connection:
-        row = connection.execute(
+        lock_row = connection.execute(
             "SELECT * FROM month_locks WHERE report_month = ?", ("2026-09",)
         ).fetchone()
-    assert row["is_locked"] == 1
-    assert row["locked_at"] == "2026-09-21T10:00:00+09:00"
-    assert row["input_revision"] == 8
+        original = connection.execute(
+            "SELECT * FROM report_runs WHERE id = ?", (original_id,)
+        ).fetchone()
+        events = connection.execute(
+            "SELECT * FROM report_runs WHERE id <> ? ORDER BY id", (original_id,)
+        ).fetchall()
+    assert lock_row["is_locked"] == 1
+    assert lock_row["locked_at"] == "2026-09-20T10:00:00+09:00"
+    assert lock_row["input_revision"] == revision
+    assert original["status"] == "finalized"
+    assert original["input_revision"] == revision
+    assert [row["status"] for row in events] == ["month_locked"]
+    assert events[0]["input_revision"] == revision
 
-
-def test_month_lock_migration_rejects_incompatible_legacy_revision(tmp_path):
-    migrations_dir = Database(tmp_path / "unused.db").migrations_dir
-    first_only = tmp_path / "first-only"
-    first_only.mkdir()
-    shutil.copyfile(
-        migrations_dir / "001_initial.sql", first_only / "001_initial.sql"
-    )
-    database_path = tmp_path / "app.db"
-    legacy_database = Database(database_path, migrations_dir=first_only)
-    legacy_database.migrate()
-    with legacy_database.connection() as connection:
-        connection.execute(
-            "INSERT INTO report_runs"
-            "(report_month, status, is_locked, locked_at, input_revision) "
-            "VALUES (?, ?, 1, ?, ?)",
-            (
-                "2026-09",
-                "finalized",
-                "2026-09-20T10:00:00+09:00",
-                "revision-one",
-            ),
-        )
-        connection.commit()
-
-    with pytest.raises(sqlite3.IntegrityError, match="invalid legacy lock input_revision"):
-        Database(database_path).migrate()
-
-    with legacy_database.connection() as connection:
-        versions = [
-            row["version"]
-            for row in connection.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
-        ]
-    assert versions == [1]
-    assert "month_locks" not in legacy_database.table_names()
+    MonthlyInputRepository(upgraded).unlock_month("2026-09", "correct legacy input")
+    with upgraded.connection() as connection:
+        audit_rows = connection.execute(
+            "SELECT id, status, input_revision FROM report_runs "
+            "WHERE status IN ('month_locked', 'month_unlocked') ORDER BY id"
+        ).fetchall()
+        for audit_row in audit_rows:
+            for statement in (
+                "UPDATE report_runs SET status = 'changed' WHERE id = ?",
+                "DELETE FROM report_runs WHERE id = ?",
+                "INSERT OR REPLACE INTO report_runs"
+                "(id, report_month, status) VALUES (?, '2026-09', 'changed')",
+            ):
+                with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                    connection.execute(statement, (audit_row["id"],))
+    assert [row["status"] for row in audit_rows] == [
+        "month_locked",
+        "month_unlocked",
+    ]
+    assert [row["input_revision"] for row in audit_rows] == [revision, revision]
 
 
 def test_monthly_actual_costs_store_authoritative_totals_with_provenance(tmp_path):
