@@ -324,7 +324,7 @@ git commit -m "feat: add editable destination and group masters"
 - Create: `transport_report/app/repositories/monthly_inputs.py`
 - Create: `transport_report/tests/unit/test_monthly_inputs.py`
 
-- [ ] **Step 1: Define and test the quantity-source contract**
+- [x] **Step 1: Define and test the quantity-source contract**
 
 ```python
 class QuantityProvider(Protocol):
@@ -341,13 +341,13 @@ class QuantityRecord:
 
 Write a test proving `ManualQuantityProvider` returns explicitly entered zero while leaving an unentered destination absent.
 
-- [ ] **Step 2: Run the test and verify failure**
+- [x] **Step 2: Run the test and verify failure**
 
 Run: `python -m pytest tests/unit/test_monthly_inputs.py -v`
 
 Expected: FAIL because the provider and repository are missing.
 
-- [ ] **Step 3: Implement monthly input upserts**
+- [x] **Step 3: Implement monthly input upserts**
 
 Implement separate upserts for:
 
@@ -359,17 +359,17 @@ save_sales(report_month, amount_won, source_note, confirmed_at)
 
 Use `None` for missing quantity and `Decimal("0")` for confirmed zero.
 
-- [ ] **Step 4: Add month-lock behavior**
+- [x] **Step 4: Add month-lock behavior**
 
 A finalized report month may be unlocked deliberately, but ordinary form submissions must reject updates while locked. Record the unlock and reason in `report_runs`.
 
-- [ ] **Step 5: Run focused tests**
+- [x] **Step 5: Run focused tests**
 
 Run: `python -m pytest tests/unit/test_monthly_inputs.py -v`
 
 Expected: PASS for insert, update, explicit zero, missing value, and locked-month behavior.
 
-- [ ] **Step 6: Commit monthly inputs**
+- [x] **Step 6: Commit monthly inputs**
 
 ```powershell
 git add transport_report/app/importers/protocols.py transport_report/app/repositories/monthly_inputs.py transport_report/tests/unit/test_monthly_inputs.py
