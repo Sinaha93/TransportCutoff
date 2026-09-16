@@ -26,7 +26,135 @@ def test_initial_migration_creates_required_tables(tmp_path):
         "transport_entries",
         "import_batches",
         "report_runs",
+        "month_locks",
     } <= names
+
+
+def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp_path):
+    migrations_dir = Database(tmp_path / "unused.db").migrations_dir
+    first_only = tmp_path / "first-only"
+    first_only.mkdir()
+    shutil.copyfile(
+        migrations_dir / "001_initial.sql", first_only / "001_initial.sql"
+    )
+    database_path = tmp_path / "app.db"
+    Database(database_path, migrations_dir=first_only).migrate()
+
+    database = Database(database_path)
+    database.migrate()
+
+    with database.connection() as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        lock_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(month_locks)")
+        }
+        trigger_names = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+    assert versions == [1, 2]
+    assert {
+        "report_month",
+        "is_locked",
+        "locked_at",
+        "unlocked_at",
+        "input_revision",
+        "last_unlock_reason",
+    } <= lock_columns
+    assert {
+        f"{table}_reject_locked_{operation}"
+        for table in (
+            "monthly_plans",
+            "monthly_actual_quantities",
+            "monthly_sales",
+            "monthly_actual_costs",
+            "transport_entries",
+        )
+        for operation in ("insert", "update", "delete")
+    } <= trigger_names
+
+
+def test_month_lock_migration_backfills_latest_legacy_active_lock(tmp_path):
+    migrations_dir = Database(tmp_path / "unused.db").migrations_dir
+    first_only = tmp_path / "first-only"
+    first_only.mkdir()
+    shutil.copyfile(
+        migrations_dir / "001_initial.sql", first_only / "001_initial.sql"
+    )
+    database_path = tmp_path / "app.db"
+    legacy_database = Database(database_path, migrations_dir=first_only)
+    legacy_database.migrate()
+    with legacy_database.connection() as connection:
+        connection.execute(
+            "INSERT INTO report_runs"
+            "(report_month, status, is_locked, locked_at, input_revision) "
+            "VALUES (?, ?, 1, ?, ?)",
+            ("2026-09", "finalized", "2026-09-20T10:00:00+09:00", " 007 "),
+        )
+        connection.execute(
+            "INSERT INTO report_runs"
+            "(report_month, status, is_locked, locked_at, input_revision) "
+            "VALUES (?, ?, 1, ?, ?)",
+            ("2026-09", "regenerated", "2026-09-21T10:00:00+09:00", "8"),
+        )
+        connection.commit()
+
+    upgraded = Database(database_path)
+    upgraded.migrate()
+
+    with upgraded.connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM month_locks WHERE report_month = ?", ("2026-09",)
+        ).fetchone()
+    assert row["is_locked"] == 1
+    assert row["locked_at"] == "2026-09-21T10:00:00+09:00"
+    assert row["input_revision"] == 8
+
+
+def test_month_lock_migration_rejects_incompatible_legacy_revision(tmp_path):
+    migrations_dir = Database(tmp_path / "unused.db").migrations_dir
+    first_only = tmp_path / "first-only"
+    first_only.mkdir()
+    shutil.copyfile(
+        migrations_dir / "001_initial.sql", first_only / "001_initial.sql"
+    )
+    database_path = tmp_path / "app.db"
+    legacy_database = Database(database_path, migrations_dir=first_only)
+    legacy_database.migrate()
+    with legacy_database.connection() as connection:
+        connection.execute(
+            "INSERT INTO report_runs"
+            "(report_month, status, is_locked, locked_at, input_revision) "
+            "VALUES (?, ?, 1, ?, ?)",
+            (
+                "2026-09",
+                "finalized",
+                "2026-09-20T10:00:00+09:00",
+                "revision-one",
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="invalid legacy lock input_revision"):
+        Database(database_path).migrate()
+
+    with legacy_database.connection() as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+    assert versions == [1]
+    assert "month_locks" not in legacy_database.table_names()
 
 
 def test_monthly_actual_costs_store_authoritative_totals_with_provenance(tmp_path):
@@ -331,7 +459,7 @@ def test_migrations_are_repeatable(tmp_path):
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1]
+    assert [row["version"] for row in versions] == [1, 2]
 
 
 def test_migrate_rejects_schema_versions_newer_than_bundled_migrations(tmp_path):
@@ -918,7 +1046,7 @@ def test_concurrent_migrate_calls_do_not_reapply_versions(tmp_path, monkeypatch)
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1]
+    assert [row["version"] for row in versions] == [1, 2]
 
 
 def _schema_objects(db):

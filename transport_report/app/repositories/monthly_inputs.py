@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from app.db import Database
 from app.importers.protocols import QuantityRecord
@@ -12,6 +13,7 @@ from app.importers.protocols import QuantityRecord
 
 _MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
 _DEFAULT_QUANTITY_SOURCE = "ERP 수기 확인"
+_SEOUL = ZoneInfo("Asia/Seoul")
 
 
 class MonthlyInputError(Exception):
@@ -68,12 +70,33 @@ class ReportRun:
     locked_at: str | None
     unlocked_at: str | None
     unlock_reason: str | None
-    input_revision: str | None
+    input_revision: int | None
+
+
+class MonthLockGuard:
+    """Read current month-lock state using a caller-owned connection."""
+
+    @staticmethod
+    def is_locked(connection: sqlite3.Connection, report_month: str) -> bool:
+        row = connection.execute(
+            "SELECT is_locked FROM month_locks WHERE report_month = ?",
+            (report_month,),
+        ).fetchone()
+        return row is not None and bool(row["is_locked"])
+
+    def require_unlocked(
+        self, connection: sqlite3.Connection, report_month: str
+    ) -> None:
+        if self.is_locked(connection, report_month):
+            raise MonthLockedError(
+                f"Report month {report_month} is finalized and locked"
+            )
 
 
 class MonthlyInputRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+        self.lock_guard = MonthLockGuard()
 
     def save_plan(
         self,
@@ -142,6 +165,26 @@ class MonthlyInputRepository:
                 (report_month,),
             ).fetchall()
         return [_plan_from_row(row) for row in rows]
+
+    def clear_plan(self, report_month: str, destination_id: int) -> bool:
+        _validate_month(report_month)
+        _validate_id(destination_id)
+        with self.database.connection() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_unlocked(connection, report_month)
+                self._require_destination(connection, destination_id)
+                cursor = connection.execute(
+                    "DELETE FROM monthly_plans "
+                    "WHERE report_month = ? AND destination_id = ?",
+                    (report_month, destination_id),
+                )
+                removed = cursor.rowcount > 0
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return removed
 
     def save_actual_quantity(
         self,
@@ -265,26 +308,54 @@ class MonthlyInputRepository:
             ).fetchone()
         return None if row is None else _sales_from_row(row)
 
-    def is_month_locked(self, report_month: str) -> bool:
+    def clear_sales(self, report_month: str) -> bool:
         _validate_month(report_month)
-        with self.database.connection() as connection:
-            return self._month_is_locked(connection, report_month)
-
-    def finalize_month(self, report_month: str, input_revision: str) -> ReportRun:
-        _validate_month(report_month)
-        clean_revision = _required_text(input_revision, "input_revision")
         with self.database.connection() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                if self._month_is_locked(connection, report_month):
+                self._require_unlocked(connection, report_month)
+                cursor = connection.execute(
+                    "DELETE FROM monthly_sales WHERE report_month = ?",
+                    (report_month,),
+                )
+                removed = cursor.rowcount > 0
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return removed
+
+    def is_month_locked(self, report_month: str) -> bool:
+        _validate_month(report_month)
+        with self.database.connection() as connection:
+            return self.lock_guard.is_locked(connection, report_month)
+
+    def finalize_month(self, report_month: str, input_revision: int) -> ReportRun:
+        _validate_month(report_month)
+        _validate_sqlite_integer(input_revision, "input_revision", minimum=0)
+        with self.database.connection() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if self.lock_guard.is_locked(connection, report_month):
                     raise MonthLockError(
                         f"Report month {report_month} is already locked"
                     )
+                locked_at = _utc_now()
+                connection.execute(
+                    "INSERT INTO month_locks"
+                    "(report_month, is_locked, locked_at, unlocked_at, "
+                    "input_revision, last_unlock_reason) VALUES (?, 1, ?, NULL, ?, NULL) "
+                    "ON CONFLICT(report_month) DO UPDATE SET "
+                    "is_locked = 1, locked_at = excluded.locked_at, "
+                    "unlocked_at = NULL, input_revision = excluded.input_revision, "
+                    "last_unlock_reason = NULL",
+                    (report_month, locked_at, input_revision),
+                )
                 row = connection.execute(
                     "INSERT INTO report_runs"
                     "(report_month, status, is_locked, locked_at, input_revision) "
-                    "VALUES (?, 'finalized', 1, ?, ?) RETURNING *",
-                    (report_month, _utc_now(), clean_revision),
+                    "VALUES (?, 'month_locked', 1, ?, ?) RETURNING *",
+                    (report_month, locked_at, input_revision),
                 ).fetchone()
                 connection.commit()
             except Exception:
@@ -299,19 +370,31 @@ class MonthlyInputRepository:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 locked_row = connection.execute(
-                    "SELECT id FROM report_runs "
-                    "WHERE report_month = ? AND is_locked = 1 "
-                    "ORDER BY id DESC LIMIT 1",
+                    "SELECT input_revision FROM month_locks "
+                    "WHERE report_month = ? AND is_locked = 1",
                     (report_month,),
                 ).fetchone()
                 if locked_row is None:
                     raise MonthLockError(
                         f"Report month {report_month} is not locked"
                     )
+                unlocked_at = _utc_now()
+                connection.execute(
+                    "UPDATE month_locks SET is_locked = 0, unlocked_at = ?, "
+                    "last_unlock_reason = ? WHERE report_month = ? AND is_locked = 1",
+                    (unlocked_at, clean_reason, report_month),
+                )
                 row = connection.execute(
-                    "UPDATE report_runs SET status = 'unlocked', is_locked = 0, "
-                    "unlocked_at = ?, unlock_reason = ? WHERE id = ? RETURNING *",
-                    (_utc_now(), clean_reason, int(locked_row["id"])),
+                    "INSERT INTO report_runs"
+                    "(report_month, status, is_locked, unlocked_at, unlock_reason, "
+                    "input_revision) VALUES (?, 'month_unlocked', 0, ?, ?, ?) "
+                    "RETURNING *",
+                    (
+                        report_month,
+                        unlocked_at,
+                        clean_reason,
+                        int(locked_row["input_revision"]),
+                    ),
                 ).fetchone()
                 connection.commit()
             except Exception:
@@ -319,21 +402,10 @@ class MonthlyInputRepository:
                 raise
         return _report_run_from_row(row)
 
-    @staticmethod
-    def _month_is_locked(
-        connection: sqlite3.Connection, report_month: str
-    ) -> bool:
-        return connection.execute(
-            "SELECT 1 FROM report_runs "
-            "WHERE report_month = ? AND is_locked = 1 LIMIT 1",
-            (report_month,),
-        ).fetchone() is not None
-
     def _require_unlocked(
         self, connection: sqlite3.Connection, report_month: str
     ) -> None:
-        if self._month_is_locked(connection, report_month):
-            raise MonthLockedError(f"Report month {report_month} is finalized and locked")
+        self.lock_guard.require_unlocked(connection, report_month)
 
     @staticmethod
     def _require_destination(
@@ -348,6 +420,8 @@ class MonthlyInputRepository:
 
 
 class ManualQuantityProvider:
+    """Provide one manual ERP aggregate per stored month/destination row."""
+
     def __init__(self, repository: MonthlyInputRepository) -> None:
         self.repository = repository
 
@@ -357,7 +431,7 @@ class ManualQuantityProvider:
                 report_month=record.report_month,
                 destination_id=record.destination_id,
                 quantity_ea=record.quantity_ea,
-                source=record.source_note or "manual",
+                source="manual_erp",
             )
             for record in self.repository.list_actual_quantities(report_month)
         ]
@@ -379,9 +453,19 @@ def _raise_integrity_error(
 
 
 def _validate_id(value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    _validate_sqlite_integer(value, "destination_id", minimum=1)
+
+
+def _validate_sqlite_integer(value: object, field: str, *, minimum: int) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > 2**63 - 1
+    ):
+        qualifier = "positive" if minimum == 1 else "nonnegative"
         raise MonthlyInputValidationError(
-            "destination_id must be a positive integer"
+            f"{field} must be a {qualifier} integer within SQLite range"
         )
 
 
@@ -404,10 +488,12 @@ def _canonical_quantity(value: object) -> str:
 
 
 def _validate_money(value: object, field: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    try:
+        _validate_sqlite_integer(value, field, minimum=0)
+    except MonthlyInputValidationError as error:
         raise MonthlyInputValidationError(
             f"{field} must be a nonnegative integer won amount"
-        )
+        ) from error
 
 
 def _optional_text(value: object, field: str) -> str | None:
@@ -426,24 +512,33 @@ def _required_text(value: object, field: str) -> str:
 
 
 def _normalize_confirmed_at(value: object) -> str:
-    if isinstance(value, datetime):
-        return value.replace(microsecond=0).isoformat(timespec="seconds")
-    if not isinstance(value, str):
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        try:
+            parsed = datetime.fromisoformat(value).replace(tzinfo=_SEOUL)
+        except ValueError as error:
+            raise MonthlyInputValidationError(
+                "confirmed_at must be a valid ISO date or timezone-aware date/time"
+            ) from error
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as error:
+            raise MonthlyInputValidationError(
+                "confirmed_at must be a valid ISO date or timezone-aware date/time"
+            ) from error
+    elif isinstance(value, datetime):
+        parsed = value
+    else:
         raise MonthlyInputValidationError(
-            "confirmed_at must be a normalized ISO date/time string or datetime"
+            "confirmed_at must be an ISO date or timezone-aware date/time"
         )
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as error:
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise MonthlyInputValidationError(
-            "confirmed_at must be a normalized ISO date/time string or datetime"
-        ) from error
-    normalized = parsed.isoformat(timespec="seconds")
-    if "T" not in value or value != normalized:
-        raise MonthlyInputValidationError(
-            "confirmed_at must be a normalized ISO date/time string or datetime"
+            "confirmed_at date/time requires an explicit timezone"
         )
-    return normalized
+    return parsed.astimezone(_SEOUL).replace(microsecond=0).isoformat(
+        timespec="seconds"
+    )
 
 
 def _utc_now() -> str:
@@ -487,5 +582,7 @@ def _report_run_from_row(row: sqlite3.Row) -> ReportRun:
         locked_at=row["locked_at"],
         unlocked_at=row["unlocked_at"],
         unlock_reason=row["unlock_reason"],
-        input_revision=row["input_revision"],
+        input_revision=(
+            None if row["input_revision"] is None else int(row["input_revision"])
+        ),
     )
