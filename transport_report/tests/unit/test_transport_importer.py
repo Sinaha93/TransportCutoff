@@ -737,6 +737,60 @@ def test_repository_rejects_exponent_abuse_before_persistence(api, database):
         )
 
 
+def test_duplicate_import_restores_newline_alias_blockers_from_entries(api, database):
+    parser_module, repository_module, _ = api
+    rows = [
+        parser_module.ParsedTransportEntry(
+            report_month="2026-08",
+            destination_alias=alias,
+            source_sheet=REGULAR_SHEET,
+            source_row=source_row,
+            source_date=date(2026, 8, 1),
+            day=source_row,
+            transport_type="regular",
+            trip_count=Decimal("1"),
+            unit_rate_won=1,
+            cost_won=1,
+        )
+        for source_row, alias in enumerate(
+            ("Unknown\nPlant", "Unknown\nPlant", "Other Plant"), start=3
+        )
+    ]
+    repository = repository_module.TransportEntryRepository(database)
+
+    first = repository.import_entries(
+        report_month="2026-08",
+        source_filename="synthetic.xlsx",
+        file_sha256="f" * 64,
+        rows=rows,
+    )
+    duplicate = repository.import_entries(
+        report_month="2026-08",
+        source_filename="synthetic.xlsx",
+        file_sha256="f" * 64,
+        rows=rows,
+    )
+
+    expected_errors = (
+        "Unknown destination alias: Unknown\nPlant",
+        "Unknown destination alias: Other Plant",
+    )
+    assert first.status == "imported_with_errors"
+    assert first.blocking_errors == expected_errors
+    assert duplicate.status == "duplicate"
+    assert duplicate.inserted_count == 0
+    assert duplicate.blocking_errors == expected_errors
+    with database.connection() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM import_batches").fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM transport_entries").fetchone()[0]
+            == 3
+        )
+
+
 def test_import_is_idempotent_and_stores_file_hash(api, database, fixture_path):
     _, _, service_module = api
     workbook = load_workbook(fixture_path)

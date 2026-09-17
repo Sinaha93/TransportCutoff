@@ -45,14 +45,24 @@ class TransportEntryRepository:
                 (report_month, SOURCE_TYPE, file_sha256),
             ).fetchone()
             if duplicate is not None:
+                unknown_aliases: list[str] = []
+                for entry in connection.execute(
+                    "SELECT unresolved_alias FROM transport_entries "
+                    "WHERE import_batch_id = ? AND destination_id IS NULL "
+                    "ORDER BY id",
+                    (duplicate["id"],),
+                ):
+                    alias = entry["unresolved_alias"]
+                    if alias not in unknown_aliases:
+                        unknown_aliases.append(alias)
                 connection.rollback()
-                error_summary = duplicate["error_summary"]
                 return ImportCommitResult(
                     batch_id=int(duplicate["id"]),
                     status="duplicate",
                     inserted_count=0,
-                    blocking_errors=(
-                        tuple(error_summary.split("\n")) if error_summary else ()
+                    blocking_errors=tuple(
+                        f"Unknown destination alias: {alias}"
+                        for alias in unknown_aliases
                     ),
                 )
 
