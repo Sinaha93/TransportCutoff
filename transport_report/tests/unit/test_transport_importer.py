@@ -95,6 +95,58 @@ def test_parser_accepts_anonymized_real_workbook_structure_and_formula_caches(
     assert not {"합계", "총계", "계"} & {row.destination_alias for row in rows}
 
 
+def test_parser_skips_both_inactive_regular_row_shapes_and_updates_group(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "inactive-rows.xlsx", include_inactive_regular_rows=True
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+    aliases = {row.destination_alias for row in rows}
+    assert "Dormant Blank Destination" not in aliases
+    assert "Dormant Zero Destination" not in aliases
+    trailing_row = next(
+        row
+        for row in rows
+        if row.source_sheet == REGULAR_SHEET and row.source_row == 8
+    )
+    assert trailing_row.vehicle_driver_group == "8-ton / Driver B"
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        (3, 1),
+        (3, "malformed"),
+        (34, 1),
+        (34, "malformed"),
+        (37, 1),
+        (37, "malformed"),
+        (36, "malformed"),
+    ],
+)
+def test_parser_rejects_inactive_looking_row_with_invalid_activity_or_unit(
+    api, fixture_path, column, value
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[REGULAR_SHEET]
+    for day_column in range(3, 34):
+        sheet.cell(5, day_column).value = None
+    sheet.cell(5, 34, 0)
+    sheet.cell(5, 36).value = None
+    sheet.cell(5, 37, 0)
+    sheet.cell(5, column, value)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
 def test_hidden_regular_detail_rows_are_parsed(api, fixture_path):
     parser_module, _, _ = api
     workbook = load_workbook(fixture_path)

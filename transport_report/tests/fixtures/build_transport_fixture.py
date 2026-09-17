@@ -59,7 +59,9 @@ def build_transport_fixture(
     return path
 
 
-def build_structural_clone_fixture(path: Path, *, month: int = 8) -> Path:
+def build_structural_clone_fixture(
+    path: Path, *, month: int = 8, include_inactive_regular_rows: bool = False
+) -> Path:
     workbook = Workbook()
     regular = workbook.active
     regular.title = f"화성운반비내역({month}월)"
@@ -86,6 +88,24 @@ def build_structural_clone_fixture(path: Path, *, month: int = 8) -> Path:
     cached_values: dict[int, dict[str, str | None]] = {
         1: {"AH3": "1.25", "AK3": "2500", "AH5": "1", "AK5": "3000"}
     }
+    if include_inactive_regular_rows:
+        regular.cell(6, 1, "8-ton / Driver B")
+        regular.cell(6, 2, "Dormant Blank Destination")
+        regular.cell(6, 34, 0)
+        regular.cell(6, 37, 0)
+
+        regular.cell(7, 2, "Dormant Zero Destination")
+        for column in range(3, 34):
+            regular.cell(7, column, 0)
+        regular.cell(7, 34, 0)
+        regular.cell(7, 37, 0)
+
+        regular.cell(8, 2, "Known Plant")
+        regular.cell(8, 3, 1)
+        regular.cell(8, 34, "=SUM(C8:AG8)")
+        regular.cell(8, 36, 4_000)
+        regular.cell(8, 37, "=AH8*AJ8")
+        cached_values[1].update({"AH8": "1", "AK8": "4000"})
     for sheet_number, (sheet_name, total_column) in enumerate(
         zip(SUBCONTRACT_SHEETS, total_label_columns, strict=True), start=2
     ):

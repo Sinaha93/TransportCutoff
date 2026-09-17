@@ -147,6 +147,13 @@ class HwaseongWorkbookParser:
                 raise WorkbookStructureError(
                     f"{sheet.title} row {row_number} destination is required"
                 )
+            if (
+                not _has_value(unit_value)
+                and all(_is_blank_or_numeric_zero(value) for value in day_values)
+                and _is_blank_or_numeric_zero(cached_count_value)
+                and _is_blank_or_numeric_zero(cached_subtotal_value)
+            ):
+                continue
 
             unit_rate = _integer_won(
                 unit_value,
@@ -316,6 +323,18 @@ def _header_text(value: object) -> str:
 
 def _has_value(value: object) -> bool:
     return value is not None and value != ""
+
+
+def _is_blank_or_numeric_zero(value: object) -> bool:
+    if not _has_value(value):
+        return True
+    if isinstance(value, bool):
+        return False
+    try:
+        numeric_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return False
+    return numeric_value.is_finite() and numeric_value == 0
 
 
 def _is_displayed_total_row(sheet, row_number: int) -> bool:
