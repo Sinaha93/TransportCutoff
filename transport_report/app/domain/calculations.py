@@ -9,7 +9,7 @@ presentation. Other Decimal results are kept unrounded for downstream output.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 
@@ -19,6 +19,20 @@ from app.domain.models import Destination, GroupMember
 UNIT_COST_QUANTUM = Decimal("0.01")
 DEFAULT_REVIEW_THRESHOLD = Decimal("0.15")
 MAX_SQLITE_INTEGER = 2**63 - 1
+_NUMERIC_RESULT_FIELDS = (
+    "planned_quantity",
+    "planned_cost_won",
+    "actual_quantity",
+    "actual_cost_won",
+    "planned_unit_cost",
+    "actual_unit_cost",
+    "quantity_variance",
+    "quantity_variance_pct",
+    "cost_variance_won",
+    "cost_variance_pct",
+    "actual_unit_cost_variance",
+    "actual_unit_cost_variance_pct",
+)
 
 
 class CalculationKind(Enum):
@@ -109,9 +123,32 @@ class DestinationCalculation:
         raise TypeError("DestinationCalculation must be created by a public factory")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DestinationResult(DestinationCalculation):
-    destination_id: int | None
+    _destination_id: int | None = field(init=False, repr=False)
+
+    def __init__(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        raise TypeError("calculation results must be created by a public factory")
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        destination_id: int | None,
+        values: Mapping[str, object],
+    ) -> DestinationResult:
+        result = object.__new__(cls)
+        object.__setattr__(result, "_destination_id", destination_id)
+        _initialize_result_fields(result, values)
+        return result
+
+    @property
+    def destination_id(self) -> int | None:
+        return self._destination_id
 
     @property
     def kind(self) -> CalculationKind:
@@ -122,10 +159,43 @@ class DestinationResult(DestinationCalculation):
         return DestinationProvenance(self.destination_id)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DerivedGroupResult(DestinationCalculation):
-    group_id: int
-    member_destination_ids: tuple[int, ...]
+    _group_id: int = field(init=False, repr=False)
+    _member_destination_ids: tuple[int, ...] = field(init=False, repr=False)
+
+    def __init__(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        raise TypeError("calculation results must be created by a public factory")
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        group_id: int,
+        member_destination_ids: tuple[int, ...],
+        values: Mapping[str, object],
+    ) -> DerivedGroupResult:
+        result = object.__new__(cls)
+        object.__setattr__(result, "_group_id", group_id)
+        object.__setattr__(
+            result,
+            "_member_destination_ids",
+            tuple(member_destination_ids),
+        )
+        _initialize_result_fields(result, values)
+        return result
+
+    @property
+    def group_id(self) -> int:
+        return self._group_id
+
+    @property
+    def member_destination_ids(self) -> tuple[int, ...]:
+        return self._member_destination_ids
 
     @property
     def kind(self) -> CalculationKind:
@@ -136,9 +206,32 @@ class DerivedGroupResult(DestinationCalculation):
         return DerivedGroupProvenance(self.group_id, self.member_destination_ids)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class GrandTotalResult(DestinationCalculation):
-    destination_ids: tuple[int, ...]
+    _destination_ids: tuple[int, ...] = field(init=False, repr=False)
+
+    def __init__(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        raise TypeError("calculation results must be created by a public factory")
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        destination_ids: tuple[int, ...],
+        values: Mapping[str, object],
+    ) -> GrandTotalResult:
+        result = object.__new__(cls)
+        object.__setattr__(result, "_destination_ids", tuple(destination_ids))
+        _initialize_result_fields(result, values)
+        return result
+
+    @property
+    def destination_ids(self) -> tuple[int, ...]:
+        return self._destination_ids
 
     @property
     def kind(self) -> CalculationKind:
@@ -395,20 +488,37 @@ def _make_calculation(
         **calculated,
     )
     if isinstance(provenance, DestinationProvenance):
-        return DestinationResult(
-            **common_fields,
+        return DestinationResult._create(
             destination_id=provenance.destination_id,
+            values=common_fields,
         )
     if isinstance(provenance, DerivedGroupProvenance):
-        return DerivedGroupResult(
-            **common_fields,
+        return DerivedGroupResult._create(
             group_id=provenance.group_id,
             member_destination_ids=provenance.member_destination_ids,
+            values=common_fields,
         )
-    return GrandTotalResult(
-        **common_fields,
+    return GrandTotalResult._create(
         destination_ids=provenance.destination_ids,
+        values=common_fields,
     )
+
+
+def _initialize_result_fields(
+    result: DestinationCalculation, values: Mapping[str, object]
+) -> None:
+    expected_fields = set(_NUMERIC_RESULT_FIELDS)
+    supplied_fields = set(values)
+    if supplied_fields != expected_fields:
+        missing = sorted(expected_fields - supplied_fields)
+        unexpected = sorted(supplied_fields - expected_fields)
+        raise TypeError(
+            f"calculation result fields are invalid; missing={missing}, "
+            f"unexpected={unexpected}"
+        )
+    for name in _NUMERIC_RESULT_FIELDS:
+        object.__setattr__(result, name, values[name])
+    result.__post_init__()
 
 
 def _calculated_fields(

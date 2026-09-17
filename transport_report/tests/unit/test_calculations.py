@@ -424,7 +424,7 @@ def test_result_records_reject_invalid_numeric_fields(changes, message):
 
     valid = calculate_destination(Decimal("1"), 100, Decimal("1"), 100)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(TypeError, match="public factory"):
         replace(valid, **changes)
 
 
@@ -452,7 +452,7 @@ def test_result_records_reject_forged_calculated_fields(changes, message):
         Decimal("10"), 100, Decimal("20"), 240, destination_id=1
     )
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(TypeError, match="public factory"):
         replace(valid, **changes)
 
 
@@ -467,11 +467,11 @@ def test_result_records_reject_kind_relabeling_without_matching_provenance():
         [GroupMember(10, 1, "Member", 1, True, True)],
     )
 
-    with pytest.raises(TypeError, match="kind"):
+    with pytest.raises(TypeError):
         replace(group, kind=CalculationKind.DESTINATION)
-    with pytest.raises(TypeError, match="kind"):
+    with pytest.raises(TypeError):
         replace(destination, kind=CalculationKind.DERIVED_GROUP)
-    with pytest.raises(TypeError, match="kind"):
+    with pytest.raises(TypeError):
         replace(destination, kind=CalculationKind.GRAND_TOTAL)
 
 
@@ -498,13 +498,13 @@ def test_result_integrity_rejects_kind_and_provenance_replacement_together():
         ],
     )
 
-    with pytest.raises(TypeError, match="kind|provenance"):
+    with pytest.raises(TypeError):
         replace(
             group,
             kind=CalculationKind.DESTINATION,
             provenance=DestinationProvenance(1),
         )
-    with pytest.raises(TypeError, match="kind|provenance"):
+    with pytest.raises(TypeError):
         replace(
             first,
             kind=CalculationKind.DERIVED_GROUP,
@@ -529,17 +529,50 @@ def test_result_identity_rejects_integrity_transplant_and_direct_replacement():
 
     assert not hasattr(destination, "_integrity")
     assert not hasattr(group, "_integrity")
-    with pytest.raises(TypeError, match="kind|provenance|integrity"):
+    with pytest.raises(TypeError):
         replace(
             group,
             kind=CalculationKind.DESTINATION,
             provenance=destination.provenance,
             _integrity=object(),
         )
-    with pytest.raises(TypeError, match="provenance"):
+    with pytest.raises(TypeError):
         replace(group, provenance=destination.provenance)
-    with pytest.raises(TypeError, match="integrity"):
+    with pytest.raises(TypeError):
         replace(group, _integrity=object())
+
+
+def test_result_backing_identity_fields_are_not_replaceable():
+    from app.domain.calculations import (
+        calculate_destination,
+        calculate_group,
+        calculate_total,
+    )
+
+    destination = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+    group = calculate_group(
+        {1: destination},
+        [GroupMember(10, 1, "Member", 1, True, True)],
+    )
+    total = calculate_total(
+        {1: destination},
+        [_destination(1, "Destination", 1)],
+    )
+
+    for result, changes in (
+        (destination, {"destination_id": 2}),
+        (destination, {"_destination_id": 2}),
+        (group, {"group_id": 20}),
+        (group, {"_group_id": 20}),
+        (group, {"member_destination_ids": (2,)}),
+        (group, {"_member_destination_ids": (2,)}),
+        (total, {"destination_ids": (2,)}),
+        (total, {"_destination_ids": (2,)}),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            replace(result, **changes)
 
 
 @pytest.mark.parametrize("invalid_key", [True, "1", 0, -1])
