@@ -9,7 +9,7 @@ presentation. Other Decimal results are kept unrounded for downstream output.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 
@@ -19,12 +19,50 @@ from app.domain.models import Destination, GroupMember
 UNIT_COST_QUANTUM = Decimal("0.01")
 DEFAULT_REVIEW_THRESHOLD = Decimal("0.15")
 MAX_SQLITE_INTEGER = 2**63 - 1
+_CALCULATED_FIELD_NAMES = (
+    "planned_unit_cost",
+    "actual_unit_cost",
+    "quantity_variance",
+    "quantity_variance_pct",
+    "cost_variance_won",
+    "cost_variance_pct",
+    "actual_unit_cost_variance",
+    "actual_unit_cost_variance_pct",
+)
 
 
 class CalculationKind(Enum):
     DESTINATION = "destination"
     DERIVED_GROUP = "derived_group"
     GRAND_TOTAL = "grand_total"
+
+
+@dataclass(frozen=True, slots=True)
+class DestinationProvenance:
+    destination_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedGroupProvenance:
+    group_id: int
+    member_destination_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GrandTotalProvenance:
+    destination_ids: tuple[int, ...]
+
+
+CalculationProvenance = (
+    DestinationProvenance | DerivedGroupProvenance | GrandTotalProvenance
+)
+_CALCULATION_INTEGRITY_SEAL = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _CalculationIntegrity:
+    seal: object
+    fingerprint: tuple[object, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,11 +79,12 @@ class DestinationCalculation:
     cost_variance_pct: Decimal | None
     actual_unit_cost_variance: Decimal | None
     actual_unit_cost_variance_pct: Decimal | None
-    kind: CalculationKind = CalculationKind.DESTINATION
+    kind: CalculationKind
+    provenance: CalculationProvenance
+    _integrity: _CalculationIntegrity = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, CalculationKind):
-            raise ValueError("kind must be a CalculationKind")
+        _validate_calculation_provenance(self.kind, self.provenance)
         if self.kind is CalculationKind.DESTINATION:
             _validate_period_inputs(
                 self.planned_quantity, self.planned_cost_won, "planned"
@@ -61,9 +100,15 @@ class DestinationCalculation:
                 self.actual_quantity, "actual_quantity"
             )
             _require_optional_nonnegative_int(
-                self.planned_cost_won, "planned_cost_won"
+                self.planned_cost_won,
+                "planned_cost_won",
+                maximum=MAX_SQLITE_INTEGER,
             )
-            _require_optional_nonnegative_int(self.actual_cost_won, "actual_cost_won")
+            _require_optional_nonnegative_int(
+                self.actual_cost_won,
+                "actual_cost_won",
+                maximum=MAX_SQLITE_INTEGER,
+            )
         _require_optional_nonnegative_decimal(
             self.planned_unit_cost, "planned_unit_cost"
         )
@@ -82,6 +127,16 @@ class DestinationCalculation:
         _require_optional_finite_decimal(
             self.actual_unit_cost_variance_pct, "actual_unit_cost_variance_pct"
         )
+        expected = _calculated_fields(
+            self.planned_quantity,
+            self.planned_cost_won,
+            self.actual_quantity,
+            self.actual_cost_won,
+        )
+        for field, expected_value in expected.items():
+            if getattr(self, field) != expected_value:
+                raise ValueError(f"{field} is inconsistent with source values")
+        _validate_calculation_integrity(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +224,8 @@ def calculate_destination(
     planned_cost_won: int | None,
     actual_quantity: Decimal | None,
     actual_cost_won: int | None,
+    *,
+    destination_id: int | None = None,
 ) -> DestinationCalculation:
     """Calculate one destination while preserving a fully missing period.
 
@@ -177,12 +234,20 @@ def calculate_destination(
     """
     _validate_period_inputs(planned_quantity, planned_cost_won, "planned")
     _validate_period_inputs(actual_quantity, actual_cost_won, "actual")
+    if destination_id is not None:
+        _require_nonnegative_int(
+            destination_id,
+            "destination_id",
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
     return _make_calculation(
         planned_quantity,
         planned_cost_won,
         actual_quantity,
         actual_cost_won,
         kind=CalculationKind.DESTINATION,
+        provenance=DestinationProvenance(destination_id),
     )
 
 
@@ -197,31 +262,38 @@ def calculate_total(
     Missing included values propagate as missing rather than becoming zero.
     """
     rules = tuple(destinations)
-    _require_unique_ids((item.id for item in rules), "destinations")
-    _validate_direct_sources(calculations, rules)
+    _validate_destination_rules(rules)
+    _validate_calculation_map(calculations)
     return _make_calculation(
         _sum_metric(calculations, rules, "planned_quantity", "include_quantity_total", Decimal(0)),
         _sum_metric(calculations, rules, "planned_cost_won", "include_cost_total", 0),
         _sum_metric(calculations, rules, "actual_quantity", "include_quantity_total", Decimal(0)),
         _sum_metric(calculations, rules, "actual_cost_won", "include_cost_total", 0),
         kind=CalculationKind.GRAND_TOTAL,
+        provenance=GrandTotalProvenance(tuple(item.id for item in rules)),
     )
 
 
 def calculate_group(
     calculations: Mapping[int, DestinationCalculation],
     members: Iterable[GroupMember],
+    *,
+    group_id: int | None = None,
 ) -> DestinationCalculation:
     """Aggregate a derived display group using its editable member flags."""
     rules = tuple(members)
-    _require_unique_ids((item.destination_id for item in rules), "group members")
-    _validate_direct_sources(calculations, rules)
+    owning_group_id = _validate_group_rules(rules, group_id)
+    _validate_calculation_map(calculations)
     return _make_calculation(
         _sum_metric(calculations, rules, "planned_quantity", "include_quantity", Decimal(0)),
         _sum_metric(calculations, rules, "planned_cost_won", "include_cost", 0),
         _sum_metric(calculations, rules, "actual_quantity", "include_quantity", Decimal(0)),
         _sum_metric(calculations, rules, "actual_cost_won", "include_cost", 0),
         kind=CalculationKind.DERIVED_GROUP,
+        provenance=DerivedGroupProvenance(
+            owning_group_id,
+            tuple(item.destination_id for item in rules),
+        ),
     )
 
 
@@ -290,7 +362,51 @@ def _make_calculation(
     actual_cost_won: int | None,
     *,
     kind: CalculationKind,
+    provenance: CalculationProvenance,
 ) -> DestinationCalculation:
+    _validate_calculation_sources(
+        planned_quantity,
+        planned_cost_won,
+        actual_quantity,
+        actual_cost_won,
+        kind,
+    )
+    calculated = _calculated_fields(
+        planned_quantity,
+        planned_cost_won,
+        actual_quantity,
+        actual_cost_won,
+    )
+    integrity = _CalculationIntegrity(
+        seal=_CALCULATION_INTEGRITY_SEAL,
+        fingerprint=_calculation_fingerprint(
+            planned_quantity,
+            planned_cost_won,
+            actual_quantity,
+            actual_cost_won,
+            calculated,
+            kind,
+            provenance,
+        ),
+    )
+    return DestinationCalculation(
+        planned_quantity=planned_quantity,
+        planned_cost_won=planned_cost_won,
+        actual_quantity=actual_quantity,
+        actual_cost_won=actual_cost_won,
+        **calculated,
+        kind=kind,
+        provenance=provenance,
+        _integrity=integrity,
+    )
+
+
+def _calculated_fields(
+    planned_quantity: Decimal | None,
+    planned_cost_won: int | None,
+    actual_quantity: Decimal | None,
+    actual_cost_won: int | None,
+) -> dict[str, Decimal | int | None]:
     planned_unit = _optional_unit_cost(planned_cost_won, planned_quantity)
     actual_unit = _optional_unit_cost(actual_cost_won, actual_quantity)
     quantity_difference = _optional_variance(actual_quantity, planned_quantity)
@@ -300,23 +416,42 @@ def _make_calculation(
         else actual_cost_won - planned_cost_won
     )
     unit_difference = _optional_variance(actual_unit, planned_unit)
-    return DestinationCalculation(
-        planned_quantity=planned_quantity,
-        planned_cost_won=planned_cost_won,
-        actual_quantity=actual_quantity,
-        actual_cost_won=actual_cost_won,
-        planned_unit_cost=planned_unit,
-        actual_unit_cost=actual_unit,
-        quantity_variance=quantity_difference,
-        quantity_variance_pct=_optional_variance_pct(actual_quantity, planned_quantity),
-        cost_variance_won=cost_difference,
-        cost_variance_pct=_optional_variance_pct(
+    return {
+        "planned_unit_cost": planned_unit,
+        "actual_unit_cost": actual_unit,
+        "quantity_variance": quantity_difference,
+        "quantity_variance_pct": _optional_variance_pct(
+            actual_quantity, planned_quantity
+        ),
+        "cost_variance_won": cost_difference,
+        "cost_variance_pct": _optional_variance_pct(
             None if actual_cost_won is None else Decimal(actual_cost_won),
             None if planned_cost_won is None else Decimal(planned_cost_won),
         ),
-        actual_unit_cost_variance=unit_difference,
-        actual_unit_cost_variance_pct=_optional_variance_pct(actual_unit, planned_unit),
-        kind=kind,
+        "actual_unit_cost_variance": unit_difference,
+        "actual_unit_cost_variance_pct": _optional_variance_pct(
+            actual_unit, planned_unit
+        ),
+    }
+
+
+def _calculation_fingerprint(
+    planned_quantity: Decimal | None,
+    planned_cost_won: int | None,
+    actual_quantity: Decimal | None,
+    actual_cost_won: int | None,
+    calculated: Mapping[str, Decimal | int | None],
+    kind: CalculationKind,
+    provenance: CalculationProvenance,
+) -> tuple[object, ...]:
+    return (
+        planned_quantity,
+        planned_cost_won,
+        actual_quantity,
+        actual_cost_won,
+        *(calculated[field] for field in _CALCULATED_FIELD_NAMES),
+        kind,
+        provenance,
     )
 
 
@@ -373,22 +508,94 @@ def _sum_metric(
     return sum(values, start=zero)
 
 
-def _validate_direct_sources(
+def _validate_calculation_map(
     calculations: Mapping[int, DestinationCalculation],
-    rules: tuple[Destination, ...] | tuple[GroupMember, ...],
 ) -> None:
-    for rule in rules:
-        destination_id = rule.id if isinstance(rule, Destination) else rule.destination_id
-        calculation = calculations.get(destination_id)
-        if calculation is None:
-            continue
+    if not isinstance(calculations, Mapping):
+        raise ValueError("calculations must be a mapping")
+    for destination_id, calculation in calculations.items():
+        _require_nonnegative_int(
+            destination_id,
+            "calculation key",
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
         if not isinstance(calculation, DestinationCalculation):
             raise ValueError("calculations must contain DestinationCalculation values")
         if calculation.kind is not CalculationKind.DESTINATION:
             raise ValueError(
-                "totals and groups require direct destination calculations; "
-                "a derived group or total cannot replace a destination"
+                "calculations must contain direct destination results, not a "
+                "derived group or grand total"
             )
+        provenance = calculation.provenance
+        if not isinstance(provenance, DestinationProvenance):
+            raise ValueError("destination calculation provenance is invalid")
+        if provenance.destination_id is None:
+            raise ValueError(
+                "aggregate calculations require a destination-bound result"
+            )
+        if provenance.destination_id != destination_id:
+            raise ValueError(
+                f"calculation key {destination_id} does not match destination "
+                f"provenance {provenance.destination_id}"
+            )
+
+
+def _validate_destination_rules(rules: tuple[Destination, ...]) -> None:
+    destination_ids: list[int] = []
+    for rule in rules:
+        if not isinstance(rule, Destination):
+            raise ValueError("destinations must contain Destination rules")
+        _require_nonnegative_int(
+            rule.id,
+            "destination id",
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
+        _require_bool(rule.include_quantity_total, "include_quantity_total")
+        _require_bool(rule.include_cost_total, "include_cost_total")
+        _require_bool(rule.include_sales_total, "include_sales_total")
+        destination_ids.append(rule.id)
+    _require_unique_ids(destination_ids, "destinations")
+
+
+def _validate_group_rules(
+    rules: tuple[GroupMember, ...], group_id: int | None
+) -> int:
+    if group_id is None:
+        if not rules:
+            raise ValueError("group_id is required for an empty group")
+        group_id = rules[0].group_id
+    _require_nonnegative_int(
+        group_id,
+        "group_id",
+        minimum=1,
+        maximum=MAX_SQLITE_INTEGER,
+    )
+    destination_ids: list[int] = []
+    for rule in rules:
+        if not isinstance(rule, GroupMember):
+            raise ValueError("members must contain GroupMember rules")
+        _require_nonnegative_int(
+            rule.group_id,
+            "group_id",
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
+        if rule.group_id != group_id:
+            raise ValueError("all group members must have the same group_id")
+        _require_nonnegative_int(
+            rule.destination_id,
+            "destination_id",
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
+        _require_nonnegative_int(rule.display_order, "display_order")
+        _require_bool(rule.include_quantity, "include_quantity")
+        _require_bool(rule.include_cost, "include_cost")
+        destination_ids.append(rule.destination_id)
+    _require_unique_ids(destination_ids, "group members")
+    return group_id
 
 
 def _average_for_months(
@@ -453,6 +660,105 @@ def _validate_period_inputs(
         )
 
 
+def _validate_calculation_sources(
+    planned_quantity: Decimal | None,
+    planned_cost_won: int | None,
+    actual_quantity: Decimal | None,
+    actual_cost_won: int | None,
+    kind: CalculationKind,
+) -> None:
+    if kind is CalculationKind.DESTINATION:
+        _validate_period_inputs(planned_quantity, planned_cost_won, "planned")
+        _validate_period_inputs(actual_quantity, actual_cost_won, "actual")
+        return
+    _require_optional_nonnegative_decimal(planned_quantity, "planned_quantity")
+    _require_optional_nonnegative_decimal(actual_quantity, "actual_quantity")
+    _require_optional_nonnegative_int(
+        planned_cost_won,
+        "planned_cost_won",
+        maximum=MAX_SQLITE_INTEGER,
+    )
+    _require_optional_nonnegative_int(
+        actual_cost_won,
+        "actual_cost_won",
+        maximum=MAX_SQLITE_INTEGER,
+    )
+
+
+def _validate_calculation_provenance(
+    kind: object, provenance: object
+) -> None:
+    if not isinstance(kind, CalculationKind):
+        raise ValueError("kind must be a CalculationKind")
+    if kind is CalculationKind.DESTINATION:
+        if not isinstance(provenance, DestinationProvenance):
+            raise ValueError("destination kind requires destination provenance")
+        if provenance.destination_id is not None:
+            _require_nonnegative_int(
+                provenance.destination_id,
+                "provenance destination_id",
+                minimum=1,
+                maximum=MAX_SQLITE_INTEGER,
+            )
+        return
+    if kind is CalculationKind.DERIVED_GROUP:
+        if not isinstance(provenance, DerivedGroupProvenance):
+            raise ValueError("derived group kind requires group provenance")
+        _require_nonnegative_int(
+            provenance.group_id,
+            "provenance group_id",
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
+        _validate_provenance_ids(
+            provenance.member_destination_ids,
+            "group provenance member ids",
+        )
+        return
+    if not isinstance(provenance, GrandTotalProvenance):
+        raise ValueError("grand total kind requires grand total provenance")
+    _validate_provenance_ids(
+        provenance.destination_ids,
+        "grand total provenance destination ids",
+    )
+
+
+def _validate_calculation_integrity(calculation: DestinationCalculation) -> None:
+    integrity = calculation._integrity
+    if (
+        not isinstance(integrity, _CalculationIntegrity)
+        or integrity.seal is not _CALCULATION_INTEGRITY_SEAL
+    ):
+        raise ValueError("calculation integrity token is invalid")
+    calculated = {
+        field: getattr(calculation, field) for field in _CALCULATED_FIELD_NAMES
+    }
+    expected = _calculation_fingerprint(
+        calculation.planned_quantity,
+        calculation.planned_cost_won,
+        calculation.actual_quantity,
+        calculation.actual_cost_won,
+        calculated,
+        calculation.kind,
+        calculation.provenance,
+    )
+    if integrity.fingerprint != expected:
+        raise ValueError("calculation integrity does not match immutable provenance")
+
+
+def _validate_provenance_ids(values: object, field: str) -> None:
+    if not isinstance(values, tuple):
+        raise ValueError(f"{field} must be a tuple")
+    for value in values:
+        _require_nonnegative_int(
+            value,
+            field,
+            minimum=1,
+            maximum=MAX_SQLITE_INTEGER,
+        )
+    _require_unique_ids(values, field)
+
+
 def _validate_review_candidate(candidate: ReviewCandidate) -> None:
     if not isinstance(candidate, ReviewCandidate):
         raise ValueError("candidates must contain ReviewCandidate values")
@@ -464,6 +770,14 @@ def _validate_review_candidate(candidate: ReviewCandidate) -> None:
         raise ValueError("candidate calculation must be a DestinationCalculation")
     if candidate.calculation.kind is not CalculationKind.DESTINATION:
         raise ValueError("review candidates must use direct destination calculations")
+    provenance = candidate.calculation.provenance
+    if (
+        not isinstance(provenance, DestinationProvenance)
+        or provenance.destination_id != candidate.destination_id
+    ):
+        raise ValueError(
+            "review candidate id must match destination calculation provenance"
+        )
 
 
 def _require_unique_ids(values: Iterable[int], label: str) -> None:
@@ -472,6 +786,11 @@ def _require_unique_ids(values: Iterable[int], label: str) -> None:
         if value in seen:
             raise ValueError(f"{label} must not contain duplicate destination ids")
         seen.add(value)
+
+
+def _require_bool(value: object, field: str) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
 
 
 def _require_finite_decimal(value: object, field: str) -> None:
@@ -513,9 +832,11 @@ def _require_optional_finite_decimal(value: object, field: str) -> None:
         _require_finite_decimal(value, field)
 
 
-def _require_optional_nonnegative_int(value: object, field: str) -> None:
+def _require_optional_nonnegative_int(
+    value: object, field: str, *, maximum: int | None = None
+) -> None:
     if value is not None:
-        _require_nonnegative_int(value, field)
+        _require_nonnegative_int(value, field, maximum=maximum)
 
 
 def _require_optional_int(value: object, field: str) -> None:

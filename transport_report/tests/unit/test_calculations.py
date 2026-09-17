@@ -66,10 +66,10 @@ def test_totals_follow_master_rules_and_do_not_count_derived_group_twice():
         _destination(4, "당진", 4, include_quantity=False, include_cost=True),
     ]
     calculations = {
-        1: calculate_destination(Decimal("10"), 1_000, Decimal("12"), 1_200),
-        2: calculate_destination(Decimal("20"), 2_000, Decimal("18"), 1_800),
-        3: calculate_destination(Decimal("30"), 3_000, Decimal("30"), 3_300),
-        4: calculate_destination(Decimal("40"), 4_000, Decimal("50"), 5_000),
+        1: calculate_destination(Decimal("10"), 1_000, Decimal("12"), 1_200, destination_id=1),
+        2: calculate_destination(Decimal("20"), 2_000, Decimal("18"), 1_800, destination_id=2),
+        3: calculate_destination(Decimal("30"), 3_000, Decimal("30"), 3_300, destination_id=3),
+        4: calculate_destination(Decimal("40"), 4_000, Decimal("50"), 5_000, destination_id=4),
     }
     members = [
         GroupMember(10, item.id, item.name, item.display_order, True, True)
@@ -78,9 +78,6 @@ def test_totals_follow_master_rules_and_do_not_count_derived_group_twice():
 
     group = calculate_group(calculations, members)
     total = calculate_total(calculations, destinations)
-    total_with_unrelated_derived_result = calculate_total(
-        {**calculations, 10: group}, destinations
-    )
 
     assert group.planned_quantity == Decimal("60")
     assert group.actual_quantity == Decimal("60")
@@ -90,10 +87,10 @@ def test_totals_follow_master_rules_and_do_not_count_derived_group_twice():
     assert total.actual_quantity == Decimal("60")
     assert total.planned_cost_won == 10_000
     assert total.actual_cost_won == 11_300
-    assert total_with_unrelated_derived_result == total
-
     with pytest.raises(ValueError, match="derived group"):
         calculate_total({**calculations, 1: group}, destinations)
+    with pytest.raises(ValueError, match="direct destination"):
+        calculate_total({**calculations, 10: group}, destinations)
 
 
 def test_group_member_metric_flags_are_honored():
@@ -103,8 +100,8 @@ def test_group_member_metric_flags_are_honored():
     )
 
     calculations = {
-        1: calculate_destination(Decimal("10"), 1_000, Decimal("20"), 2_000),
-        2: calculate_destination(Decimal("30"), 3_000, Decimal("40"), 4_000),
+        1: calculate_destination(Decimal("10"), 1_000, Decimal("20"), 2_000, destination_id=1),
+        2: calculate_destination(Decimal("30"), 3_000, Decimal("40"), 4_000, destination_id=2),
     }
     members = [
         GroupMember(1, 1, "First", 1, True, False),
@@ -127,7 +124,9 @@ def test_aggregate_validates_all_sources_before_missing_values_short_circuit():
     )
 
     destinations = [_destination(1, "Missing", 1), _destination(2, "Collides", 2)]
-    direct = calculate_destination(Decimal("1"), 100, Decimal("1"), 100)
+    direct = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=2
+    )
     derived = calculate_group(
         {2: direct},
         [GroupMember(2, 2, "Collides", 1, True, True)],
@@ -144,8 +143,8 @@ def test_missing_included_metric_propagates_instead_of_becoming_zero():
     )
 
     calculations = {
-        1: calculate_destination(Decimal("0"), 0, Decimal("0"), 0),
-        2: calculate_destination(None, None, None, None),
+        1: calculate_destination(Decimal("0"), 0, Decimal("0"), 0, destination_id=1),
+        2: calculate_destination(None, None, None, None, destination_id=2),
     }
     total = calculate_total(
         calculations,
@@ -254,19 +253,25 @@ def test_review_selector_includes_exact_thresholds_and_orders_deterministically(
             3,
             "Below threshold",
             30,
-            calculate_destination(Decimal("1"), 100, Decimal("1"), 114),
+            calculate_destination(
+                Decimal("1"), 100, Decimal("1"), 114, destination_id=3
+            ),
         ),
         ReviewCandidate(
             2,
             "Positive boundary",
             20,
-            calculate_destination(Decimal("1"), 100, Decimal("1"), 115),
+            calculate_destination(
+                Decimal("1"), 100, Decimal("1"), 115, destination_id=2
+            ),
         ),
         ReviewCandidate(
             1,
             "Negative boundary",
             10,
-            calculate_destination(Decimal("1"), 100, Decimal("1"), 85),
+            calculate_destination(
+                Decimal("1"), 100, Decimal("1"), 85, destination_id=1
+            ),
         ),
     ]
 
@@ -293,7 +298,13 @@ def test_review_selector_surfaces_unavailable_variance_without_narrative():
                 7,
                 "Zero actual",
                 3,
-                calculate_destination(Decimal("46"), 254_000, Decimal("0"), 0),
+                calculate_destination(
+                    Decimal("46"),
+                    254_000,
+                    Decimal("0"),
+                    0,
+                    destination_id=7,
+                ),
             )
         ]
     )
@@ -312,7 +323,9 @@ def test_review_selector_rejects_derived_group_candidates():
         select_unit_cost_reviews,
     )
 
-    direct = calculate_destination(Decimal("1"), 100, Decimal("1"), 115)
+    direct = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 115, destination_id=1
+    )
     derived = calculate_group(
         {1: direct},
         [GroupMember(1, 1, "Member", 1, True, True)],
@@ -413,3 +426,256 @@ def test_result_records_reject_invalid_numeric_fields(changes, message):
 
     with pytest.raises(ValueError, match=message):
         replace(valid, **changes)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"planned_unit_cost": Decimal("999")}, "planned_unit_cost"),
+        ({"planned_unit_cost": 10.0}, "planned_unit_cost"),
+        ({"actual_unit_cost": Decimal("999")}, "actual_unit_cost"),
+        ({"quantity_variance": Decimal("999")}, "quantity_variance"),
+        ({"quantity_variance_pct": Decimal("999")}, "quantity_variance_pct"),
+        ({"cost_variance_won": 999}, "cost_variance_won"),
+        ({"cost_variance_pct": Decimal("999")}, "cost_variance_pct"),
+        ({"actual_unit_cost_variance": Decimal("999")}, "actual_unit_cost_variance"),
+        (
+            {"actual_unit_cost_variance_pct": Decimal("999")},
+            "actual_unit_cost_variance_pct",
+        ),
+    ],
+)
+def test_result_records_reject_forged_calculated_fields(changes, message):
+    from app.domain.calculations import calculate_destination
+
+    valid = calculate_destination(
+        Decimal("10"), 100, Decimal("20"), 240, destination_id=1
+    )
+
+    with pytest.raises(ValueError, match=message):
+        replace(valid, **changes)
+
+
+def test_result_records_reject_kind_relabeling_without_matching_provenance():
+    from app.domain.calculations import CalculationKind, calculate_destination, calculate_group
+
+    destination = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+    group = calculate_group(
+        {1: destination},
+        [GroupMember(10, 1, "Member", 1, True, True)],
+    )
+
+    with pytest.raises(ValueError, match="provenance"):
+        replace(group, kind=CalculationKind.DESTINATION)
+    with pytest.raises(ValueError, match="provenance"):
+        replace(destination, kind=CalculationKind.DERIVED_GROUP)
+    with pytest.raises(ValueError, match="provenance"):
+        replace(destination, kind=CalculationKind.GRAND_TOTAL)
+
+
+def test_result_integrity_rejects_kind_and_provenance_replacement_together():
+    from app.domain.calculations import (
+        CalculationKind,
+        DestinationProvenance,
+        DerivedGroupProvenance,
+        calculate_destination,
+        calculate_group,
+    )
+
+    first = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+    second = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=2
+    )
+    group = calculate_group(
+        {1: first, 2: second},
+        [
+            GroupMember(10, 1, "First", 1, True, True),
+            GroupMember(10, 2, "Second", 2, True, True),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="integrity"):
+        replace(
+            group,
+            kind=CalculationKind.DESTINATION,
+            provenance=DestinationProvenance(1),
+        )
+    with pytest.raises(ValueError, match="integrity"):
+        replace(
+            first,
+            kind=CalculationKind.DERIVED_GROUP,
+            provenance=DerivedGroupProvenance(10, (1,)),
+        )
+
+
+@pytest.mark.parametrize("invalid_key", [True, "1", 0, -1])
+def test_aggregate_rejects_invalid_calculation_map_keys(invalid_key):
+    from app.domain.calculations import calculate_destination, calculate_total
+
+    calculation = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+
+    with pytest.raises(ValueError, match="calculation key"):
+        calculate_total(
+            {invalid_key: calculation},
+            [_destination(1, "Destination", 1)],
+        )
+
+
+def test_aggregate_requires_map_key_to_match_destination_provenance():
+    from app.domain.calculations import calculate_destination, calculate_total
+
+    calculation = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=2
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        calculate_total({1: calculation}, [_destination(1, "Destination", 1)])
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"id": True}, "destination id"),
+        ({"id": "1"}, "destination id"),
+        ({"id": 0}, "destination id"),
+        ({"include_quantity_total": 1}, "include_quantity_total"),
+        ({"include_cost_total": "yes"}, "include_cost_total"),
+        ({"include_sales_total": 1}, "include_sales_total"),
+    ],
+)
+def test_total_rejects_invalid_master_rules(changes, message):
+    from app.domain.calculations import calculate_destination, calculate_total
+
+    rule = replace(_destination(1, "Destination", 1), **changes)
+    calculation = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+
+    with pytest.raises(ValueError, match=message):
+        calculate_total({1: calculation}, [rule])
+
+
+def test_total_rejects_duplicate_destination_rules():
+    from app.domain.calculations import calculate_destination, calculate_total
+
+    rule = _destination(1, "Destination", 1)
+    calculation = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        calculate_total({1: calculation}, [rule, rule])
+
+
+def test_group_rejects_mixed_owner_ids_invalid_flags_and_duplicate_members():
+    from app.domain.calculations import calculate_destination, calculate_group
+
+    calculations = {
+        1: calculate_destination(
+            Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+        ),
+        2: calculate_destination(
+            Decimal("1"), 100, Decimal("1"), 100, destination_id=2
+        ),
+    }
+    first = GroupMember(10, 1, "First", 1, True, True)
+    wrong_owner = GroupMember(11, 2, "Second", 2, True, True)
+    invalid_flag = GroupMember(10, 2, "Second", 2, 1, True)
+
+    with pytest.raises(ValueError, match="same group_id"):
+        calculate_group(calculations, [first, wrong_owner])
+    with pytest.raises(ValueError, match="include_quantity"):
+        calculate_group(calculations, [first, invalid_flag])
+    with pytest.raises(ValueError, match="duplicate"):
+        calculate_group(calculations, [first, first])
+
+
+def test_group_rejects_bool_and_nonpositive_member_ids():
+    from app.domain.calculations import calculate_destination, calculate_group
+
+    calculation = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+
+    with pytest.raises(ValueError, match="group_id"):
+        calculate_group(
+            {1: calculation},
+            [GroupMember(True, 1, "Member", 1, True, True)],
+        )
+    with pytest.raises(ValueError, match="destination_id"):
+        calculate_group(
+            {1: calculation},
+            [GroupMember(1, 0, "Member", 1, True, True)],
+        )
+
+
+def test_aggregate_cost_enforces_sqlite_bound_before_result_creation():
+    from app.domain.calculations import MAX_SQLITE_INTEGER, calculate_destination, calculate_total
+
+    destinations = [_destination(1, "First", 1), _destination(2, "Second", 2)]
+    at_limit = {
+        1: calculate_destination(
+            Decimal("1"),
+            MAX_SQLITE_INTEGER - 1,
+            Decimal("1"),
+            MAX_SQLITE_INTEGER - 1,
+            destination_id=1,
+        ),
+        2: calculate_destination(
+            Decimal("1"), 1, Decimal("1"), 1, destination_id=2
+        ),
+    }
+    overflow = {
+        1: calculate_destination(
+            Decimal("1"),
+            MAX_SQLITE_INTEGER,
+            Decimal("1"),
+            MAX_SQLITE_INTEGER,
+            destination_id=1,
+        ),
+        2: calculate_destination(
+            Decimal("1"), 1, Decimal("1"), 1, destination_id=2
+        ),
+    }
+
+    assert calculate_total(at_limit, destinations).planned_cost_won == MAX_SQLITE_INTEGER
+    with pytest.raises(ValueError, match="planned_cost_won"):
+        calculate_total(overflow, destinations)
+
+
+def test_aggregate_validates_cost_bound_before_unit_cost_arithmetic():
+    from app.domain.calculations import MAX_SQLITE_INTEGER, calculate_destination, calculate_total
+
+    destinations = [
+        _destination(1, "Quantity", 1, include_quantity=True, include_cost=False),
+        _destination(2, "Cost one", 2, include_quantity=False, include_cost=True),
+        _destination(3, "Cost two", 3, include_quantity=False, include_cost=True),
+    ]
+    calculations = {
+        1: calculate_destination(
+            Decimal("0.0000000000000000000000000001"),
+            0,
+            Decimal("0.0000000000000000000000000001"),
+            0,
+            destination_id=1,
+        ),
+        2: calculate_destination(
+            Decimal("1"),
+            MAX_SQLITE_INTEGER,
+            Decimal("1"),
+            MAX_SQLITE_INTEGER,
+            destination_id=2,
+        ),
+        3: calculate_destination(
+            Decimal("1"), 1, Decimal("1"), 1, destination_id=3
+        ),
+    }
+
+    with pytest.raises(ValueError, match="planned_cost_won"):
+        calculate_total(calculations, destinations)
