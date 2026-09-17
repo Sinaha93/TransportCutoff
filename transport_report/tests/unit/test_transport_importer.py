@@ -442,6 +442,36 @@ def test_parser_reconciles_anonymized_total_rows_in_columns_a_and_g(api, tmp_pat
     assert len([row for row in rows if row.transport_type == "nonregular"]) == 3
 
 
+def test_parser_rejects_total_row_with_uncached_ancillary_formula(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "uncached-total-ancillary-formula.xlsx",
+        subcontract_total_ancillary_value="=1",
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=r"row 4.*date"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("value", "cached_value"),
+    [(1, None), ("=1", "1")],
+    ids=("cached-value", "cached-formula"),
+)
+def test_parser_rejects_total_row_with_ancillary_cached_value_or_formula(
+    api, tmp_path, value, cached_value
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / f"total-ancillary-{cached_value or 'value'}.xlsx",
+        subcontract_total_ancillary_value=value,
+        subcontract_total_ancillary_cached_value=cached_value,
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=r"row 4.*date"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
 def test_parser_rejects_total_label_text_in_ancillary_detail_column(
     api, fixture_path
 ):

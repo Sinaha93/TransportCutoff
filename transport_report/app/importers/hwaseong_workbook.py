@@ -380,7 +380,7 @@ class HwaseongWorkbookParser:
         calculated_total = 0
         displayed_total_found = False
         for row_number in range(header_row + 1, sheet.max_row + 1):
-            if _is_displayed_total_row(sheet, row_number):
+            if _is_displayed_total_row(sheet, formula_sheet, row_number):
                 if displayed_total_found:
                     raise WorkbookStructureError(
                         f"{sheet.title} row {row_number} contains a second displayed total"
@@ -589,7 +589,7 @@ def _is_blank_or_numeric_zero(value: object) -> bool:
     return numeric_value.is_finite() and numeric_value == 0
 
 
-def _is_displayed_total_row(sheet, row_number: int) -> bool:
+def _is_displayed_total_row(sheet, formula_sheet, row_number: int) -> bool:
     label_columns = [
         column
         for column in _SUBCONTRACT_TOTAL_LABEL_COLUMNS
@@ -598,8 +598,12 @@ def _is_displayed_total_row(sheet, row_number: int) -> bool:
     if len(label_columns) != 1:
         return False
     allowed_columns = {label_columns[0], 9}
-    return not any(
-        _has_value(sheet.cell(row_number, column).value)
+    return any(
+        _has_value(workbook_sheet.cell(row_number, 9).value)
+        for workbook_sheet in (sheet, formula_sheet)
+    ) and not any(
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
         for column in range(1, _SUBCONTRACT_LAST_FOOTPRINT_COLUMN + 1)
         if column not in allowed_columns
     )
