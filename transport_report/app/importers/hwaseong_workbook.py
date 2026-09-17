@@ -4,7 +4,11 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from posixpath import join as posix_join
+from posixpath import normpath as posix_normpath
+from xml.etree.ElementTree import ParseError, iterparse
+from zipfile import BadZipFile, LargeZipFile, ZipFile
 
 from openpyxl import load_workbook
 
@@ -34,10 +38,25 @@ _SQLITE_MAX = 2**63 - 1
 MAX_WORKSHEET_ROWS = 2_000
 MAX_WORKSHEET_COLUMNS = 128
 MAX_PARSED_ENTRIES = 20_000
+# Pre-load limits cover every worksheet, not only the four imported sheets. The
+# real source has 6 sheets, at most 3,970 cell records/sheet, 7,535 total cells,
+# 116 rows, 54 columns, and a largest worksheet XML of 101,774 bytes.
+# Expanded merged-range areas are charged against the same cell envelopes because
+# OpenPyXL creates a MergedCell object for each covered coordinate.
+MAX_PREFLIGHT_WORKSHEETS = 256
+MAX_PREFLIGHT_WORKSHEET_XML_BYTES = 8 * 1024 * 1024
+MAX_PREFLIGHT_WORKSHEET_CELLS = 50_000
+MAX_PREFLIGHT_TOTAL_CELLS = 100_000
+MAX_PREFLIGHT_ROWS = 20_000
+MAX_PREFLIGHT_COLUMNS = 512
 # Conservative source-cell limits: 10,000 trips/day, 4 decimals, 16 canonical chars.
 MAX_TRIP_COUNT = Decimal("10000")
 MAX_TRIP_COUNT_SCALE = 4
 MAX_TRIP_COUNT_CANONICAL_LENGTH = 16
+_CELL_REFERENCE = re.compile(r"^(?P<column>[A-Za-z]+)(?P<row>[1-9][0-9]*)$")
+_DOCUMENT_RELATIONSHIP_ID = (
+    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+)
 
 
 class TransportWorkbookError(Exception):
@@ -85,6 +104,7 @@ class HwaseongWorkbookParser:
             raise WorkbookStructureError("report_month must use YYYY-MM")
 
         path = Path(workbook_path)
+        _preflight_workbook_resources(path)
         workbook = None
         formula_workbook = None
         try:
@@ -226,6 +246,20 @@ class HwaseongWorkbookParser:
                     f"AK{row_number}",
                     "cached subtotal",
                 )
+            if _has_regular_footer_label(sheet, formula_sheet, row_number):
+                cached_footer_marker = sheet.cell(row_number, 38).value
+                formula_footer_marker = formula_sheet.cell(row_number, 38).value
+                if not _has_value(cached_footer_marker) and _is_formula(
+                    formula_footer_marker
+                ):
+                    _required_cached_value(
+                        cached_footer_marker,
+                        formula_footer_marker,
+                        sheet.title,
+                        row_number,
+                        f"AL{row_number}",
+                        "footer marker",
+                    )
             if _is_regular_footer_or_note(sheet, formula_sheet, row_number):
                 continue
             if _is_regular_blank_or_group_row(sheet, formula_sheet, row_number):
@@ -475,6 +509,271 @@ def _validate_worksheet_bounds(sheet) -> None:
         )
 
 
+def _preflight_workbook_resources(path: Path) -> None:
+    try:
+        with ZipFile(path, "r") as archive:
+            sheet_refs = _read_workbook_sheet_refs(archive)
+            worksheet_members = _resolve_worksheet_members(archive, sheet_refs)
+            total_cells = 0
+            total_materialized_cells = 0
+            for sheet_name, member_name in worksheet_members:
+                cell_count, materialized_cell_count = _preflight_worksheet_xml(
+                    archive, sheet_name, member_name
+                )
+                total_cells += cell_count
+                if total_cells > MAX_PREFLIGHT_TOTAL_CELLS:
+                    raise WorkbookStructureError(
+                        "Workbook exceeds workbook cell-record limit of "
+                        f"{MAX_PREFLIGHT_TOTAL_CELLS}"
+                    )
+                total_materialized_cells += materialized_cell_count
+                if total_materialized_cells > MAX_PREFLIGHT_TOTAL_CELLS:
+                    raise WorkbookStructureError(
+                        "Workbook exceeds workbook cell materialization limit of "
+                        f"{MAX_PREFLIGHT_TOTAL_CELLS}"
+                    )
+    except WorkbookStructureError:
+        raise
+    except (BadZipFile, LargeZipFile, OSError, ValueError) as error:
+        raise WorkbookStructureError(
+            f"Workbook resource preflight failed: {error}"
+        ) from error
+
+
+def _read_workbook_sheet_refs(archive: ZipFile) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    try:
+        with archive.open("xl/workbook.xml") as source:
+            for _, element in iterparse(source, events=("end",)):
+                if _xml_local_name(element.tag) == "sheet":
+                    relationship_id = element.attrib.get(_DOCUMENT_RELATIONSHIP_ID)
+                    if not relationship_id:
+                        raise WorkbookStructureError(
+                            "Workbook sheet is missing a relationship id"
+                        )
+                    refs.append(
+                        (element.attrib.get("name") or "<unnamed>", relationship_id)
+                    )
+                    if len(refs) > MAX_PREFLIGHT_WORKSHEETS:
+                        raise WorkbookStructureError(
+                            "Workbook exceeds worksheet count limit of "
+                            f"{MAX_PREFLIGHT_WORKSHEETS}"
+                        )
+                element.clear()
+    except KeyError as error:
+        raise WorkbookStructureError("Workbook XML is missing") from error
+    except ParseError as error:
+        raise WorkbookStructureError("Workbook XML is malformed") from error
+    return refs
+
+
+def _resolve_worksheet_members(
+    archive: ZipFile, sheet_refs: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    wanted_ids = {relationship_id for _, relationship_id in sheet_refs}
+    relationships: dict[str, tuple[str, str, str | None]] = {}
+    try:
+        with archive.open("xl/_rels/workbook.xml.rels") as source:
+            for _, element in iterparse(source, events=("end",)):
+                if _xml_local_name(element.tag) == "Relationship":
+                    relationship_id = element.attrib.get("Id")
+                    if relationship_id in wanted_ids:
+                        if relationship_id in relationships:
+                            raise WorkbookStructureError(
+                                "Workbook relationships contain a duplicate id"
+                            )
+                        relationships[relationship_id] = (
+                            element.attrib.get("Type", ""),
+                            element.attrib.get("Target", ""),
+                            element.attrib.get("TargetMode"),
+                        )
+                element.clear()
+    except KeyError as error:
+        raise WorkbookStructureError("Workbook relationships XML is missing") from error
+    except ParseError as error:
+        raise WorkbookStructureError(
+            "Workbook relationships XML is malformed"
+        ) from error
+
+    result: list[tuple[str, str]] = []
+    for sheet_name, relationship_id in sheet_refs:
+        relationship = relationships.get(relationship_id)
+        if relationship is None:
+            raise WorkbookStructureError(
+                f"Workbook sheet {sheet_name} has no relationship"
+            )
+        relationship_type, target, target_mode = relationship
+        if target_mode == "External":
+            raise WorkbookStructureError(
+                f"Workbook sheet {sheet_name} has an external worksheet relationship"
+            )
+        # OpenPyXL treats every workbook sheet relationship except a chartsheet
+        # as a worksheet and eagerly parses its target.
+        if "chartsheet" in relationship_type:
+            continue
+        result.append((sheet_name, _safe_worksheet_member(sheet_name, target)))
+    return result
+
+
+def _safe_worksheet_member(sheet_name: str, target: str) -> str:
+    if not target or "\\" in target or "\x00" in target:
+        raise WorkbookStructureError(
+            f"Workbook sheet {sheet_name} has an unsafe worksheet relationship target"
+        )
+    target_path = PurePosixPath(target)
+    if ".." in target_path.parts:
+        raise WorkbookStructureError(
+            f"Workbook sheet {sheet_name} has an unsafe worksheet relationship target"
+        )
+    candidate = target[1:] if target.startswith("/") else posix_join("xl", target)
+    member_name = posix_normpath(candidate)
+    parts = PurePosixPath(member_name).parts
+    if len(parts) < 3 or parts[:2] != ("xl", "worksheets"):
+        raise WorkbookStructureError(
+            f"Workbook sheet {sheet_name} has an unsafe worksheet relationship target"
+        )
+    return member_name
+
+
+def _preflight_worksheet_xml(
+    archive: ZipFile, sheet_name: str, member_name: str
+) -> tuple[int, int]:
+    try:
+        member = archive.getinfo(member_name)
+    except KeyError as error:
+        raise WorkbookStructureError(
+            f"Worksheet XML is missing for {sheet_name}"
+        ) from error
+    if member.is_dir():
+        raise WorkbookStructureError(f"Worksheet XML is invalid for {sheet_name}")
+    if member.file_size > MAX_PREFLIGHT_WORKSHEET_XML_BYTES:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds worksheet XML size limit of "
+            f"{MAX_PREFLIGHT_WORKSHEET_XML_BYTES}"
+        )
+
+    cell_count = 0
+    materialized_cell_count = 0
+    inferred_row_number = 0
+    try:
+        with archive.open(member) as source:
+            for _, element in iterparse(source, events=("end",)):
+                local_name = _xml_local_name(element.tag)
+                if local_name == "c":
+                    cell_count += 1
+                    if cell_count > MAX_PREFLIGHT_WORKSHEET_CELLS:
+                        raise WorkbookStructureError(
+                            f"{sheet_name} exceeds worksheet cell-record limit of "
+                            f"{MAX_PREFLIGHT_WORKSHEET_CELLS}"
+                        )
+                    materialized_cell_count += 1
+                    _validate_materialized_cell_count(
+                        sheet_name, materialized_cell_count
+                    )
+                    _validate_preflight_cell_reference(
+                        element.attrib.get("r"), sheet_name
+                    )
+                elif local_name == "dimension":
+                    reference = element.attrib.get("ref")
+                    if reference:
+                        _preflight_range_area(reference, sheet_name)
+                elif local_name == "mergeCell":
+                    materialized_cell_count += _preflight_range_area(
+                        element.attrib.get("ref"), sheet_name
+                    )
+                    _validate_materialized_cell_count(
+                        sheet_name, materialized_cell_count
+                    )
+                elif local_name == "hyperlink":
+                    materialized_cell_count += _preflight_range_area(
+                        element.attrib.get("ref"), sheet_name
+                    )
+                    _validate_materialized_cell_count(
+                        sheet_name, materialized_cell_count
+                    )
+                elif local_name == "row":
+                    row_reference = element.attrib.get("r")
+                    if row_reference is None:
+                        row_number = inferred_row_number + 1
+                    else:
+                        try:
+                            row_number = int(row_reference)
+                        except ValueError as error:
+                            raise WorkbookStructureError(
+                                f"{sheet_name} contains an invalid row reference"
+                            ) from error
+                    inferred_row_number = row_number
+                    if not 1 <= row_number <= MAX_PREFLIGHT_ROWS:
+                        raise WorkbookStructureError(
+                            f"{sheet_name} exceeds preflight row limit of "
+                            f"{MAX_PREFLIGHT_ROWS}"
+                        )
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Worksheet XML is malformed for {sheet_name}"
+        ) from error
+    return cell_count, materialized_cell_count
+
+
+def _validate_materialized_cell_count(sheet_name: str, count: int) -> None:
+    if count > MAX_PREFLIGHT_WORKSHEET_CELLS:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds worksheet cell materialization limit of "
+            f"{MAX_PREFLIGHT_WORKSHEET_CELLS}"
+        )
+
+
+def _preflight_range_area(reference: str | None, sheet_name: str) -> int:
+    coordinates = (reference or "").split(":")
+    if len(coordinates) not in (1, 2):
+        raise WorkbookStructureError(
+            f"{sheet_name} contains an invalid cell range reference"
+        )
+    start_row, start_column = _validate_preflight_cell_reference(
+        coordinates[0], sheet_name
+    )
+    if len(coordinates) == 1:
+        return 1
+    end_row, end_column = _validate_preflight_cell_reference(
+        coordinates[1], sheet_name
+    )
+    if end_row < start_row or end_column < start_column:
+        raise WorkbookStructureError(
+            f"{sheet_name} contains an invalid cell range reference"
+        )
+    return (end_row - start_row + 1) * (end_column - start_column + 1)
+
+
+def _validate_preflight_cell_reference(
+    reference: str | None, sheet_name: str
+) -> tuple[int, int]:
+    match = _CELL_REFERENCE.fullmatch(reference or "")
+    if match is None:
+        raise WorkbookStructureError(
+            f"{sheet_name} contains an invalid cell reference"
+        )
+    row_number = int(match.group("row"))
+    column_number = 0
+    for character in match.group("column").upper():
+        column_number = column_number * 26 + ord(character) - ord("A") + 1
+        if column_number > MAX_PREFLIGHT_COLUMNS:
+            break
+    if row_number > MAX_PREFLIGHT_ROWS:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds preflight row limit of {MAX_PREFLIGHT_ROWS}"
+        )
+    if column_number > MAX_PREFLIGHT_COLUMNS:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds preflight column limit of {MAX_PREFLIGHT_COLUMNS}"
+        )
+    return row_number, column_number
+
+
+def _xml_local_name(name: str) -> str:
+    return name.rsplit("}", 1)[-1]
+
+
 def _append_parsed_entry(
     rows: list[ParsedTransportEntry], entry: ParsedTransportEntry, limit: int
 ) -> None:
@@ -616,18 +915,7 @@ def _is_displayed_total_row(sheet, formula_sheet, row_number: int) -> bool:
 
 
 def _is_regular_footer_or_note(sheet, formula_sheet, row_number: int) -> bool:
-    if any(
-        _has_value(workbook_sheet.cell(row_number, column).value)
-        for workbook_sheet in (sheet, formula_sheet)
-        for column in range(1, 37)
-    ):
-        return False
-    cached_label = sheet.cell(row_number, 37).value
-    formula_label = formula_sheet.cell(row_number, 37).value
-    if not all(
-        isinstance(value, str) and bool(value.strip()) and not _is_formula(value)
-        for value in (cached_label, formula_label)
-    ):
+    if not _has_regular_footer_label(sheet, formula_sheet, row_number):
         return False
     cached_marker = sheet.cell(row_number, 38).value
     formula_marker = formula_sheet.cell(row_number, 38).value
@@ -642,6 +930,23 @@ def _is_regular_footer_or_note(sheet, formula_sheet, row_number: int) -> bool:
             )
         )
     )
+
+
+def _has_regular_footer_label(sheet, formula_sheet, row_number: int) -> bool:
+    if any(
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
+        for column in range(1, 37)
+    ):
+        return False
+    cached_label = sheet.cell(row_number, 37).value
+    formula_label = formula_sheet.cell(row_number, 37).value
+    if not all(
+        isinstance(value, str) and bool(value.strip()) and not _is_formula(value)
+        for value in (cached_label, formula_label)
+    ):
+        return False
+    return True
 
 
 def _is_regular_blank_or_group_row(sheet, formula_sheet, row_number: int) -> bool:

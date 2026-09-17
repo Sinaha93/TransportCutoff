@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal
 from importlib import import_module
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from openpyxl import load_workbook
@@ -63,6 +64,26 @@ def _parsed_entry(parser_module, **overrides):
     }
     values.update(overrides)
     return parser_module.ParsedTransportEntry(**values)
+
+
+def _rewrite_zip_member(path: Path, member_name: str, transform) -> None:
+    with ZipFile(path, "r") as source:
+        members = [
+            (info, transform(source.read(info.filename)))
+            if info.filename == member_name
+            else (info, source.read(info.filename))
+            for info in source.infolist()
+        ]
+
+    temporary = path.with_name(path.name + ".rewritten")
+    with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as destination:
+        for info, data in members:
+            destination.writestr(info, data)
+    temporary.replace(path)
+
+
+def _fail_if_openpyxl_loads(*args, **kwargs):
+    pytest.fail("load_workbook was called before workbook resource preflight")
 
 
 def test_parser_normalizes_day_columns_and_fractional_trips(api, fixture_path):
@@ -150,6 +171,20 @@ def test_parser_skips_anonymized_regular_footer_without_destination(api, tmp_pat
     assert not any(
         row.source_sheet == REGULAR_SHEET and row.source_row == 113 for row in rows
     )
+
+
+def test_parser_reports_uncached_regular_footer_al_formula_at_cell(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "regular-footer-uncached-al.xlsx", include_regular_footer=True
+    )
+    patch_formula_cached_values(path, 1, {"AL113": None})
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"row 113 cell AL113 cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
 @pytest.mark.parametrize(("column", "coordinate"), [(34, "AH113"), (36, "AJ113")])
@@ -668,6 +703,245 @@ def test_parser_rejects_worksheet_column_dimension_abuse(
         parser_module.WorkbookStructureError, match=r"column limit.*128"
     ):
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_oversized_relevant_sheet_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEET_CELLS", 82)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"cell-record limit.*82"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_oversized_irrelevant_sheet_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    irrelevant = workbook.create_sheet("Irrelevant")
+    for row_number in range(1, 85):
+        irrelevant.cell(row_number, 1, row_number)
+    workbook.save(fixture_path)
+    workbook.close()
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEET_CELLS", 83)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Irrelevant.*cell-record limit.*83",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_large_total_cell_count_with_low_dimensions(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_TOTAL_CELLS", 100)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"workbook cell-record limit.*100",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("row_number", "column_number", "message"),
+    [
+        (20_001, 1, r"preflight row limit.*20000"),
+        (1, 513, r"preflight column limit.*512"),
+    ],
+    ids=("row", "column"),
+)
+def test_preflight_rejects_extreme_references_before_openpyxl(
+    api, fixture_path, monkeypatch, row_number, column_number, message
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET].cell(row_number, column_number, 1)
+    workbook.save(fixture_path)
+    workbook.close()
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=message):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_large_worksheet_xml_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEET_XML_BYTES", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"worksheet XML size limit.*1"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_huge_merged_range_on_irrelevant_sheet_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook.create_sheet("Irrelevant").cell(1, 1, 1)
+    workbook.save(fixture_path)
+    workbook.close()
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet5.xml",
+        lambda data: data.replace(
+            b"</worksheet>",
+            b'<mergeCells count="1"><mergeCell ref="A1:SR20000"/>'
+            b"</mergeCells></worksheet>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Irrelevant.*cell materialization limit.*50000",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_huge_hyperlink_range_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook.create_sheet("Irrelevant").cell(1, 1, 1)
+    workbook.save(fixture_path)
+    workbook.close()
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet5.xml",
+        lambda data: data.replace(
+            b"</worksheet>",
+            b'<hyperlinks><hyperlink ref="A1:SR20000" location="x"/>'
+            b"</hyperlinks></worksheet>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Irrelevant.*cell materialization limit.*50000",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_counts_rows_without_explicit_references_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook.create_sheet("Irrelevant").cell(1, 1, 1)
+    workbook.save(fixture_path)
+    workbook.close()
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet5.xml",
+        lambda data: data.replace(
+            b"</sheetData>", b'<row s="0"/>' * 20_000 + b"</sheetData>"
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"preflight row limit.*20000"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_covers_nonstandard_sheet_relationship_openpyxl_would_load(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/_rels/workbook.xml.rels",
+        lambda data: data.replace(
+            b"/relationships/worksheet\"",
+            b"/relationships/dialogsheet\"",
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEET_CELLS", 82)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"cell-record limit.*82"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_uses_the_relationship_id_openpyxl_will_use(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/workbook.xml",
+        lambda data: data.replace(
+            b"<sheet ",
+            b'<sheet xmlns:x="urn:untrusted" x:id="rId2" ',
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEET_CELLS", 82)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"cell-record limit.*82"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("member_name", "transform", "message"),
+    [
+        (
+            "xl/_rels/workbook.xml.rels",
+            lambda data: data.replace(
+                b'Target="/xl/worksheets/sheet1.xml"',
+                b'Target="../worksheets/sheet1.xml"',
+                1,
+            ),
+            "worksheet relationship target",
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            lambda data: data[:-1],
+            "relationships XML",
+        ),
+        ("xl/worksheets/sheet1.xml", lambda data: data[:-1], "Worksheet XML"),
+    ],
+    ids=("unsafe-path", "malformed-relationships", "malformed-worksheet"),
+)
+def test_preflight_rejects_unsafe_or_malformed_xml_before_openpyxl(
+    api, fixture_path, monkeypatch, member_name, transform, message
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(fixture_path, member_name, transform)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=message):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_normal_synthetic_workbook(api, fixture_path):
+    parser_module, _, _ = api
+
+    parser_module._preflight_workbook_resources(fixture_path)
 
 
 def test_parser_caps_total_entries_across_workbook(
