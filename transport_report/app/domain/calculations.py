@@ -9,7 +9,7 @@ presentation. Other Decimal results are kept unrounded for downstream output.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 
@@ -19,16 +19,6 @@ from app.domain.models import Destination, GroupMember
 UNIT_COST_QUANTUM = Decimal("0.01")
 DEFAULT_REVIEW_THRESHOLD = Decimal("0.15")
 MAX_SQLITE_INTEGER = 2**63 - 1
-_CALCULATED_FIELD_NAMES = (
-    "planned_unit_cost",
-    "actual_unit_cost",
-    "quantity_variance",
-    "quantity_variance_pct",
-    "cost_variance_won",
-    "cost_variance_pct",
-    "actual_unit_cost_variance",
-    "actual_unit_cost_variance_pct",
-)
 
 
 class CalculationKind(Enum):
@@ -56,13 +46,6 @@ class GrandTotalProvenance:
 CalculationProvenance = (
     DestinationProvenance | DerivedGroupProvenance | GrandTotalProvenance
 )
-_CALCULATION_INTEGRITY_SEAL = object()
-
-
-@dataclass(frozen=True, slots=True)
-class _CalculationIntegrity:
-    seal: object
-    fingerprint: tuple[object, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,36 +62,16 @@ class DestinationCalculation:
     cost_variance_pct: Decimal | None
     actual_unit_cost_variance: Decimal | None
     actual_unit_cost_variance_pct: Decimal | None
-    kind: CalculationKind
-    provenance: CalculationProvenance
-    _integrity: _CalculationIntegrity = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _validate_calculation_provenance(self.kind, self.provenance)
-        if self.kind is CalculationKind.DESTINATION:
-            _validate_period_inputs(
-                self.planned_quantity, self.planned_cost_won, "planned"
-            )
-            _validate_period_inputs(
-                self.actual_quantity, self.actual_cost_won, "actual"
-            )
-        else:
-            _require_optional_nonnegative_decimal(
-                self.planned_quantity, "planned_quantity"
-            )
-            _require_optional_nonnegative_decimal(
-                self.actual_quantity, "actual_quantity"
-            )
-            _require_optional_nonnegative_int(
-                self.planned_cost_won,
-                "planned_cost_won",
-                maximum=MAX_SQLITE_INTEGER,
-            )
-            _require_optional_nonnegative_int(
-                self.actual_cost_won,
-                "actual_cost_won",
-                maximum=MAX_SQLITE_INTEGER,
-            )
+        _validate_calculation_sources(
+            self.planned_quantity,
+            self.planned_cost_won,
+            self.actual_quantity,
+            self.actual_cost_won,
+            self.kind,
+        )
         _require_optional_nonnegative_decimal(
             self.planned_unit_cost, "planned_unit_cost"
         )
@@ -136,7 +99,54 @@ class DestinationCalculation:
         for field, expected_value in expected.items():
             if getattr(self, field) != expected_value:
                 raise ValueError(f"{field} is inconsistent with source values")
-        _validate_calculation_integrity(self)
+
+    @property
+    def kind(self) -> CalculationKind:
+        raise TypeError("DestinationCalculation must be created by a public factory")
+
+    @property
+    def provenance(self) -> CalculationProvenance:
+        raise TypeError("DestinationCalculation must be created by a public factory")
+
+
+@dataclass(frozen=True, slots=True)
+class DestinationResult(DestinationCalculation):
+    destination_id: int | None
+
+    @property
+    def kind(self) -> CalculationKind:
+        return CalculationKind.DESTINATION
+
+    @property
+    def provenance(self) -> DestinationProvenance:
+        return DestinationProvenance(self.destination_id)
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedGroupResult(DestinationCalculation):
+    group_id: int
+    member_destination_ids: tuple[int, ...]
+
+    @property
+    def kind(self) -> CalculationKind:
+        return CalculationKind.DERIVED_GROUP
+
+    @property
+    def provenance(self) -> DerivedGroupProvenance:
+        return DerivedGroupProvenance(self.group_id, self.member_destination_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class GrandTotalResult(DestinationCalculation):
+    destination_ids: tuple[int, ...]
+
+    @property
+    def kind(self) -> CalculationKind:
+        return CalculationKind.GRAND_TOTAL
+
+    @property
+    def provenance(self) -> GrandTotalProvenance:
+        return GrandTotalProvenance(self.destination_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,27 +387,27 @@ def _make_calculation(
         actual_quantity,
         actual_cost_won,
     )
-    integrity = _CalculationIntegrity(
-        seal=_CALCULATION_INTEGRITY_SEAL,
-        fingerprint=_calculation_fingerprint(
-            planned_quantity,
-            planned_cost_won,
-            actual_quantity,
-            actual_cost_won,
-            calculated,
-            kind,
-            provenance,
-        ),
-    )
-    return DestinationCalculation(
+    common_fields = dict(
         planned_quantity=planned_quantity,
         planned_cost_won=planned_cost_won,
         actual_quantity=actual_quantity,
         actual_cost_won=actual_cost_won,
         **calculated,
-        kind=kind,
-        provenance=provenance,
-        _integrity=integrity,
+    )
+    if isinstance(provenance, DestinationProvenance):
+        return DestinationResult(
+            **common_fields,
+            destination_id=provenance.destination_id,
+        )
+    if isinstance(provenance, DerivedGroupProvenance):
+        return DerivedGroupResult(
+            **common_fields,
+            group_id=provenance.group_id,
+            member_destination_ids=provenance.member_destination_ids,
+        )
+    return GrandTotalResult(
+        **common_fields,
+        destination_ids=provenance.destination_ids,
     )
 
 
@@ -433,26 +443,6 @@ def _calculated_fields(
             actual_unit, planned_unit
         ),
     }
-
-
-def _calculation_fingerprint(
-    planned_quantity: Decimal | None,
-    planned_cost_won: int | None,
-    actual_quantity: Decimal | None,
-    actual_cost_won: int | None,
-    calculated: Mapping[str, Decimal | int | None],
-    kind: CalculationKind,
-    provenance: CalculationProvenance,
-) -> tuple[object, ...]:
-    return (
-        planned_quantity,
-        planned_cost_won,
-        actual_quantity,
-        actual_cost_won,
-        *(calculated[field] for field in _CALCULATED_FIELD_NAMES),
-        kind,
-        provenance,
-    )
 
 
 def _optional_unit_cost(
@@ -721,29 +711,6 @@ def _validate_calculation_provenance(
         provenance.destination_ids,
         "grand total provenance destination ids",
     )
-
-
-def _validate_calculation_integrity(calculation: DestinationCalculation) -> None:
-    integrity = calculation._integrity
-    if (
-        not isinstance(integrity, _CalculationIntegrity)
-        or integrity.seal is not _CALCULATION_INTEGRITY_SEAL
-    ):
-        raise ValueError("calculation integrity token is invalid")
-    calculated = {
-        field: getattr(calculation, field) for field in _CALCULATED_FIELD_NAMES
-    }
-    expected = _calculation_fingerprint(
-        calculation.planned_quantity,
-        calculation.planned_cost_won,
-        calculation.actual_quantity,
-        calculation.actual_cost_won,
-        calculated,
-        calculation.kind,
-        calculation.provenance,
-    )
-    if integrity.fingerprint != expected:
-        raise ValueError("calculation integrity does not match immutable provenance")
 
 
 def _validate_provenance_ids(values: object, field: str) -> None:

@@ -467,11 +467,11 @@ def test_result_records_reject_kind_relabeling_without_matching_provenance():
         [GroupMember(10, 1, "Member", 1, True, True)],
     )
 
-    with pytest.raises(ValueError, match="provenance"):
+    with pytest.raises(TypeError, match="kind"):
         replace(group, kind=CalculationKind.DESTINATION)
-    with pytest.raises(ValueError, match="provenance"):
+    with pytest.raises(TypeError, match="kind"):
         replace(destination, kind=CalculationKind.DERIVED_GROUP)
-    with pytest.raises(ValueError, match="provenance"):
+    with pytest.raises(TypeError, match="kind"):
         replace(destination, kind=CalculationKind.GRAND_TOTAL)
 
 
@@ -498,18 +498,48 @@ def test_result_integrity_rejects_kind_and_provenance_replacement_together():
         ],
     )
 
-    with pytest.raises(ValueError, match="integrity"):
+    with pytest.raises(TypeError, match="kind|provenance"):
         replace(
             group,
             kind=CalculationKind.DESTINATION,
             provenance=DestinationProvenance(1),
         )
-    with pytest.raises(ValueError, match="integrity"):
+    with pytest.raises(TypeError, match="kind|provenance"):
         replace(
             first,
             kind=CalculationKind.DERIVED_GROUP,
             provenance=DerivedGroupProvenance(10, (1,)),
         )
+
+
+def test_result_identity_rejects_integrity_transplant_and_direct_replacement():
+    from app.domain.calculations import (
+        CalculationKind,
+        calculate_destination,
+        calculate_group,
+    )
+
+    destination = calculate_destination(
+        Decimal("1"), 100, Decimal("1"), 100, destination_id=1
+    )
+    group = calculate_group(
+        {1: destination},
+        [GroupMember(10, 1, "Member", 1, True, True)],
+    )
+
+    assert not hasattr(destination, "_integrity")
+    assert not hasattr(group, "_integrity")
+    with pytest.raises(TypeError, match="kind|provenance|integrity"):
+        replace(
+            group,
+            kind=CalculationKind.DESTINATION,
+            provenance=destination.provenance,
+            _integrity=object(),
+        )
+    with pytest.raises(TypeError, match="provenance"):
+        replace(group, provenance=destination.provenance)
+    with pytest.raises(TypeError, match="integrity"):
+        replace(group, _integrity=object())
 
 
 @pytest.mark.parametrize("invalid_key", [True, "1", 0, -1])
