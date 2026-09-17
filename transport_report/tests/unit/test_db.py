@@ -61,7 +61,7 @@ def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
     assert {
         "report_month",
         "is_locked",
@@ -81,6 +81,137 @@ def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp
         )
         for operation in ("insert", "update", "delete")
     } <= trigger_names
+
+
+def test_transport_source_alias_migration_preserves_known_legacy_state(tmp_path):
+    migrations_dir = Database(tmp_path / "unused.db").migrations_dir
+    first_two = tmp_path / "first-two"
+    first_two.mkdir()
+    for filename in ("001_initial.sql", "002_month_locks.sql"):
+        shutil.copyfile(migrations_dir / filename, first_two / filename)
+
+    database_path = tmp_path / "app.db"
+    legacy = Database(database_path, migrations_dir=first_two)
+    legacy.migrate()
+    with legacy.connection() as connection:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Legacy Destination", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "transport", "legacy.xlsx", "a" * 64, "imported"),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, destination_id, source_sheet, "
+            "source_row, transport_day, transport_type, trip_count_text, cost_won) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                "2026-08",
+                destination_id,
+                "Sheet1",
+                2,
+                1,
+                "regular",
+                "1",
+                1_000,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, unresolved_alias, source_sheet, "
+            "source_row, transport_day, transport_type, trip_count_text, cost_won) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                "2026-08",
+                "Legacy Unknown",
+                "Sheet1",
+                3,
+                2,
+                "regular",
+                "1",
+                2_000,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, destination_id, unresolved_alias, "
+            "source_sheet, source_row, transport_day, transport_type, "
+            "trip_count_text, cost_won) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                "2026-08",
+                destination_id,
+                "   ",
+                "Sheet1",
+                4,
+                3,
+                "regular",
+                "1",
+                3_000,
+            ),
+        )
+        connection.commit()
+
+    upgraded = Database(database_path)
+    upgraded.migrate()
+
+    with upgraded.connection() as connection:
+        rows = connection.execute(
+            "SELECT destination_id, unresolved_alias, source_alias "
+            "FROM transport_entries ORDER BY source_row"
+        ).fetchall()
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+    assert versions == [1, 2, 3]
+    assert tuple(rows[0]) == (destination_id, None, None)
+    assert tuple(rows[1]) == (None, "Legacy Unknown", "Legacy Unknown")
+    assert tuple(rows[2]) == (destination_id, "   ", None)
+
+
+def test_transport_source_alias_rejects_blank_nonnull_values(tmp_path):
+    database = Database(tmp_path / "app.db")
+    database.migrate()
+    with database.connection() as connection:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "transport", "source.xlsx", "b" * 64, "imported"),
+        ).lastrowid
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO transport_entries"
+                "(import_batch_id, report_month, destination_id, source_alias, "
+                "source_sheet, source_row, transport_day, transport_type, "
+                "trip_count_text, cost_won) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    "2026-08",
+                    destination_id,
+                    "   ",
+                    "Sheet1",
+                    2,
+                    1,
+                    "regular",
+                    "1",
+                    1_000,
+                ),
+            )
 
 
 @pytest.mark.parametrize(
@@ -452,7 +583,7 @@ def test_migrations_are_repeatable(tmp_path):
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2]
+    assert [row["version"] for row in versions] == [1, 2, 3]
 
 
 def test_migrate_rejects_schema_versions_newer_than_bundled_migrations(tmp_path):
@@ -646,6 +777,7 @@ def test_schema_includes_required_business_and_audit_fields(tmp_path):
         "transport_entries": {
             "source_sheet",
             "source_row",
+            "source_alias",
             "transport_day",
             "transport_type",
             "trip_count_text",
@@ -1039,7 +1171,7 @@ def test_concurrent_migrate_calls_do_not_reapply_versions(tmp_path, monkeypatch)
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2]
+    assert [row["version"] for row in versions] == [1, 2, 3]
 
 
 def _schema_objects(db):

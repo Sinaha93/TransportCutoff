@@ -73,15 +73,17 @@ class TransportEntryRepository:
             connection.executemany(
                 "INSERT INTO transport_entries"
                 "(import_batch_id, report_month, destination_id, unresolved_alias, "
-                "source_sheet, source_row, transport_day, transport_type, "
+                "source_alias, source_sheet, source_row, transport_day, transport_type, "
                 "vehicle_type, vehicle_driver_group, trip_count_text, unit_rate_won, "
-                "cost_won, source_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "cost_won, source_note) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         batch_id,
                         report_month,
                         destination_id,
                         unresolved_alias,
+                        row.destination_alias,
                         row.source_sheet,
                         row.source_row,
                         row.day,

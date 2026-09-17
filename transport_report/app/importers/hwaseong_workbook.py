@@ -10,19 +10,21 @@ from openpyxl import load_workbook
 
 
 REGULAR_SHEET = "화성운반비내역(8월)"
+_REGULAR_SHEET = re.compile(r"^화성운반비내역\((?P<month>[1-9]|1[0-2])월\)$")
 SUBCONTRACT_SHEETS = (
     "용차1-OK로지웰",
     "용차2-대원로지스틱",
     "용차3-정동물류",
 )
 _MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
-_REGULAR_DESTINATION_HEADERS = {"운반지역", "운반지", "목적지", "납품처"}
+_REGULAR_COLUMN_B_HEADERS = {"날짜", "운반지역", "운반지", "목적지", "납품처"}
+_REGULAR_TOTAL_COUNT_HEADERS = {"계", "총회수", "총횟수"}
 _REGULAR_UNIT_HEADERS = {"단가", "운반단가", "운임단가"}
 _REGULAR_SUBTOTAL_HEADERS = {"소계", "금액", "운반비"}
-_DATE_HEADERS = {"일자", "날짜", "운반일", "운송일"}
-_DESTINATION_HEADERS = _REGULAR_DESTINATION_HEADERS | {"도착지"}
-_TONNAGE_HEADERS = {"톤수", "차량톤수", "차종"}
-_AMOUNT_HEADERS = {"금액", "운반비", "운임"}
+_DATE_HEADERS = {"일자", "날짜", "오더일자", "운반일", "운송일"}
+_DESTINATION_HEADERS = {"운반지역", "운반지", "목적지", "납품처", "도착지"}
+_TONNAGE_HEADERS = {"톤수", "차량톤수", "차종", "차종(t)", "차종(톤)"}
+_AMOUNT_HEADERS = {"금액", "운반비", "운임", "기본요금"}
 _TOTAL_LABELS = {"합계", "총계", "계"}
 _SQLITE_MAX = 2**63 - 1
 
@@ -37,6 +39,10 @@ class WorkbookStructureError(TransportWorkbookError):
 
 class SubtotalMismatchError(TransportWorkbookError):
     """Raised when a regular row does not reconcile to its cached subtotal."""
+
+
+class TotalCountMismatchError(TransportWorkbookError):
+    """Raised when a regular row does not reconcile to its cached trip count."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,14 +81,24 @@ class HwaseongWorkbookParser:
             raise WorkbookStructureError(f"Workbook could not be opened: {error}") from error
 
         try:
-            required_sheets = (REGULAR_SHEET, *SUBCONTRACT_SHEETS)
-            missing = [name for name in required_sheets if name not in workbook.sheetnames]
+            regular_sheets = [
+                name for name in workbook.sheetnames if _REGULAR_SHEET.fullmatch(name)
+            ]
+            missing = [name for name in SUBCONTRACT_SHEETS if name not in workbook.sheetnames]
+            if not regular_sheets:
+                missing.insert(0, "화성운반비내역(<month>월)")
             if missing:
                 raise WorkbookStructureError(
                     "Workbook is missing required sheet(s): " + ", ".join(missing)
                 )
+            if len(regular_sheets) != 1:
+                raise WorkbookStructureError(
+                    "Workbook must contain exactly one regular transport sheet"
+                )
 
-            rows = self._parse_regular(workbook[REGULAR_SHEET], report_month)
+            regular_sheet = workbook[regular_sheets[0]]
+            _validate_regular_sheet_month(regular_sheet.title, report_month)
+            rows = self._parse_regular(regular_sheet, report_month)
             for sheet_name in SUBCONTRACT_SHEETS:
                 rows.extend(
                     self._parse_subcontract(workbook[sheet_name], report_month)
@@ -101,27 +117,44 @@ class HwaseongWorkbookParser:
         rows: list[ParsedTransportEntry] = []
         vehicle_driver_group: str | None = None
         for row_number in range(header_row + 1, sheet.max_row + 1):
-            if sheet.row_dimensions[row_number].hidden or _is_regular_header(
-                sheet, row_number
-            ):
+            if _is_regular_header(sheet, row_number):
                 continue
 
             group_value = _optional_text(sheet.cell(row_number, 1).value)
             if group_value is not None:
                 vehicle_driver_group = group_value
 
-            destination_alias = _optional_text(sheet.cell(row_number, 2).value)
+            destination_alias = _destination_alias(
+                sheet.cell(row_number, 2).value,
+                f"{sheet.title} row {row_number} destination",
+            )
+            day_values = [
+                sheet.cell(row_number, column).value for column in range(3, 34)
+            ]
+            cached_count_value = sheet.cell(row_number, 34).value
             unit_value = sheet.cell(row_number, 36).value
-            if destination_alias is None or not _is_number(unit_value):
+            cached_subtotal_value = sheet.cell(row_number, 37).value
+            detail_values = (
+                destination_alias,
+                *day_values,
+                cached_count_value,
+                unit_value,
+                cached_subtotal_value,
+            )
+            if not any(_has_value(value) for value in detail_values):
                 continue
+            if destination_alias is None:
+                raise WorkbookStructureError(
+                    f"{sheet.title} row {row_number} destination is required"
+                )
 
             unit_rate = _integer_won(
                 unit_value,
                 f"{sheet.title} row {row_number} unit cost",
             )
             row_entries: list[ParsedTransportEntry] = []
-            for day in range(1, 32):
-                raw_count = sheet.cell(row_number, day + 2).value
+            calculated_count = Decimal(0)
+            for day, raw_count in enumerate(day_values, start=1):
                 if raw_count in (None, ""):
                     continue
                 trip_count = _nonnegative_decimal(
@@ -130,6 +163,8 @@ class HwaseongWorkbookParser:
                 )
                 if trip_count == 0:
                     continue
+                _validate_calendar_day(report_month, day, sheet.title, row_number)
+                calculated_count += trip_count
                 cost_won = _integer_won(
                     trip_count * unit_rate,
                     f"{sheet.title} row {row_number} day {day} calculated cost",
@@ -149,8 +184,17 @@ class HwaseongWorkbookParser:
                     )
                 )
 
+            cached_count = _nonnegative_decimal(
+                cached_count_value,
+                f"{sheet.title} row {row_number} cached total count",
+            )
+            if calculated_count != cached_count:
+                raise TotalCountMismatchError(
+                    f"Total count mismatch in {sheet.title} row {row_number}: "
+                    f"calculated {calculated_count}, cached {cached_count}"
+                )
             cached_subtotal = _integer_won(
-                sheet.cell(row_number, 37).value,
+                cached_subtotal_value,
                 f"{sheet.title} row {row_number} cached subtotal",
             )
             calculated_subtotal = sum(entry.cost_won for entry in row_entries)
@@ -174,17 +218,24 @@ class HwaseongWorkbookParser:
 
         rows: list[ParsedTransportEntry] = []
         for row_number in range(header_row + 1, sheet.max_row + 1):
-            if sheet.row_dimensions[row_number].hidden:
-                continue
-            destination_alias = _optional_text(
-                sheet.cell(row_number, destination_column).value
-            )
-            if destination_alias is None or _header_text(destination_alias) in _TOTAL_LABELS:
-                continue
+            if _is_displayed_total_row(sheet, row_number):
+                break
             raw_date = sheet.cell(row_number, date_column).value
+            destination_alias = _destination_alias(
+                sheet.cell(row_number, destination_column).value,
+                f"{sheet.title} row {row_number} destination",
+            )
+            raw_tonnage = sheet.cell(row_number, tonnage_column).value
             raw_amount = sheet.cell(row_number, 9).value
-            if raw_date in (None, "") and raw_amount in (None, ""):
+            if not any(
+                _has_value(value)
+                for value in (raw_date, destination_alias, raw_tonnage, raw_amount)
+            ):
                 continue
+            if destination_alias is None:
+                raise WorkbookStructureError(
+                    f"{sheet.title} row {row_number} destination is required"
+                )
             transport_date = _transport_date(
                 raw_date, f"{sheet.title} row {row_number} date"
             )
@@ -206,9 +257,7 @@ class HwaseongWorkbookParser:
                     trip_count=Decimal(1),
                     unit_rate_won=None,
                     cost_won=amount,
-                    vehicle_type=_optional_text(
-                        sheet.cell(row_number, tonnage_column).value
-                    ),
+                    vehicle_type=_optional_text(raw_tonnage),
                 )
             )
         return rows
@@ -223,11 +272,13 @@ def _find_regular_header(sheet) -> int | None:
 
 def _is_regular_header(sheet, row_number: int) -> bool:
     destination = _header_text(sheet.cell(row_number, 2).value)
+    total_count = _header_text(sheet.cell(row_number, 34).value)
     unit = _header_text(sheet.cell(row_number, 36).value)
     subtotal = _header_text(sheet.cell(row_number, 37).value)
     day_values = [sheet.cell(row_number, column).value for column in range(3, 34)]
     return (
-        destination in _REGULAR_DESTINATION_HEADERS
+        destination in _REGULAR_COLUMN_B_HEADERS
+        and total_count in _REGULAR_TOTAL_COUNT_HEADERS
         and unit in _REGULAR_UNIT_HEADERS
         and subtotal in _REGULAR_SUBTOTAL_HEADERS
         and day_values == list(range(1, 32))
@@ -263,6 +314,17 @@ def _header_text(value: object) -> str:
     return "" if value is None else str(value).strip().replace(" ", "")
 
 
+def _has_value(value: object) -> bool:
+    return value is not None and value != ""
+
+
+def _is_displayed_total_row(sheet, row_number: int) -> bool:
+    return any(
+        _header_text(sheet.cell(row_number, column).value) in _TOTAL_LABELS
+        for column in range(1, 10)
+    )
+
+
 def _optional_text(value: object) -> str | None:
     if value is None:
         return None
@@ -270,8 +332,36 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
-def _is_number(value: object) -> bool:
-    return not isinstance(value, bool) and isinstance(value, (int, float, Decimal))
+def _destination_alias(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WorkbookStructureError(f"{label} must be text")
+    text = value.strip()
+    return text or None
+
+
+def _validate_regular_sheet_month(sheet_name: str, report_month: str) -> None:
+    match = _REGULAR_SHEET.fullmatch(sheet_name)
+    if match is None:
+        raise WorkbookStructureError(f"Invalid regular sheet name: {sheet_name}")
+    if int(match.group("month")) != int(report_month[-2:]):
+        raise WorkbookStructureError(
+            f"Regular sheet month does not match report_month {report_month}"
+        )
+
+
+def _validate_calendar_day(
+    report_month: str, day: int, sheet_name: str, row_number: int
+) -> None:
+    year, month = (int(part) for part in report_month.split("-"))
+    try:
+        date(year, month, day)
+    except ValueError as error:
+        raise WorkbookStructureError(
+            f"{sheet_name} row {row_number} has invalid calendar date "
+            f"{report_month}-{day:02d}"
+        ) from error
 
 
 def _nonnegative_decimal(value: object, label: str) -> Decimal:
