@@ -130,6 +130,27 @@ def _add_zip_member(path: Path, member_name: str, data: bytes) -> None:
         archive.writestr(member_name, data)
 
 
+def _rename_zip_member(
+    path: Path, old_member_name: str, new_member_name: str, transform=lambda data: data
+) -> None:
+    with ZipFile(path, "r") as source:
+        members = [
+            (
+                new_member_name if info.filename == old_member_name else info.filename,
+                transform(source.read(info.filename))
+                if info.filename == old_member_name
+                else source.read(info.filename),
+            )
+            for info in source.infolist()
+        ]
+
+    temporary = path.with_name(path.name + ".renamed")
+    with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as destination:
+        for member_name, data in members:
+            destination.writestr(member_name, data)
+    temporary.replace(path)
+
+
 def _add_workbook_pivot_cache_reference(path: Path, target: str) -> None:
     _rewrite_zip_member(
         path,
@@ -2030,8 +2051,8 @@ def test_preflight_rejects_wrong_type_drawing_hyperlink_before_openpyxl(
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
-def test_preflight_uses_first_duplicate_drawing_hyperlink_relationship(
-    api, fixture_path
+def test_preflight_rejects_conflicting_duplicate_drawing_relationship(
+    api, fixture_path, monkeypatch
 ):
     parser_module, _, _ = api
     _add_drawing_hyperlink(fixture_path)
@@ -2047,9 +2068,13 @@ def test_preflight_uses_first_duplicate_drawing_hyperlink_relationship(
         ),
     )
 
-    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
 
-    assert len(rows) == 5
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"content type conflicts with image relationship semantics",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
 def test_preflight_rejects_missing_workbook_pivot_cache_before_openpyxl(
@@ -2090,6 +2115,16 @@ def test_preflight_follows_pivot_cache_records_chain_before_openpyxl(
         b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" '
         b'Target="/xl/pivotCache/missingRecords.xml"/></Relationships>',
     )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml"/>'
+            b"</Types>",
+        ),
+    )
     monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
 
     with pytest.raises(
@@ -2128,6 +2163,591 @@ def test_preflight_accepts_valid_worksheet_chart_and_image(api, fixture_path):
     rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
     assert len(rows) == 5
+
+
+def _rename_chart_part(path: Path, *, malformed: bool = False) -> None:
+    _add_worksheet_chart(path)
+    _rename_zip_member(
+        path,
+        "xl/charts/chart1.xml",
+        "xl/charts/chart1.bin",
+        (lambda data: data[:-1]) if malformed else (lambda data: data),
+    )
+    _rewrite_zip_member(
+        path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(b"/xl/charts/chart1.xml", b"/xl/charts/chart1.bin"),
+    )
+    _rewrite_zip_member(
+        path,
+        "[Content_Types].xml",
+        lambda data: data.replace(b"/xl/charts/chart1.xml", b"/xl/charts/chart1.bin"),
+    )
+
+
+@pytest.mark.parametrize(
+    "relationship_namespace",
+    [
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    ],
+    ids=("transitional", "strict"),
+)
+def test_preflight_classifies_malformed_chart_by_relationship_not_suffix(
+    api, fixture_path, monkeypatch, relationship_namespace
+):
+    parser_module, _, _ = api
+    _rename_chart_part(fixture_path, malformed=True)
+    if "purl.oclc.org" in relationship_namespace:
+        _rewrite_zip_member(
+            fixture_path,
+            "xl/drawings/_rels/drawing1.xml.rels",
+            lambda data: data.replace(
+                b"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+                f"{relationship_namespace}/chart".encode(),
+            ),
+        )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Related XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_applies_xml_limit_to_chart_with_binary_suffix(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rename_chart_part(fixture_path)
+    limit = 16 * 1024
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/charts/chart1.bin",
+        lambda data: data.replace(b"</chartSpace>", b" " * limit + b"</chartSpace>"),
+    )
+    monkeypatch.setattr(
+        parser_module, "MAX_PREFLIGHT_RELATED_XML_BYTES", limit
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"related XML size limit.*16384"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_well_formed_chart_with_binary_suffix(api, fixture_path):
+    parser_module, _, _ = api
+    _rename_chart_part(fixture_path)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_keeps_image_binary_despite_xml_suffix(api, fixture_path):
+    parser_module, _, _ = api
+    _add_worksheet_chart_and_image(fixture_path)
+    _rename_zip_member(
+        fixture_path, "xl/media/image1.png", "xl/media/image1.xml"
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(b"/xl/media/image1.png", b"/xl/media/image1.xml"),
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/media/image1.xml" ContentType="image/png"/>'
+            b"</Types>",
+        ),
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_rejects_chart_consumer_disguised_as_image_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(b"/relationships/chart\"", b"/relationships/image\""),
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b'application/vnd.openxmlformats-officedocument.drawingml.chart+xml',
+            b"image/png",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"content type conflicts with chart relationship semantics",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("semantic", "content_type"),
+    [
+        (
+            "worksheet",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+        ),
+        (
+            "chartsheet",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml",
+        ),
+        (
+            "drawing",
+            "application/vnd.openxmlformats-officedocument.drawing+xml",
+        ),
+        (
+            "table",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        ),
+        (
+            "queryTable",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.queryTable+xml",
+        ),
+        (
+            "pivotTable",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml",
+        ),
+        (
+            "pivotCacheDefinition",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
+        ),
+        (
+            "pivotCacheRecords",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml",
+        ),
+        (
+            "comments",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml",
+        ),
+        ("vmlDrawing", "application/vnd.openxmlformats-officedocument.vmlDrawing"),
+        ("chartStyle", "application/vnd.ms-office.chartstyle+xml"),
+        ("chartColorStyle", "application/vnd.ms-office.chartcolorstyle+xml"),
+    ],
+)
+@pytest.mark.parametrize(
+    "relationship_namespace",
+    [
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    ],
+    ids=("transitional", "strict"),
+)
+def test_preflight_classifies_xml_relationship_semantics_for_both_namespaces(
+    api, semantic, content_type, relationship_namespace
+):
+    parser_module, _, _ = api
+    content_types = parser_module._ContentTypes(
+        {}, {"xl/unusual.bin": content_type}, (("xl/unusual.bin", content_type),)
+    )
+    target = parser_module._RelationshipTarget(
+        "xl/unusual.bin",
+        "rId1",
+        f"{relationship_namespace}/{semantic}",
+        "xl/source.xml",
+    )
+
+    assert parser_module._validate_relationship_target_semantics(
+        content_types, target
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "relationship_type",
+    [
+        "http://schemas.microsoft.com/office/2011/relationships/chartStyle",
+        "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle",
+    ],
+)
+def test_preflight_rejects_microsoft_chart_style_content_type_conflict(
+    api, relationship_type
+):
+    parser_module, _, _ = api
+    content_types = parser_module._ContentTypes(
+        {}, {"xl/style.bin": "image/png"}, (("xl/style.bin", "image/png"),)
+    )
+    target = parser_module._RelationshipTarget(
+        "xl/style.bin", "rId1", relationship_type, "xl/charts/chart1.xml"
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"content type conflicts with chart.*relationship semantics",
+    ):
+        parser_module._validate_relationship_target_semantics(
+            content_types, target
+        )
+
+
+def test_preflight_rejects_relationship_content_type_conflict_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b'application/vnd.openxmlformats-officedocument.drawingml.chart+xml',
+            b"image/png",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"content type.*chart"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_content_type_mapping_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rename_chart_part(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b'<Override PartName="/xl/charts/chart1.bin" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>',
+            b"",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"content type mapping is missing"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_conflicting_content_type_overrides_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/styles.xml" ContentType="image/png"/>'
+            b"</Types>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"conflicting content type override",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_content_types_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(fixture_path, "[Content_Types].xml", lambda data: data[:-1])
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Content types XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_wrong_content_types_root_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(b"<Types ", b"<NotTypes ", 1).replace(
+            b"</Types>", b"</NotTypes>", 1
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Content types XML is invalid"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    "part_name", ["/xl/../escape.xml", "/xl//escape.xml", "/xl/./escape.xml"]
+)
+def test_preflight_rejects_unsafe_content_type_part_name_before_openpyxl(
+    api, fixture_path, monkeypatch, part_name
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            f'<Override PartName="{part_name}" ContentType="application/xml"/>'.encode()
+            + b"</Types>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"unsafe part name"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_content_type_record_budget_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_CONTENT_TYPE_RECORDS", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"content type record limit.*1"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_eager_style_target_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _remove_zip_member(fixture_path, "xl/styles.xml")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing: xl/styles.xml",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_mismatched_office_document_target_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "_rels/.rels",
+        lambda data: data.replace(b'Target="xl/workbook.xml"', b'Target="xl/styles.xml"'),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"officeDocument relationship target conflicts",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_unused_shared_string_records_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_zip_member(
+        fixture_path,
+        "xl/sharedStrings.bin",
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b"<si><t>one</t></si><si><t>two</t></si></sst>",
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/sharedStrings.bin" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            b"</Types>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_SHARED_STRING_RECORDS", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"shared string record limit.*1"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_shared_string_text_budget_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_zip_member(
+        fixture_path,
+        "xl/sharedStrings.xml",
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b"<si><t>long text</t></si></sst>",
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/sharedStrings.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            b"</Types>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_SHARED_STRING_CHARACTERS", 4)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"shared string character limit.*4"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_bounded_shared_strings_with_unusual_name(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    _add_zip_member(
+        fixture_path,
+        "xl/sharedStrings.bin",
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b"<si><t>ordinary text</t></si></sst>",
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/sharedStrings.bin" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            b"</Types>",
+        ),
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_rejects_style_record_budget_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_STYLE_RECORDS", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"style record limit.*1"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_style_collection_budget_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_STYLE_COLLECTION_RECORDS", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"style collection record limit.*1",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_styles_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path, "xl/styles.xml", lambda data: data.rsplit(b">", 1)[0]
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Styles XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_custom_properties_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_zip_member(
+        fixture_path,
+        "docProps/custom.xml",
+        b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties">',
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/docProps/custom.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/>'
+            b"</Types>",
+        ),
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "_rels/.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rIdCustom" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties" '
+            b'Target="docProps/custom.xml"/></Relationships>',
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Package XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "xl/theme/theme1.xml",
+        "docProps/core.xml",
+        "docProps/app.xml",
+    ],
+    ids=("theme", "core-properties", "extended-properties"),
+)
+def test_preflight_rejects_malformed_package_xml_before_openpyxl(
+    api, fixture_path, monkeypatch, member_name
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path, member_name, lambda data: data.rsplit(b">", 1)[0]
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Package XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
 @pytest.mark.parametrize(

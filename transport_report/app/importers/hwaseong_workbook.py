@@ -47,7 +47,21 @@ MAX_PARSED_ENTRIES = 20_000
 MAX_PREFLIGHT_WORKSHEETS = 256
 MAX_PREFLIGHT_WORKSHEET_XML_BYTES = 8 * 1024 * 1024
 MAX_PREFLIGHT_RELATED_XML_BYTES = 8 * 1024 * 1024
+MAX_PREFLIGHT_PACKAGE_XML_BYTES = 8 * 1024 * 1024
 MAX_PREFLIGHT_RELATED_PART_BYTES = 64 * 1024 * 1024
+# OpenPyXL 3.1.5 load audit: manifest, shared strings, workbook, core/custom
+# properties, theme, styles, then worksheets and their comments/tables/drawings/
+# charts/images/pivots. keep_links=False skips external-link bodies. app.xml is
+# not currently materialized but is checked as package metadata. Generic package
+# trees are stream-validated under 8 MiB, which bounds their one-shot parse cost;
+# shared strings/styles need the deeper object/text counts below because OpenPyXL
+# eagerly builds a Python object for every record. Excel's documented unique-cell-
+# format ceiling is 65,490, so 65,536 leaves ordinary workbooks headroom.
+MAX_PREFLIGHT_CONTENT_TYPE_RECORDS = 4_096
+MAX_PREFLIGHT_SHARED_STRING_RECORDS = 100_000
+MAX_PREFLIGHT_SHARED_STRING_CHARACTERS = 8_000_000
+MAX_PREFLIGHT_STYLE_COLLECTION_RECORDS = 65_536
+MAX_PREFLIGHT_STYLE_RECORDS = 100_000
 MAX_PREFLIGHT_RELATIONSHIP_PARTS = 1_024
 MAX_PREFLIGHT_RELATIONSHIP_EDGES = 4_096
 MAX_PREFLIGHT_RELATIONSHIP_DEPTH = 64
@@ -70,25 +84,124 @@ _CELL_REFERENCE = re.compile(r"^(?P<column>[A-Za-z]+)(?P<row>[1-9][0-9]*)$")
 _DOCUMENT_RELATIONSHIP_NAMESPACE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 )
+_STRICT_DOCUMENT_RELATIONSHIP_NAMESPACE = (
+    "http://purl.oclc.org/ooxml/officeDocument/relationships"
+)
+_RELATIONSHIP_SEMANTIC_ALIASES = {
+    "http://schemas.microsoft.com/office/2011/relationships/chartStyle": (
+        "chartStyle"
+    ),
+    "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle": (
+        "chartColorStyle"
+    ),
+}
 _DOCUMENT_RELATIONSHIP_ID = f"{{{_DOCUMENT_RELATIONSHIP_NAMESPACE}}}id"
 _DOCUMENT_RELATIONSHIP_REFERENCES = {
     f"{{{_DOCUMENT_RELATIONSHIP_NAMESPACE}}}{name}"
     for name in ("id", "embed", "link")
-}
-_COMMENTS_RELATIONSHIP = (
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
-)
-_OPENPYXL_EAGER_SHEET_RELATIONSHIPS = {
-    _COMMENTS_RELATIONSHIP,
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
 }
 _HYPERLINK_RELATIONSHIPS = {
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
     "http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink",
 }
 _HYPERLINK_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTENT_TYPE = re.compile(r"^[!#$&^_.+A-Za-z0-9-]+/[!#$&^_.+A-Za-z0-9-]+$")
+_CONTENT_TYPES_ROOT = (
+    "{http://schemas.openxmlformats.org/package/2006/content-types}Types"
+)
+
+_CONTENT_TYPE_WORKBOOKS = (
+    "application/vnd.ms-excel.template.macroEnabled.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+    "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+)
+_CONTENT_TYPE_SHARED_STRINGS = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+)
+_CONTENT_TYPE_STYLES = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"
+)
+_CONTENT_TYPE_THEME = "application/vnd.openxmlformats-officedocument.theme+xml"
+_CONTENT_TYPE_CORE_PROPERTIES = (
+    "application/vnd.openxmlformats-package.core-properties+xml"
+)
+_CONTENT_TYPE_EXTENDED_PROPERTIES = (
+    "application/vnd.openxmlformats-officedocument.extended-properties+xml"
+)
+_CONTENT_TYPE_CUSTOM_PROPERTIES = (
+    "application/vnd.openxmlformats-officedocument.custom-properties+xml"
+)
+
+_XML_RELATIONSHIP_CONTENT_TYPES = {
+    "worksheet": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+    },
+    "dialogsheet": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.dialogsheet+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    },
+    "macrosheet": {
+        "application/vnd.ms-excel.macrosheet+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    },
+    "intlMacrosheet": {
+        "application/vnd.ms-excel.intlmacrosheet+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    },
+    "chartsheet": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml"
+    },
+    "drawing": {
+        "application/vnd.openxmlformats-officedocument.drawing+xml"
+    },
+    "chart": {
+        "application/vnd.openxmlformats-officedocument.drawingml.chart+xml"
+    },
+    "table": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"
+    },
+    "queryTable": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.queryTable+xml"
+    },
+    "pivotTable": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"
+    },
+    "pivotCacheDefinition": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml"
+    },
+    "pivotCacheRecords": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml"
+    },
+    "comments": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"
+    },
+    "vmlDrawing": {
+        "application/vnd.openxmlformats-officedocument.vmlDrawing"
+    },
+    "chartStyle": {"application/vnd.ms-office.chartstyle+xml"},
+    "chartColorStyle": {"application/vnd.ms-office.chartcolorstyle+xml"},
+    "styles": {_CONTENT_TYPE_STYLES},
+    "theme": {_CONTENT_TYPE_THEME},
+    "sharedStrings": {_CONTENT_TYPE_SHARED_STRINGS},
+}
+_BINARY_RELATIONSHIP_CONTENT_TYPE_PREFIXES = {
+    "image": ("image/",),
+    "audio": ("audio/",),
+    "video": ("video/",),
+}
+_STYLE_COLLECTION_ELEMENTS = {
+    "numFmts",
+    "fonts",
+    "fills",
+    "borders",
+    "cellStyleXfs",
+    "cellXfs",
+    "cellStyles",
+    "dxfs",
+    "tableStyles",
+    "indexedColors",
+}
 
 
 class TransportWorkbookError(Exception):
@@ -134,6 +247,38 @@ class _Relationship:
     type: str
     target: str
     target_mode: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RelationshipTarget:
+    member_name: str
+    relationship_id: str
+    relationship_type: str
+    source_member: str
+    expected_semantic: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ContentTypes:
+    defaults: dict[str, str]
+    overrides: dict[str, str]
+    overrides_in_order: tuple[tuple[str, str], ...]
+
+    def for_member(self, member_name: str) -> str | None:
+        override = self.overrides.get(member_name)
+        if override is not None:
+            return override
+        filename = PurePosixPath(member_name).name
+        if "." not in filename:
+            return None
+        return self.defaults.get(filename.rsplit(".", 1)[1].lower())
+
+    def members_with_type(self, content_type: str) -> list[str]:
+        return [
+            member_name
+            for member_name, mapped_type in self.overrides_in_order
+            if mapped_type == content_type
+        ]
 
 
 class HwaseongWorkbookParser:
@@ -549,21 +694,537 @@ def _validate_worksheet_bounds(sheet) -> None:
         )
 
 
+def _read_content_types(archive: ZipFile) -> _ContentTypes:
+    try:
+        member = archive.getinfo("[Content_Types].xml")
+    except KeyError as error:
+        raise WorkbookStructureError("Content types XML is missing") from error
+    if member.is_dir():
+        raise WorkbookStructureError("Content types XML is invalid")
+    if member.file_size > MAX_PREFLIGHT_PACKAGE_XML_BYTES:
+        raise WorkbookStructureError(
+            "Content types XML exceeds XML size limit of "
+            f"{MAX_PREFLIGHT_PACKAGE_XML_BYTES}"
+        )
+
+    defaults: dict[str, str] = {}
+    overrides: dict[str, str] = {}
+    overrides_in_order: list[tuple[str, str]] = []
+    record_count = 0
+    root_seen = False
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source,
+                MAX_PREFLIGHT_PACKAGE_XML_BYTES,
+                "Content types XML",
+            )
+            for event, element in iterparse(
+                limited_source, events=("start", "end")
+            ):
+                if not root_seen:
+                    root_seen = True
+                    if event != "start" or element.tag != _CONTENT_TYPES_ROOT:
+                        raise WorkbookStructureError(
+                            "Content types XML is invalid"
+                        )
+                if event == "start":
+                    continue
+                local_name = _xml_local_name(element.tag)
+                if local_name == "Default":
+                    record_count += 1
+                    extension = element.attrib.get("Extension", "")
+                    content_type = element.attrib.get("ContentType", "")
+                    if (
+                        not extension
+                        or extension.startswith(".")
+                        or not extension.isascii()
+                        or not extension.replace("-", "").replace("_", "").isalnum()
+                    ):
+                        raise WorkbookStructureError(
+                            "Content types XML contains an unsafe default extension"
+                        )
+                    _validate_content_type(content_type)
+                    extension = extension.lower()
+                    previous = defaults.get(extension)
+                    if previous is not None and previous != content_type:
+                        raise WorkbookStructureError(
+                            "Content types XML contains a conflicting default"
+                        )
+                    defaults[extension] = content_type
+                elif local_name == "Override":
+                    record_count += 1
+                    member_name = _safe_content_type_part_name(
+                        element.attrib.get("PartName", "")
+                    )
+                    content_type = element.attrib.get("ContentType", "")
+                    _validate_content_type(content_type)
+                    previous = overrides.get(member_name)
+                    if previous is not None and previous != content_type:
+                        raise WorkbookStructureError(
+                            "Content types XML contains a conflicting content type "
+                            f"override for {member_name}"
+                        )
+                    if previous is None:
+                        overrides[member_name] = content_type
+                        overrides_in_order.append((member_name, content_type))
+                if record_count > MAX_PREFLIGHT_CONTENT_TYPE_RECORDS:
+                    raise WorkbookStructureError(
+                        "Workbook exceeds content type record limit of "
+                        f"{MAX_PREFLIGHT_CONTENT_TYPE_RECORDS}"
+                    )
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError("Content types XML is malformed") from error
+    if not root_seen:
+        raise WorkbookStructureError("Content types XML is invalid")
+    return _ContentTypes(defaults, overrides, tuple(overrides_in_order))
+
+
+def _safe_content_type_part_name(part_name: str) -> str:
+    if (
+        not part_name.startswith("/")
+        or part_name.startswith("//")
+        or part_name.endswith("/")
+        or "\\" in part_name
+        or "%" in part_name
+        or "?" in part_name
+        or "#" in part_name
+        or ":" in part_name
+        or _HYPERLINK_CONTROL_CHARACTERS.search(part_name)
+    ):
+        raise WorkbookStructureError(
+            "Content types XML contains an unsafe part name"
+        )
+    parts = part_name[1:].split("/")
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise WorkbookStructureError(
+            "Content types XML contains an unsafe part name"
+        )
+    return "/".join(parts)
+
+
+def _validate_content_type(content_type: str) -> None:
+    if len(content_type) > 255 or _CONTENT_TYPE.fullmatch(content_type) is None:
+        raise WorkbookStructureError(
+            "Content types XML contains an unsafe content type"
+        )
+
+
+def _select_workbook_member(content_types: _ContentTypes) -> str:
+    candidates: list[str] = []
+    for content_type in _CONTENT_TYPE_WORKBOOKS:
+        candidates.extend(content_types.members_with_type(content_type))
+        if candidates:
+            break
+    if not candidates:
+        default_types = set(content_types.defaults.values())
+        if default_types.intersection(_CONTENT_TYPE_WORKBOOKS):
+            candidates = ["xl/workbook.xml"]
+    if len(candidates) != 1:
+        raise WorkbookStructureError(
+            "Content types XML must identify exactly one workbook part"
+        )
+    workbook_member = candidates[0]
+    if workbook_member != "xl/workbook.xml":
+        raise WorkbookStructureError(
+            "Workbook part must be xl/workbook.xml for safe import"
+        )
+    return workbook_member
+
+
+def _require_content_type(
+    content_types: _ContentTypes,
+    member_name: str,
+    expected: set[str] | tuple[str, ...] | str,
+    description: str,
+) -> str:
+    content_type = content_types.for_member(member_name)
+    if content_type is None:
+        raise WorkbookStructureError(
+            f"{member_name} content type mapping is missing for {description}"
+        )
+    expected_types = {expected} if isinstance(expected, str) else set(expected)
+    if content_type not in expected_types:
+        raise WorkbookStructureError(
+            f"{member_name} content type conflicts with {description} semantics"
+        )
+    return content_type
+
+
+def _preflight_package_parts(
+    archive: ZipFile, content_types: _ContentTypes, workbook_member: str
+) -> None:
+    _require_content_type(
+        content_types, workbook_member, _CONTENT_TYPE_WORKBOOKS, "workbook"
+    )
+    _preflight_bounded_xml(archive, workbook_member, "Workbook")
+
+    shared_string_members = content_types.members_with_type(
+        _CONTENT_TYPE_SHARED_STRINGS
+    )
+    if len(shared_string_members) > 1:
+        raise WorkbookStructureError(
+            "Content types XML identifies multiple shared string parts"
+        )
+    if shared_string_members:
+        _preflight_shared_strings(archive, shared_string_members[0])
+
+    package_parts = (
+        ("xl/styles.xml", _CONTENT_TYPE_STYLES, "Styles", _preflight_styles),
+        ("xl/theme/theme1.xml", _CONTENT_TYPE_THEME, "Theme", None),
+        (
+            "docProps/core.xml",
+            _CONTENT_TYPE_CORE_PROPERTIES,
+            "Core properties",
+            None,
+        ),
+        (
+            "docProps/app.xml",
+            _CONTENT_TYPE_EXTENDED_PROPERTIES,
+            "Extended properties",
+            None,
+        ),
+        (
+            "docProps/custom.xml",
+            _CONTENT_TYPE_CUSTOM_PROPERTIES,
+            "Custom properties",
+            None,
+        ),
+    )
+    archive_names = set(archive.namelist())
+    for member_name, content_type, description, specialized_preflight in package_parts:
+        if member_name not in archive_names:
+            continue
+        _require_content_type(
+            content_types, member_name, content_type, description.lower()
+        )
+        if specialized_preflight is None:
+            _preflight_bounded_xml(archive, member_name, description)
+        else:
+            specialized_preflight(archive, member_name)
+    _preflight_package_relationships(archive, content_types, workbook_member)
+
+
+def _preflight_package_relationships(
+    archive: ZipFile, content_types: _ContentTypes, workbook_member: str
+) -> None:
+    root_relationships = _read_package_relationships(
+        archive, "_rels/.rels", "Package relationships"
+    )
+    office_document_count = 0
+    for relationship in root_relationships:
+        semantic = _relationship_semantic(relationship.type)
+        expected_member: str | None = None
+        expected_type: str | tuple[str, ...] | None = None
+        description = semantic or relationship.type
+        if semantic == "officeDocument":
+            office_document_count += 1
+            expected_member = workbook_member
+            expected_type = _CONTENT_TYPE_WORKBOOKS
+        elif relationship.type == (
+            "http://schemas.openxmlformats.org/package/2006/relationships/"
+            "metadata/core-properties"
+        ):
+            expected_member = "docProps/core.xml"
+            expected_type = _CONTENT_TYPE_CORE_PROPERTIES
+            description = "core properties"
+        elif semantic == "extended-properties":
+            expected_member = "docProps/app.xml"
+            expected_type = _CONTENT_TYPE_EXTENDED_PROPERTIES
+        elif semantic == "custom-properties":
+            expected_member = "docProps/custom.xml"
+            expected_type = _CONTENT_TYPE_CUSTOM_PROPERTIES
+        if expected_member is None or expected_type is None:
+            continue
+        if relationship.target_mode == "External":
+            raise WorkbookStructureError(
+                f"Package has an external {description} relationship"
+            )
+        target_member = _safe_package_relationship_target(
+            "", relationship.target
+        )
+        if target_member != expected_member:
+            raise WorkbookStructureError(
+                f"Package {description} relationship target conflicts with "
+                "the eagerly loaded part"
+            )
+        _required_graph_member(archive, target_member)
+        _require_content_type(
+            content_types, target_member, expected_type, description
+        )
+    if office_document_count != 1:
+        raise WorkbookStructureError(
+            "Package must contain exactly one office document relationship"
+        )
+
+    workbook_relationships = _read_package_relationships(
+        archive,
+        "xl/_rels/workbook.xml.rels",
+        "Workbook relationships",
+    )
+    expected_members = {
+        "styles": "xl/styles.xml",
+        "theme": "xl/theme/theme1.xml",
+    }
+    shared_string_members = content_types.members_with_type(
+        _CONTENT_TYPE_SHARED_STRINGS
+    )
+    if shared_string_members:
+        expected_members["sharedStrings"] = shared_string_members[0]
+    for relationship in workbook_relationships:
+        semantic = _relationship_semantic(relationship.type)
+        expected_member = expected_members.get(semantic or "")
+        if expected_member is None:
+            continue
+        if relationship.target_mode == "External":
+            raise WorkbookStructureError(
+                f"Workbook has an external {semantic} relationship"
+            )
+        target_member = _safe_package_relationship_target(
+            workbook_member, relationship.target
+        )
+        if target_member != expected_member:
+            raise WorkbookStructureError(
+                f"Workbook {semantic} relationship target conflicts with "
+                "the eagerly loaded part"
+            )
+        _required_graph_member(archive, target_member)
+        _validate_relationship_target_semantics(
+            content_types,
+            _RelationshipTarget(
+                target_member,
+                relationship.id,
+                relationship.type,
+                workbook_member,
+            ),
+        )
+
+
+def _read_package_relationships(
+    archive: ZipFile, member_name: str, description: str
+) -> list[_Relationship]:
+    member = _required_xml_member(
+        archive, member_name, f"{description} XML is missing"
+    )
+    if member.file_size > MAX_PREFLIGHT_PACKAGE_XML_BYTES:
+        raise WorkbookStructureError(
+            f"{description} exceeds XML size limit of "
+            f"{MAX_PREFLIGHT_PACKAGE_XML_BYTES}"
+        )
+    relationships: list[_Relationship] = []
+    relationship_ids: set[str] = set()
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source, MAX_PREFLIGHT_PACKAGE_XML_BYTES, description
+            )
+            for _, element in iterparse(limited_source, events=("end",)):
+                if _xml_local_name(element.tag) == "Relationship":
+                    relationship_id = element.attrib.get("Id")
+                    relationship_type = element.attrib.get("Type")
+                    target = element.attrib.get("Target")
+                    if (
+                        not relationship_id
+                        or not relationship_type
+                        or not target
+                        or relationship_id in relationship_ids
+                    ):
+                        raise WorkbookStructureError(
+                            f"{description} XML is invalid"
+                        )
+                    relationship_ids.add(relationship_id)
+                    relationships.append(
+                        _Relationship(
+                            relationship_id,
+                            relationship_type,
+                            target,
+                            element.attrib.get("TargetMode"),
+                        )
+                    )
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"{description} XML is malformed"
+        ) from error
+    return relationships
+
+
+def _safe_package_relationship_target(source_member: str, target: str) -> str:
+    if (
+        not target
+        or target.startswith("//")
+        or "\\" in target
+        or "%" in target
+        or "\x00" in target
+        or ":" in target
+        or "?" in target
+        or "#" in target
+    ):
+        raise WorkbookStructureError(
+            "Package contains an unsafe relationship target"
+        )
+    parts = [] if target.startswith("/") else list(
+        PurePosixPath(source_member).parent.parts
+    )
+    if parts == ["."]:
+        parts = []
+    for part in PurePosixPath(target).parts:
+        if part in ("/", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise WorkbookStructureError(
+                    "Package contains an unsafe relationship target"
+                )
+            parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
+        raise WorkbookStructureError(
+            "Package contains an unsafe relationship target"
+        )
+    return "/".join(parts)
+
+
+def _preflight_bounded_xml(
+    archive: ZipFile, member_name: str, description: str
+) -> None:
+    member = _required_xml_member(
+        archive, member_name, f"Package XML is missing: {member_name}"
+    )
+    if member.file_size > MAX_PREFLIGHT_PACKAGE_XML_BYTES:
+        raise WorkbookStructureError(
+            f"{description} exceeds XML size limit of "
+            f"{MAX_PREFLIGHT_PACKAGE_XML_BYTES}"
+        )
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source, MAX_PREFLIGHT_PACKAGE_XML_BYTES, description
+            )
+            for _, element in iterparse(limited_source, events=("end",)):
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Package XML is malformed: {member_name}"
+        ) from error
+
+
+def _preflight_shared_strings(archive: ZipFile, member_name: str) -> None:
+    member = _required_xml_member(
+        archive, member_name, f"Shared strings XML is missing: {member_name}"
+    )
+    if member.file_size > MAX_PREFLIGHT_PACKAGE_XML_BYTES:
+        raise WorkbookStructureError(
+            "Shared strings XML exceeds XML size limit of "
+            f"{MAX_PREFLIGHT_PACKAGE_XML_BYTES}"
+        )
+    record_count = 0
+    character_count = 0
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source, MAX_PREFLIGHT_PACKAGE_XML_BYTES, "Shared strings XML"
+            )
+            for _, element in iterparse(limited_source, events=("end",)):
+                local_name = _xml_local_name(element.tag)
+                if local_name == "t" and element.text:
+                    character_count += len(element.text)
+                    if character_count > MAX_PREFLIGHT_SHARED_STRING_CHARACTERS:
+                        raise WorkbookStructureError(
+                            "Workbook exceeds shared string character limit of "
+                            f"{MAX_PREFLIGHT_SHARED_STRING_CHARACTERS}"
+                        )
+                if local_name == "si":
+                    record_count += 1
+                    if record_count > MAX_PREFLIGHT_SHARED_STRING_RECORDS:
+                        raise WorkbookStructureError(
+                            "Workbook exceeds shared string record limit of "
+                            f"{MAX_PREFLIGHT_SHARED_STRING_RECORDS}"
+                        )
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Shared strings XML is malformed: {member_name}"
+        ) from error
+
+
+def _preflight_styles(archive: ZipFile, member_name: str) -> None:
+    member = _required_xml_member(
+        archive, member_name, f"Styles XML is missing: {member_name}"
+    )
+    if member.file_size > MAX_PREFLIGHT_PACKAGE_XML_BYTES:
+        raise WorkbookStructureError(
+            "Styles XML exceeds XML size limit of "
+            f"{MAX_PREFLIGHT_PACKAGE_XML_BYTES}"
+        )
+    total_records = 0
+    collection_counts = {name: 0 for name in _STYLE_COLLECTION_ELEMENTS}
+    stack: list[str] = []
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source, MAX_PREFLIGHT_PACKAGE_XML_BYTES, "Styles XML"
+            )
+            for event, element in iterparse(
+                limited_source, events=("start", "end")
+            ):
+                local_name = _xml_local_name(element.tag)
+                if event == "start":
+                    stack.append(local_name)
+                    continue
+                if local_name not in _STYLE_COLLECTION_ELEMENTS and local_name != "styleSheet":
+                    total_records += 1
+                    if total_records > MAX_PREFLIGHT_STYLE_RECORDS:
+                        raise WorkbookStructureError(
+                            "Workbook exceeds style record limit of "
+                            f"{MAX_PREFLIGHT_STYLE_RECORDS}"
+                        )
+                if len(stack) >= 2 and stack[-2] in collection_counts:
+                    collection_name = stack[-2]
+                    collection_counts[collection_name] += 1
+                    if (
+                        collection_counts[collection_name]
+                        > MAX_PREFLIGHT_STYLE_COLLECTION_RECORDS
+                    ):
+                        raise WorkbookStructureError(
+                            f"Workbook exceeds {collection_name} style collection "
+                            "record limit of "
+                            f"{MAX_PREFLIGHT_STYLE_COLLECTION_RECORDS}"
+                        )
+                stack.pop()
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Styles XML is malformed: {member_name}"
+        ) from error
+
+
 def _preflight_workbook_resources(path: Path) -> None:
     try:
         with ZipFile(path, "r") as archive:
+            content_types = _read_content_types(archive)
+            workbook_member = _select_workbook_member(content_types)
+            _preflight_package_parts(archive, content_types, workbook_member)
             sheet_refs = _read_workbook_sheet_refs(archive)
             worksheet_members, chartsheet_members = _resolve_sheet_members(
-                archive, sheet_refs
+                archive, sheet_refs, content_types
             )
-            relationship_roots: dict[str, None] = {}
-            for _, member_name in chartsheet_members:
-                _add_relationship_root(relationship_roots, member_name)
-            for sheet_name, member_name in chartsheet_members:
+            relationship_roots: dict[str, list[_RelationshipTarget]] = {}
+            for _, member_name, relationship in chartsheet_members:
+                _add_relationship_root(
+                    relationship_roots,
+                    member_name,
+                    relationship,
+                    workbook_member,
+                    "chartsheet",
+                )
+            for sheet_name, member_name, _ in chartsheet_members:
                 _preflight_chartsheet_xml(archive, sheet_name, member_name)
             total_cells = 0
             total_materialized_cells = 0
-            for sheet_name, member_name in worksheet_members:
+            for sheet_name, member_name, _ in worksheet_members:
                 (
                     cell_count,
                     materialized_cell_count,
@@ -599,7 +1260,9 @@ def _preflight_workbook_resources(path: Path) -> None:
             _add_workbook_pivot_cache_roots(
                 archive, relationship_roots
             )
-            _preflight_relationship_graph(archive, relationship_roots)
+            _preflight_relationship_graph(
+                archive, relationship_roots, content_types
+            )
     except WorkbookStructureError:
         raise
     except (BadZipFile, LargeZipFile, OSError, ValueError) as error:
@@ -636,8 +1299,13 @@ def _read_workbook_sheet_refs(archive: ZipFile) -> list[tuple[str, str]]:
 
 
 def _resolve_sheet_members(
-    archive: ZipFile, sheet_refs: list[tuple[str, str]]
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    archive: ZipFile,
+    sheet_refs: list[tuple[str, str]],
+    content_types: _ContentTypes,
+) -> tuple[
+    list[tuple[str, str, _Relationship]],
+    list[tuple[str, str, _Relationship]],
+]:
     wanted_ids = {relationship_id for _, relationship_id in sheet_refs}
     relationships: dict[str, tuple[str, str, str | None]] = {}
     try:
@@ -663,8 +1331,8 @@ def _resolve_sheet_members(
             "Workbook relationships XML is malformed"
         ) from error
 
-    worksheets: list[tuple[str, str]] = []
-    chartsheets: list[tuple[str, str]] = []
+    worksheets: list[tuple[str, str, _Relationship]] = []
+    chartsheets: list[tuple[str, str, _Relationship]] = []
     for sheet_name, relationship_id in sheet_refs:
         relationship = relationships.get(relationship_id)
         if relationship is None:
@@ -672,6 +1340,9 @@ def _resolve_sheet_members(
                 f"Workbook sheet {sheet_name} has no relationship"
             )
         relationship_type, target, target_mode = relationship
+        relationship_object = _Relationship(
+            relationship_id, relationship_type, target, target_mode
+        )
         # OpenPyXL treats every workbook sheet relationship except a chartsheet
         # as a worksheet and eagerly parses its target.
         if "chartsheet" in relationship_type:
@@ -679,17 +1350,42 @@ def _resolve_sheet_members(
                 raise WorkbookStructureError(
                     f"Workbook sheet {sheet_name} has an external chartsheet relationship"
                 )
-            chartsheets.append(
-                (sheet_name, _safe_sheet_member(sheet_name, target, "chartsheets"))
+            member_name = _safe_sheet_member(sheet_name, target, "chartsheets")
+            _validate_relationship_target_semantics(
+                content_types,
+                _RelationshipTarget(
+                    member_name,
+                    relationship_id,
+                    relationship_type,
+                    "xl/workbook.xml",
+                    "chartsheet",
+                ),
             )
+            chartsheets.append((sheet_name, member_name, relationship_object))
             continue
         if target_mode == "External":
             raise WorkbookStructureError(
                 f"Workbook sheet {sheet_name} has an external worksheet relationship"
             )
-        worksheets.append(
-            (sheet_name, _safe_sheet_member(sheet_name, target, "worksheets"))
+        member_name = _safe_sheet_member(sheet_name, target, "worksheets")
+        sheet_semantic = _relationship_semantic(relationship_type)
+        expected_semantic = (
+            sheet_semantic
+            if sheet_semantic
+            in {"worksheet", "dialogsheet", "macrosheet", "intlMacrosheet"}
+            else "worksheet"
         )
+        _validate_relationship_target_semantics(
+            content_types,
+            _RelationshipTarget(
+                member_name,
+                relationship_id,
+                relationship_type,
+                "xl/workbook.xml",
+                expected_semantic,
+            ),
+        )
+        worksheets.append((sheet_name, member_name, relationship_object))
     return worksheets, chartsheets
 
 
@@ -772,7 +1468,7 @@ def _preflight_worksheet_relationships(
     worksheet_member: str,
     table_relationship_ids: set[str],
     hyperlink_relationship_ids: set[str],
-    relationship_roots: dict[str, None],
+    relationship_roots: dict[str, list[_RelationshipTarget]],
 ) -> int:
     worksheet_path = PurePosixPath(worksheet_member)
     relationships_member = str(
@@ -876,11 +1572,18 @@ def _preflight_worksheet_relationships(
             worksheet_member,
             relationship.target,
         )
+        relationship_semantic = _relationship_semantic(relationship.type)
         if (
-            relationship.type in _OPENPYXL_EAGER_SHEET_RELATIONSHIPS
+            relationship_semantic in _XML_RELATIONSHIP_CONTENT_TYPES
             or is_selected_table_relationship
         ):
-            _add_relationship_root(relationship_roots, target_member)
+            _add_relationship_root(
+                relationship_roots,
+                target_member,
+                relationship,
+                worksheet_member,
+                "table" if is_selected_table_relationship else None,
+            )
             eager_relationships.append((relationship.type, target_member))
             if len(eager_relationships) > MAX_PREFLIGHT_RELATIONSHIP_EDGES:
                 raise WorkbookStructureError(
@@ -890,7 +1593,7 @@ def _preflight_worksheet_relationships(
 
     comment_count = 0
     for relationship_type, target_member in eager_relationships:
-        if relationship_type == _COMMENTS_RELATIONSHIP:
+        if _relationship_semantic(relationship_type) == "comments":
             parts = PurePosixPath(target_member).parts
             if len(parts) < 3 or parts[:2] != ("xl", "comments"):
                 raise WorkbookStructureError(
@@ -964,7 +1667,7 @@ def _validate_hyperlink_relationship(
 
 
 def _add_workbook_pivot_cache_roots(
-    archive: ZipFile, relationship_roots: dict[str, None]
+    archive: ZipFile, relationship_roots: dict[str, list[_RelationshipTarget]]
 ) -> None:
     cache_ids: list[str] = []
     try:
@@ -994,7 +1697,7 @@ def _add_workbook_pivot_cache_roots(
         raise WorkbookStructureError("Workbook XML is malformed") from error
 
     wanted_ids = set(cache_ids)
-    relationships: dict[str, tuple[str, str | None]] = {}
+    relationships: dict[str, _Relationship] = {}
     try:
         with archive.open("xl/_rels/workbook.xml.rels") as source:
             limited_source = _SizeLimitedReader(
@@ -1010,7 +1713,9 @@ def _add_workbook_pivot_cache_roots(
                             raise WorkbookStructureError(
                                 "Workbook pivot cache relationships contain a duplicate id"
                             )
-                        relationships[relationship_id] = (
+                        relationships[relationship_id] = _Relationship(
+                            relationship_id,
+                            element.attrib.get("Type", ""),
                             element.attrib.get("Target", ""),
                             element.attrib.get("TargetMode"),
                         )
@@ -1028,47 +1733,76 @@ def _add_workbook_pivot_cache_roots(
             raise WorkbookStructureError(
                 "Workbook pivot cache has no relationship"
             )
-        target, target_mode = relationship
-        if target_mode == "External":
+        if relationship.target_mode == "External":
             raise WorkbookStructureError(
                 "Workbook pivot cache has an unsupported external relationship"
             )
         _add_relationship_root(
             relationship_roots,
-            _safe_relationship_graph_target("xl/workbook.xml", target),
+            _safe_relationship_graph_target(
+                "xl/workbook.xml", relationship.target
+            ),
+            relationship,
+            "xl/workbook.xml",
+            "pivotCacheDefinition",
         )
 
 
 def _add_relationship_root(
-    relationship_roots: dict[str, None], member_name: str
+    relationship_roots: dict[str, list[_RelationshipTarget]],
+    member_name: str,
+    relationship: _Relationship,
+    source_member: str,
+    expected_semantic: str | None = None,
 ) -> None:
-    if member_name in relationship_roots:
+    relationship_target = _RelationshipTarget(
+        member_name,
+        relationship.id,
+        relationship.type,
+        source_member,
+        expected_semantic,
+    )
+    existing_targets = relationship_roots.get(member_name)
+    if existing_targets is not None:
+        if relationship_target not in existing_targets:
+            existing_targets.append(relationship_target)
         return
     if len(relationship_roots) >= MAX_PREFLIGHT_RELATIONSHIP_QUEUE:
         raise WorkbookStructureError(
             "Workbook exceeds relationship queue limit of "
             f"{MAX_PREFLIGHT_RELATIONSHIP_QUEUE}"
         )
-    relationship_roots[member_name] = None
+    relationship_roots[member_name] = [relationship_target]
 
 
 def _preflight_relationship_graph(
-    archive: ZipFile, root_members: dict[str, None]
+    archive: ZipFile,
+    root_members: dict[str, list[_RelationshipTarget]],
+    content_types: _ContentTypes,
 ) -> None:
     if len(root_members) > MAX_PREFLIGHT_RELATIONSHIP_QUEUE:
         raise WorkbookStructureError(
             "Workbook exceeds relationship queue limit of "
             f"{MAX_PREFLIGHT_RELATIONSHIP_QUEUE}"
         )
-    queue = deque((member_name, 0) for member_name in root_members)
-    queued = {member_name for member_name, _ in queue}
+    queue = deque(
+        (relationship_target, 0)
+        for targets in root_members.values()
+        for relationship_target in targets
+    )
+    queued = {target.member_name for target, _ in queue}
     visited: set[str] = set()
     adjacency: dict[str, list[str]] = {}
     edge_count = 0
 
     while queue:
-        member_name, depth = queue.popleft()
+        relationship_target, depth = queue.popleft()
+        member_name = relationship_target.member_name
         queued.discard(member_name)
+        member = _required_graph_member(archive, member_name)
+        is_xml = _validate_relationship_target_semantics(
+            content_types, relationship_target
+        )
         if member_name in visited:
             continue
         visited.add(member_name)
@@ -1078,15 +1812,16 @@ def _preflight_relationship_graph(
                 f"{MAX_PREFLIGHT_RELATIONSHIP_PARTS}"
             )
 
-        member = _required_graph_member(archive, member_name)
         relationship_references: set[str] = set()
         hyperlink_references: set[str] = set()
         non_hyperlink_references: set[str] = set()
-        if _is_xml_part(member_name):
+        expected_relationship_semantics: dict[str, str] = {}
+        if is_xml:
             (
                 relationship_references,
                 hyperlink_references,
                 non_hyperlink_references,
+                expected_relationship_semantics,
             ) = _preflight_related_xml(
                 archive,
                 member_name,
@@ -1141,8 +1876,18 @@ def _preflight_relationship_graph(
             target_member = _safe_relationship_graph_target(
                 member_name, relationship.target
             )
-            targets.append(target_member)
+            target_context = _RelationshipTarget(
+                target_member,
+                relationship.id,
+                relationship.type,
+                member_name,
+                expected_relationship_semantics.get(relationship.id),
+            )
             _required_graph_member(archive, target_member)
+            _validate_relationship_target_semantics(
+                content_types, target_context
+            )
+            targets.append(target_member)
             if target_member in visited or target_member in queued:
                 continue
             target_depth = depth + 1
@@ -1151,7 +1896,7 @@ def _preflight_relationship_graph(
                     "Workbook exceeds relationship depth limit of "
                     f"{MAX_PREFLIGHT_RELATIONSHIP_DEPTH}"
                 )
-            queue.append((target_member, target_depth))
+            queue.append((target_context, target_depth))
             queued.add(target_member)
             if len(queue) > MAX_PREFLIGHT_RELATIONSHIP_QUEUE:
                 raise WorkbookStructureError(
@@ -1270,14 +2015,83 @@ def _required_graph_member(archive: ZipFile, member_name: str):
     return member
 
 
-def _is_xml_part(member_name: str) -> bool:
-    lowered = member_name.lower()
-    return lowered.endswith((".xml", ".vml", ".rels"))
+def _relationship_semantic(relationship_type: str) -> str | None:
+    alias = _RELATIONSHIP_SEMANTIC_ALIASES.get(relationship_type)
+    if alias is not None:
+        return alias
+    for namespace in (
+        _DOCUMENT_RELATIONSHIP_NAMESPACE,
+        _STRICT_DOCUMENT_RELATIONSHIP_NAMESPACE,
+    ):
+        prefix = f"{namespace}/"
+        if relationship_type.startswith(prefix):
+            semantic = relationship_type[len(prefix) :]
+            return semantic or None
+    return None
+
+
+def _is_xml_content_type(content_type: str) -> bool:
+    lowered = content_type.lower()
+    return (
+        lowered in {"application/xml", "text/xml"}
+        or lowered.endswith("+xml")
+        or lowered == "application/vnd.openxmlformats-officedocument.vmldrawing"
+    )
+
+
+def _validate_relationship_target_semantics(
+    content_types: _ContentTypes, target: _RelationshipTarget
+) -> bool:
+    content_type = content_types.for_member(target.member_name)
+    relationship_semantic = _relationship_semantic(target.relationship_type)
+    semantic = target.expected_semantic or relationship_semantic
+    semantic_description = semantic or target.relationship_type
+    if content_type is None:
+        raise WorkbookStructureError(
+            f"{target.member_name} content type mapping is missing for "
+            f"{semantic_description} relationship {target.relationship_id}"
+        )
+
+    semantics = [semantic]
+    if relationship_semantic not in semantics:
+        semantics.append(relationship_semantic)
+    result: bool | None = None
+    for candidate_semantic in semantics:
+        expected_xml_types = _XML_RELATIONSHIP_CONTENT_TYPES.get(
+            candidate_semantic or ""
+        )
+        if expected_xml_types is not None:
+            if content_type not in expected_xml_types:
+                raise WorkbookStructureError(
+                    f"{target.member_name} content type conflicts with "
+                    f"{candidate_semantic} relationship semantics"
+                )
+            result = True
+            continue
+
+        expected_binary_prefixes = _BINARY_RELATIONSHIP_CONTENT_TYPE_PREFIXES.get(
+            candidate_semantic or ""
+        )
+        if expected_binary_prefixes is not None:
+            if not content_type.startswith(expected_binary_prefixes):
+                raise WorkbookStructureError(
+                    f"{target.member_name} content type conflicts with "
+                    f"{candidate_semantic} relationship semantics"
+                )
+            if result is True:
+                raise WorkbookStructureError(
+                    f"{target.member_name} has conflicting relationship semantics"
+                )
+            result = False
+
+    if result is not None:
+        return result
+    return _is_xml_content_type(content_type)
 
 
 def _preflight_related_xml(
     archive: ZipFile, member_name: str, member
-) -> tuple[set[str], set[str], set[str]]:
+) -> tuple[set[str], set[str], set[str], dict[str, str]]:
     if member.file_size > MAX_PREFLIGHT_RELATED_XML_BYTES:
         raise WorkbookStructureError(
             f"{member_name} exceeds related XML size limit of "
@@ -1286,6 +2100,7 @@ def _preflight_related_xml(
     relationship_references: set[str] = set()
     hyperlink_references: set[str] = set()
     non_hyperlink_references: set[str] = set()
+    expected_relationship_semantics: dict[str, str] = {}
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
@@ -1307,6 +2122,25 @@ def _preflight_related_xml(
                             hyperlink_references.add(relationship_id)
                         else:
                             non_hyperlink_references.add(relationship_id)
+                        expected_semantic = _expected_relationship_semantic(
+                            local_name, attribute_name
+                        )
+                        previous_semantic = expected_relationship_semantics.get(
+                            relationship_id
+                        )
+                        if (
+                            expected_semantic is not None
+                            and previous_semantic is not None
+                            and previous_semantic != expected_semantic
+                        ):
+                            raise WorkbookStructureError(
+                                f"{member_name} relationship {relationship_id} has "
+                                "conflicting consumer semantics"
+                            )
+                        if expected_semantic is not None:
+                            expected_relationship_semantics[relationship_id] = (
+                                expected_semantic
+                            )
                 element.clear()
     except ParseError as error:
         raise WorkbookStructureError(
@@ -1316,7 +2150,22 @@ def _preflight_related_xml(
         relationship_references,
         hyperlink_references,
         non_hyperlink_references,
+        expected_relationship_semantics,
     )
+
+
+def _expected_relationship_semantic(
+    local_name: str, attribute_name: str
+) -> str | None:
+    if local_name in ("hlinkClick", "hlinkHover", "hlinkMouseOver"):
+        return "hyperlink"
+    if local_name == "blip" and attribute_name.endswith("}embed"):
+        return "image"
+    if local_name == "chart" and attribute_name.endswith("}id"):
+        return "chart"
+    if local_name == "pivotCacheDefinition" and attribute_name.endswith("}id"):
+        return "pivotCacheRecords"
+    return None
 
 
 def _reject_relationship_cycles(adjacency: dict[str, list[str]]) -> None:
