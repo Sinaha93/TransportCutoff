@@ -40,17 +40,20 @@ class TransportEntryRepository:
         try:
             connection.execute("BEGIN IMMEDIATE")
             duplicate = connection.execute(
-                "SELECT id FROM import_batches "
+                "SELECT id, error_summary FROM import_batches "
                 "WHERE report_month = ? AND source_type = ? AND file_sha256 = ?",
                 (report_month, SOURCE_TYPE, file_sha256),
             ).fetchone()
             if duplicate is not None:
                 connection.rollback()
+                error_summary = duplicate["error_summary"]
                 return ImportCommitResult(
                     batch_id=int(duplicate["id"]),
                     status="duplicate",
                     inserted_count=0,
-                    blocking_errors=(),
+                    blocking_errors=(
+                        tuple(error_summary.split("\n")) if error_summary else ()
+                    ),
                 )
 
             self.lock_guard.require_unlocked(connection, report_month)

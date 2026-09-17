@@ -156,6 +156,36 @@ def test_parser_rejects_missing_aj_cache_on_inactive_looking_row(api, tmp_path):
         parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
+def test_parser_rejects_missing_ah_cache_on_inactive_looking_row(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "inactive-missing-ah-cache.xlsx",
+        include_inactive_regular_rows=True,
+        missing_inactive_regular_count_formula_cache=True,
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"row 6 cell AH6 cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_rejects_missing_ak_cache_on_inactive_looking_row(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "inactive-missing-ak-cache.xlsx",
+        include_inactive_regular_rows=True,
+        missing_inactive_regular_subtotal_formula_cache=True,
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"row 6 cell AK6 cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
 def test_parser_rejects_numeric_string_regular_unit_rate(api, fixture_path):
     parser_module, _, _ = api
     workbook = load_workbook(fixture_path)
@@ -709,14 +739,20 @@ def test_repository_rejects_exponent_abuse_before_persistence(api, database):
 
 def test_import_is_idempotent_and_stores_file_hash(api, database, fixture_path):
     _, _, service_module = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET].cell(5, 2, "Known Plant")
+    workbook.save(fixture_path)
+    workbook.close()
     service = service_module.TransportImportService(database)
 
     first = service.import_transport(fixture_path, "2026-08")
     second = service.import_transport(fixture_path, "2026-08")
 
+    assert first.status == "imported"
     assert first.inserted_count == 5
     assert second.status == "duplicate"
     assert second.inserted_count == 0
+    assert second.blocking_errors == ()
     with database.connection() as connection:
         batches = connection.execute("SELECT * FROM import_batches").fetchall()
         entries = connection.execute("SELECT * FROM transport_entries").fetchall()
@@ -869,13 +905,18 @@ def test_unknown_alias_is_imported_as_blocking_unresolved_entry(
     api, database, fixture_path
 ):
     _, _, service_module = api
+    service = service_module.TransportImportService(database)
 
-    result = service_module.TransportImportService(database).import_transport(
-        fixture_path, "2026-08"
-    )
+    result = service.import_transport(fixture_path, "2026-08")
+    destination = MasterRepository(database).list_destinations()[0]
+    MasterRepository(database).add_alias(destination.id, "Unknown Plant", "transport")
+    duplicate = service.import_transport(fixture_path, "2026-08")
 
     assert result.status == "imported_with_errors"
     assert result.blocking_errors == ("Unknown destination alias: Unknown Plant",)
+    assert duplicate.status == "duplicate"
+    assert duplicate.inserted_count == 0
+    assert duplicate.blocking_errors == result.blocking_errors
     with database.connection() as connection:
         unresolved = connection.execute(
             "SELECT destination_id, unresolved_alias, source_alias "

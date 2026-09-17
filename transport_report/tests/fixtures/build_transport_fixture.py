@@ -75,6 +75,8 @@ def build_structural_clone_fixture(
     missing_regular_day_formula_cache: bool = False,
     missing_regular_unit_formula_cache: bool = False,
     missing_inactive_regular_unit_formula_cache: bool = False,
+    missing_inactive_regular_count_formula_cache: bool = False,
+    missing_inactive_regular_subtotal_formula_cache: bool = False,
     include_subcontract_template_rows: bool = False,
 ) -> Path:
     workbook = Workbook()
@@ -110,10 +112,18 @@ def build_structural_clone_fixture(
     if include_inactive_regular_rows:
         regular.cell(6, 1, "8-ton / Driver B")
         regular.cell(6, 2, "Dormant Blank Destination")
-        regular.cell(6, 34, 0)
+        regular.cell(
+            6,
+            34,
+            "=SUM(C6:AG6)" if missing_inactive_regular_count_formula_cache else 0,
+        )
         if missing_inactive_regular_unit_formula_cache:
             regular.cell(6, 36, "=0")
-        regular.cell(6, 37, 0)
+        regular.cell(
+            6,
+            37,
+            "=AH6*AJ6" if missing_inactive_regular_subtotal_formula_cache else 0,
+        )
 
         regular.cell(7, 2, "Dormant Zero Destination")
         for column in range(3, 34):

@@ -228,6 +228,30 @@ class HwaseongWorkbookParser:
                     f"AJ{row_number}",
                     "unit cost",
                 )
+            count_formula_value = formula_sheet.cell(row_number, 34).value
+            if not _has_value(cached_count_value) and _is_formula(
+                count_formula_value
+            ):
+                _required_cached_value(
+                    cached_count_value,
+                    count_formula_value,
+                    sheet.title,
+                    row_number,
+                    f"AH{row_number}",
+                    "cached total count",
+                )
+            subtotal_formula_value = formula_sheet.cell(row_number, 37).value
+            if not _has_value(cached_subtotal_value) and _is_formula(
+                subtotal_formula_value
+            ):
+                _required_cached_value(
+                    cached_subtotal_value,
+                    subtotal_formula_value,
+                    sheet.title,
+                    row_number,
+                    f"AK{row_number}",
+                    "cached subtotal",
+                )
             if (
                 not _has_value(unit_value)
                 and all(_is_blank_or_numeric_zero(value) for value in day_values)
@@ -292,7 +316,7 @@ class HwaseongWorkbookParser:
             cached_count = _nonnegative_decimal(
                 _required_cached_value(
                     cached_count_value,
-                    formula_sheet.cell(row_number, 34).value,
+                    count_formula_value,
                     sheet.title,
                     row_number,
                     f"AH{row_number}",
@@ -308,7 +332,7 @@ class HwaseongWorkbookParser:
             cached_subtotal = _integer_won(
                 _required_cached_value(
                     cached_subtotal_value,
-                    formula_sheet.cell(row_number, 37).value,
+                    subtotal_formula_value,
                     sheet.title,
                     row_number,
                     f"AK{row_number}",
