@@ -52,6 +52,7 @@ MAX_PREFLIGHT_RELATIONSHIP_PARTS = 1_024
 MAX_PREFLIGHT_RELATIONSHIP_EDGES = 4_096
 MAX_PREFLIGHT_RELATIONSHIP_DEPTH = 64
 MAX_PREFLIGHT_RELATIONSHIP_QUEUE = 1_024
+MAX_PREFLIGHT_HYPERLINK_TARGET_LENGTH = 8_192
 MAX_PREFLIGHT_WORKSHEET_CELLS = 50_000
 MAX_PREFLIGHT_TOTAL_CELLS = 100_000
 MAX_PREFLIGHT_ROWS = 20_000
@@ -83,9 +84,11 @@ _OPENPYXL_EAGER_SHEET_RELATIONSHIPS = {
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
 }
-_HYPERLINK_RELATIONSHIP = (
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
-)
+_HYPERLINK_RELATIONSHIPS = {
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink",
+}
+_HYPERLINK_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class TransportWorkbookError(Exception):
@@ -123,6 +126,14 @@ class ParsedTransportEntry:
     vehicle_type: str | None = None
     vehicle_driver_group: str | None = None
     source_note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Relationship:
+    id: str
+    type: str
+    target: str
+    target_mode: str | None
 
 
 class HwaseongWorkbookParser:
@@ -553,7 +564,12 @@ def _preflight_workbook_resources(path: Path) -> None:
             total_cells = 0
             total_materialized_cells = 0
             for sheet_name, member_name in worksheet_members:
-                cell_count, materialized_cell_count, table_ids = (
+                (
+                    cell_count,
+                    materialized_cell_count,
+                    table_ids,
+                    hyperlink_ids,
+                ) = (
                     _preflight_worksheet_xml(archive, sheet_name, member_name)
                 )
                 comment_count = _preflight_worksheet_relationships(
@@ -561,6 +577,7 @@ def _preflight_workbook_resources(path: Path) -> None:
                     sheet_name,
                     member_name,
                     table_ids,
+                    hyperlink_ids,
                     relationship_roots,
                 )
                 materialized_cell_count += comment_count
@@ -754,6 +771,7 @@ def _preflight_worksheet_relationships(
     sheet_name: str,
     worksheet_member: str,
     table_relationship_ids: set[str],
+    hyperlink_relationship_ids: set[str],
     relationship_roots: dict[str, None],
 ) -> int:
     worksheet_path = PurePosixPath(worksheet_member)
@@ -765,6 +783,10 @@ def _preflight_worksheet_relationships(
     try:
         member = archive.getinfo(relationships_member)
     except KeyError:
+        if hyperlink_relationship_ids:
+            raise WorkbookStructureError(
+                f"Worksheet hyperlink relationships are missing for {sheet_name}"
+            )
         if table_relationship_ids:
             raise WorkbookStructureError(
                 f"Worksheet table relationships are missing for {sheet_name}"
@@ -780,7 +802,7 @@ def _preflight_worksheet_relationships(
             f"{MAX_PREFLIGHT_RELATED_XML_BYTES}"
         )
 
-    eager_relationships: list[tuple[str, str]] = []
+    relationships: list[_Relationship] = []
     relationship_ids: set[str] = set()
     try:
         with archive.open(member) as source:
@@ -792,45 +814,20 @@ def _preflight_worksheet_relationships(
             for _, element in iterparse(limited_source, events=("end",)):
                 if _xml_local_name(element.tag) == "Relationship":
                     relationship_id = element.attrib.get("Id")
-                    if not relationship_id or relationship_id in relationship_ids:
+                    if not relationship_id:
                         raise WorkbookStructureError(
                             f"Worksheet relationships are invalid for {sheet_name}"
                         )
                     relationship_ids.add(relationship_id)
                     relationship_type = element.attrib.get("Type", "")
-                    target_mode = element.attrib.get("TargetMode")
-                    if target_mode == "External":
-                        if (
-                            relationship_type != _HYPERLINK_RELATIONSHIP
-                            or relationship_id in table_relationship_ids
-                        ):
-                            raise WorkbookStructureError(
-                                f"{sheet_name} has an unsupported external "
-                                "worksheet relationship"
-                            )
-                        element.clear()
-                        continue
-                    target_member = _safe_worksheet_related_member(
-                        sheet_name,
-                        worksheet_member,
-                        element.attrib.get("Target", ""),
-                    )
-                    if (
-                        relationship_type in _OPENPYXL_EAGER_SHEET_RELATIONSHIPS
-                        or relationship_id in table_relationship_ids
-                    ):
-                        _add_relationship_root(relationship_roots, target_member)
-                        eager_relationships.append(
-                            (relationship_type, target_member)
+                    relationships.append(
+                        _Relationship(
+                            relationship_id,
+                            relationship_type,
+                            element.attrib.get("Target", ""),
+                            element.attrib.get("TargetMode"),
                         )
-                        if (
-                            len(eager_relationships)
-                            > MAX_PREFLIGHT_RELATIONSHIP_EDGES
-                        ):
-                            raise WorkbookStructureError(
-                                "Workbook exceeds relationship edge limit of "
-                                f"{MAX_PREFLIGHT_RELATIONSHIP_EDGES}"
-                            )
+                    )
                 element.clear()
     except ParseError as error:
         raise WorkbookStructureError(
@@ -840,6 +837,56 @@ def _preflight_worksheet_relationships(
         raise WorkbookStructureError(
             f"Worksheet table relationships are missing for {sheet_name}"
         )
+    if not hyperlink_relationship_ids.issubset(relationship_ids):
+        raise WorkbookStructureError(
+            f"Worksheet hyperlink relationships are missing for {sheet_name}"
+        )
+
+    relationships_by_id: dict[str, _Relationship] = {}
+    for relationship in relationships:
+        relationships_by_id.setdefault(relationship.id, relationship)
+    for relationship_id in hyperlink_relationship_ids:
+        _validate_hyperlink_relationship(
+            relationships_by_id[relationship_id],
+            f"{sheet_name} has an invalid worksheet hyperlink relationship",
+        )
+
+    eager_relationships: list[tuple[str, str]] = []
+    for relationship in relationships:
+        is_selected_table_relationship = (
+            relationship.id in table_relationship_ids
+            and relationships_by_id[relationship.id] is relationship
+        )
+        if relationship.target_mode == "External":
+            if (
+                relationship.type not in _HYPERLINK_RELATIONSHIPS
+                or is_selected_table_relationship
+            ):
+                raise WorkbookStructureError(
+                    f"{sheet_name} has an unsupported external "
+                    "worksheet relationship"
+                )
+            _validate_hyperlink_relationship(
+                relationship,
+                f"{sheet_name} has an invalid worksheet hyperlink relationship",
+            )
+            continue
+        target_member = _safe_worksheet_related_member(
+            sheet_name,
+            worksheet_member,
+            relationship.target,
+        )
+        if (
+            relationship.type in _OPENPYXL_EAGER_SHEET_RELATIONSHIPS
+            or is_selected_table_relationship
+        ):
+            _add_relationship_root(relationship_roots, target_member)
+            eager_relationships.append((relationship.type, target_member))
+            if len(eager_relationships) > MAX_PREFLIGHT_RELATIONSHIP_EDGES:
+                raise WorkbookStructureError(
+                    "Workbook exceeds relationship edge limit of "
+                    f"{MAX_PREFLIGHT_RELATIONSHIP_EDGES}"
+                )
 
     comment_count = 0
     for relationship_type, target_member in eager_relationships:
@@ -901,6 +948,19 @@ def _safe_worksheet_related_member(
             f"{sheet_name} has an unsafe worksheet relationship target"
         )
     return "/".join(parts)
+
+
+def _validate_hyperlink_relationship(
+    relationship: _Relationship, error_message: str
+) -> None:
+    if (
+        relationship.type not in _HYPERLINK_RELATIONSHIPS
+        or relationship.target_mode not in (None, "Internal", "External")
+        or not relationship.target.strip()
+        or len(relationship.target) > MAX_PREFLIGHT_HYPERLINK_TARGET_LENGTH
+        or _HYPERLINK_CONTROL_CHARACTERS.search(relationship.target)
+    ):
+        raise WorkbookStructureError(error_message)
 
 
 def _add_workbook_pivot_cache_roots(
@@ -1020,9 +1080,17 @@ def _preflight_relationship_graph(
 
         member = _required_graph_member(archive, member_name)
         relationship_references: set[str] = set()
+        hyperlink_references: set[str] = set()
+        non_hyperlink_references: set[str] = set()
         if _is_xml_part(member_name):
-            relationship_references = _preflight_related_xml(
-                archive, member_name, member
+            (
+                relationship_references,
+                hyperlink_references,
+                non_hyperlink_references,
+            ) = _preflight_related_xml(
+                archive,
+                member_name,
+                member,
             )
         elif member.file_size > MAX_PREFLIGHT_RELATED_PART_BYTES:
             raise WorkbookStructureError(
@@ -1030,26 +1098,49 @@ def _preflight_relationship_graph(
                 f"{MAX_PREFLIGHT_RELATED_PART_BYTES}"
             )
 
-        relationships, relationship_ids = _read_graph_relationships(
+        relationships, relationships_by_id = _read_graph_relationships(
             archive, member_name
         )
-        if not relationship_references.issubset(relationship_ids):
+        if not relationship_references.issubset(relationships_by_id):
             raise WorkbookStructureError(
                 f"{member_name} relationship references are missing"
             )
+        for relationship_id in hyperlink_references:
+            relationship = relationships_by_id[relationship_id]
+            relationship_kind = (
+                "drawing" if member_name.startswith("xl/drawings/") else "related XML"
+            )
+            _validate_hyperlink_relationship(
+                relationship,
+                f"{member_name} has an invalid {relationship_kind} "
+                "hyperlink relationship",
+            )
+        for relationship_id in non_hyperlink_references:
+            if relationships_by_id[relationship_id].target_mode == "External":
+                raise WorkbookStructureError(
+                    f"{member_name} has an unsupported external relationship"
+                )
         targets = adjacency.setdefault(member_name, [])
-        for target, target_mode in relationships:
+        for relationship in relationships:
             edge_count += 1
             if edge_count > MAX_PREFLIGHT_RELATIONSHIP_EDGES:
                 raise WorkbookStructureError(
                     "Workbook exceeds relationship edge limit of "
                     f"{MAX_PREFLIGHT_RELATIONSHIP_EDGES}"
                 )
-            if target_mode == "External":
-                raise WorkbookStructureError(
-                    f"{member_name} has an unsupported external relationship"
+            if relationship.target_mode == "External":
+                if relationship.type not in _HYPERLINK_RELATIONSHIPS:
+                    raise WorkbookStructureError(
+                        f"{member_name} has an unsupported external relationship"
+                    )
+                _validate_hyperlink_relationship(
+                    relationship,
+                    f"{member_name} has an invalid external hyperlink relationship",
                 )
-            target_member = _safe_relationship_graph_target(member_name, target)
+                continue
+            target_member = _safe_relationship_graph_target(
+                member_name, relationship.target
+            )
             targets.append(target_member)
             _required_graph_member(archive, target_member)
             if target_member in visited or target_member in queued:
@@ -1073,7 +1164,7 @@ def _preflight_relationship_graph(
 
 def _read_graph_relationships(
     archive: ZipFile, source_member: str
-) -> tuple[list[tuple[str, str | None]], set[str]]:
+) -> tuple[list[_Relationship], dict[str, _Relationship]]:
     source_path = PurePosixPath(source_member)
     relationships_member = str(
         source_path.parent / "_rels" / f"{source_path.name}.rels"
@@ -1081,7 +1172,7 @@ def _read_graph_relationships(
     try:
         member = archive.getinfo(relationships_member)
     except KeyError:
-        return [], set()
+        return [], {}
     if member.is_dir():
         raise WorkbookStructureError(
             f"Relationship graph relationships XML is invalid for {source_member}"
@@ -1092,8 +1183,7 @@ def _read_graph_relationships(
             f"{MAX_PREFLIGHT_RELATED_XML_BYTES}"
         )
 
-    relationships: list[tuple[str, str | None]] = []
-    relationship_ids: set[str] = set()
+    relationships: list[_Relationship] = []
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
@@ -1106,19 +1196,15 @@ def _read_graph_relationships(
                     relationship_id = element.attrib.get("Id")
                     relationship_type = element.attrib.get("Type")
                     target = element.attrib.get("Target")
-                    if (
-                        not relationship_id
-                        or relationship_id in relationship_ids
-                        or not relationship_type
-                        or not target
-                    ):
+                    if not relationship_id or not relationship_type or not target:
                         raise WorkbookStructureError(
                             "Relationship graph relationships are invalid for "
                             f"{source_member}"
                         )
-                    relationship_ids.add(relationship_id)
                     relationships.append(
-                        (
+                        _Relationship(
+                            relationship_id,
+                            relationship_type,
                             target,
                             element.attrib.get("TargetMode"),
                         )
@@ -1129,7 +1215,10 @@ def _read_graph_relationships(
             "Relationship graph relationships XML is malformed for "
             f"{source_member}"
         ) from error
-    return relationships, relationship_ids
+    relationships_by_id: dict[str, _Relationship] = {}
+    for relationship in relationships:
+        relationships_by_id.setdefault(relationship.id, relationship)
+    return relationships, relationships_by_id
 
 
 def _safe_relationship_graph_target(source_member: str, target: str) -> str:
@@ -1188,13 +1277,15 @@ def _is_xml_part(member_name: str) -> bool:
 
 def _preflight_related_xml(
     archive: ZipFile, member_name: str, member
-) -> set[str]:
+) -> tuple[set[str], set[str], set[str]]:
     if member.file_size > MAX_PREFLIGHT_RELATED_XML_BYTES:
         raise WorkbookStructureError(
             f"{member_name} exceeds related XML size limit of "
             f"{MAX_PREFLIGHT_RELATED_XML_BYTES}"
         )
     relationship_references: set[str] = set()
+    hyperlink_references: set[str] = set()
+    non_hyperlink_references: set[str] = set()
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
@@ -1203,16 +1294,29 @@ def _preflight_related_xml(
                 f"{member_name} related XML",
             )
             for _, element in iterparse(limited_source, events=("end",)):
+                local_name = _xml_local_name(element.tag)
                 for attribute_name in _DOCUMENT_RELATIONSHIP_REFERENCES:
                     relationship_id = element.attrib.get(attribute_name)
                     if relationship_id:
                         relationship_references.add(relationship_id)
+                        if local_name in (
+                            "hlinkClick",
+                            "hlinkHover",
+                            "hlinkMouseOver",
+                        ):
+                            hyperlink_references.add(relationship_id)
+                        else:
+                            non_hyperlink_references.add(relationship_id)
                 element.clear()
     except ParseError as error:
         raise WorkbookStructureError(
             f"Related XML is malformed: {member_name}"
         ) from error
-    return relationship_references
+    return (
+        relationship_references,
+        hyperlink_references,
+        non_hyperlink_references,
+    )
 
 
 def _reject_relationship_cycles(adjacency: dict[str, list[str]]) -> None:
@@ -1282,7 +1386,7 @@ def _preflight_comment_xml(archive: ZipFile, sheet_name: str, member) -> int:
 
 def _preflight_worksheet_xml(
     archive: ZipFile, sheet_name: str, member_name: str
-) -> tuple[int, int, set[str]]:
+) -> tuple[int, int, set[str], set[str]]:
     try:
         member = archive.getinfo(member_name)
     except KeyError as error:
@@ -1303,6 +1407,7 @@ def _preflight_worksheet_xml(
     column_dimension_count = 0
     inferred_row_number = 0
     table_relationship_ids: set[str] = set()
+    hyperlink_relationship_ids: set[str] = set()
     try:
         with archive.open(member) as source:
             for _, element in iterparse(source, events=("end",)):
@@ -1339,6 +1444,11 @@ def _preflight_worksheet_xml(
                     _validate_materialized_cell_count(
                         sheet_name, materialized_cell_count
                     )
+                    relationship_id = element.attrib.get(
+                        _DOCUMENT_RELATIONSHIP_ID
+                    )
+                    if relationship_id:
+                        hyperlink_relationship_ids.add(relationship_id)
                 elif local_name == "row":
                     row_record_count += 1
                     if row_record_count > MAX_PREFLIGHT_ROWS:
@@ -1387,7 +1497,12 @@ def _preflight_worksheet_xml(
         raise WorkbookStructureError(
             f"Worksheet XML is malformed for {sheet_name}"
         ) from error
-    return cell_count, materialized_cell_count, table_relationship_ids
+    return (
+        cell_count,
+        materialized_cell_count,
+        table_relationship_ids,
+        hyperlink_relationship_ids,
+    )
 
 
 def _validate_preflight_column_dimension(

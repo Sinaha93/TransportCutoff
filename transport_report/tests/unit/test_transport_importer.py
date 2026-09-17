@@ -14,6 +14,7 @@ from openpyxl import load_workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.comments import Comment
 from openpyxl.drawing.image import Image as WorksheetImage
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.table import Table
 from PIL import Image as PillowImage
 
@@ -163,6 +164,50 @@ def _add_worksheet_chart(path: Path) -> None:
     source.add_chart(chart, "A10")
     workbook.save(path)
     workbook.close()
+
+
+def _add_worksheet_hyperlink(
+    path: Path,
+    *,
+    target: str | None = "https://example.test/report",
+    location: str | None = None,
+) -> None:
+    workbook = load_workbook(path)
+    cell = workbook[REGULAR_SHEET]["A1"]
+    if target is None:
+        cell.hyperlink = Hyperlink(ref=cell.coordinate, location=location)
+    else:
+        cell.hyperlink = target
+    workbook.save(path)
+    workbook.close()
+
+
+def _add_drawing_hyperlink(path: Path) -> None:
+    _add_worksheet_chart(path)
+    _rewrite_zip_member(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda data: data.replace(
+            b'<cNvPr id="1" name="Chart 1"/>',
+            b'<cNvPr id="1" name="Chart 1">'
+            b'<a:hlinkClick xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            b'r:id="rId2"/></cNvPr>',
+            1,
+        ),
+    )
+    _rewrite_zip_member(
+        path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId2" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+            b'Target="https://example.test/chart" TargetMode="External"/>'
+            b"</Relationships>",
+            1,
+        ),
+    )
 
 
 def _add_worksheet_table(path: Path) -> None:
@@ -1341,6 +1386,166 @@ def test_preflight_rejects_malformed_worksheet_relationships_before_openpyxl(
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
+def test_preflight_rejects_missing_worksheet_hyperlink_relationship_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    _remove_zip_member(fixture_path, "xl/worksheets/_rels/sheet1.xml.rels")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Worksheet hyperlink relationships are missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_wrong_type_worksheet_hyperlink_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b"/relationships/hyperlink\"",
+            b"/relationships/image\"",
+            1,
+        ).replace(b' TargetMode="External"', b"", 1),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"invalid worksheet hyperlink relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    "relationship_type",
+    [
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink",
+    ],
+    ids=("transitional", "strict"),
+)
+def test_preflight_accepts_valid_external_worksheet_hyperlink(
+    api, fixture_path, relationship_type
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+            relationship_type.encode(),
+            1,
+        ),
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_accepts_location_only_worksheet_hyperlink(api, fixture_path):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path, target=None, location="Sheet2!A1")
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_accepts_internal_worksheet_hyperlink_relationship(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b'Target="https://example.test/report" TargetMode="External"',
+            b'Target="../workbook.xml" TargetMode="Internal"',
+            1,
+        ),
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["", "   ", "https://example.test/&#x7f;report"],
+    ids=("blank", "whitespace", "control-character"),
+)
+def test_preflight_rejects_invalid_external_hyperlink_target_before_openpyxl(
+    api, fixture_path, monkeypatch, target
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b'Target="https://example.test/report"',
+            f'Target="{target}"'.encode(),
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"invalid worksheet hyperlink relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_overlong_external_hyperlink_target_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_HYPERLINK_TARGET_LENGTH", 8)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"invalid worksheet hyperlink relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_uses_first_duplicate_worksheet_hyperlink_relationship(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    _add_worksheet_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId1" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            b'Target="/xl/workbook.xml"/></Relationships>',
+            1,
+        ),
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
 @pytest.mark.parametrize(
     "target",
     ["../../../outside.xml", "../../xl/comments/comment1.xml"],
@@ -1766,6 +1971,85 @@ def test_preflight_rejects_nested_external_relationship_before_openpyxl(
         match=r"unsupported external relationship",
     ):
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_external_hyperlink_used_as_drawing_part_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" '
+            b'Target="/xl/charts/chart1.xml"',
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+            b'Target="https://example.test/chart" TargetMode="External"',
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"unsupported external relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_valid_external_drawing_hyperlink(api, fixture_path):
+    parser_module, _, _ = api
+    _add_drawing_hyperlink(fixture_path)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_rejects_wrong_type_drawing_hyperlink_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_drawing_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b"/relationships/hyperlink\"",
+            b"/relationships/image\"",
+            1,
+        ).replace(b' TargetMode="External"', b"", 1),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"invalid drawing hyperlink relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_uses_first_duplicate_drawing_hyperlink_relationship(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    _add_drawing_hyperlink(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId2" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            b'Target="/xl/charts/chart1.xml"/></Relationships>',
+            1,
+        ),
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
 
 
 def test_preflight_rejects_missing_workbook_pivot_cache_before_openpyxl(
