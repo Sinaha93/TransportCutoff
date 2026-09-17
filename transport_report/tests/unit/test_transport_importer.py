@@ -862,6 +862,156 @@ def test_preflight_counts_rows_without_explicit_references_before_openpyxl(
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
+def test_preflight_rejects_duplicate_row_record_overflow_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook.create_sheet("Irrelevant").cell(1, 1, 1)
+    workbook.save(fixture_path)
+    workbook.close()
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet5.xml",
+        lambda data: data.replace(
+            b"</sheetData>", b'<row r="1"/>' * 20_000 + b"</sheetData>"
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row-record limit.*20000"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_column_dimension_record_overflow_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    definitions = b'<col min="1" max="1" width="10"/>' * 2_049
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet1.xml",
+        lambda data: data.replace(
+            b"<sheetData>",
+            b"<cols>" + definitions + b"</cols><sheetData>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"column-dimension record limit.*2048",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_openpyxl_materializes_one_column_dimension_for_a_full_width_span(
+    fixture_path,
+):
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet1.xml",
+        lambda data: data.replace(
+            b"<sheetData>",
+            b'<cols><col min="1" max="16384" width="10"/></cols><sheetData>',
+        ),
+    )
+
+    workbook = load_workbook(fixture_path)
+    dimensions = workbook[REGULAR_SHEET].column_dimensions
+    assert len(dimensions) == 1
+    assert (dimensions["A"].min, dimensions["A"].max) == (1, 16_384)
+    workbook.close()
+
+
+def test_preflight_accepts_full_width_style_column_span(api, fixture_path):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet1.xml",
+        lambda data: data.replace(
+            b"<sheetData>",
+            b'<cols><col min="1" max="16384" style="1"/></cols><sheetData>',
+        ),
+    )
+
+    parser_module._preflight_workbook_resources(fixture_path)
+
+
+def test_preflight_accepts_actual_sized_column_dimension_record_shape(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    definitions = b"".join(
+        f'<col min="{column}" max="{column}" width="10"/>'.encode()
+        for column in range(1, 705)
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet1.xml",
+        lambda data: data.replace(
+            b"<sheetData>", b"<cols>" + definitions + b"</cols><sheetData>"
+        ),
+    )
+
+    parser_module._preflight_workbook_resources(fixture_path)
+
+
+@pytest.mark.parametrize(
+    "column_definition",
+    [
+        b'<col max="1"/>',
+        b'<col min="1"/>',
+        b'<col min="x" max="1"/>',
+        b'<col min="2" max="1"/>',
+        b'<col min="0" max="1"/>',
+        b'<col min="1" max="16385"/>',
+        b'<col min="' + b"9" * 10_000 + b'" max="1"/>',
+    ],
+    ids=(
+        "missing-min",
+        "missing-max",
+        "noninteger",
+        "reversed",
+        "zero",
+        "out-of-range",
+        "pathological-integer",
+    ),
+)
+def test_preflight_rejects_invalid_column_dimensions_before_openpyxl(
+    api, fixture_path, monkeypatch, column_definition
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/sheet1.xml",
+        lambda data: data.replace(
+            b"<sheetData>", b"<cols>" + column_definition + b"</cols><sheetData>"
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"invalid column dimension",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_normal_styled_columns(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[REGULAR_SHEET]
+    sheet.column_dimensions["A"].width = 18
+    sheet.column_dimensions["B"].hidden = True
+    workbook.save(fixture_path)
+    workbook.close()
+
+    parser_module._preflight_workbook_resources(fixture_path)
+
+
 def test_preflight_covers_nonstandard_sheet_relationship_openpyxl_would_load(
     api, fixture_path, monkeypatch
 ):

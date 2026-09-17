@@ -49,6 +49,11 @@ MAX_PREFLIGHT_WORKSHEET_CELLS = 50_000
 MAX_PREFLIGHT_TOTAL_CELLS = 100_000
 MAX_PREFLIGHT_ROWS = 20_000
 MAX_PREFLIGHT_COLUMNS = 512
+# OpenPyXL creates one ColumnDimension per raw <col> record; it does not expand
+# min..max spans. The real source has up to 704 records and valid style spans
+# through Excel's final column, so bound records separately from data columns.
+MAX_PREFLIGHT_COLUMN_DIMENSION_RECORDS = 2_048
+MAX_EXCEL_COLUMNS = 16_384
 # Conservative source-cell limits: 10,000 trips/day, 4 decimals, 16 canonical chars.
 MAX_TRIP_COUNT = Decimal("10000")
 MAX_TRIP_COUNT_SCALE = 4
@@ -654,6 +659,8 @@ def _preflight_worksheet_xml(
 
     cell_count = 0
     materialized_cell_count = 0
+    row_record_count = 0
+    column_dimension_count = 0
     inferred_row_number = 0
     try:
         with archive.open(member) as source:
@@ -692,6 +699,13 @@ def _preflight_worksheet_xml(
                         sheet_name, materialized_cell_count
                     )
                 elif local_name == "row":
+                    row_record_count += 1
+                    if row_record_count > MAX_PREFLIGHT_ROWS:
+                        raise WorkbookStructureError(
+                            f"{sheet_name} exceeds preflight row limit of "
+                            f"{MAX_PREFLIGHT_ROWS} (worksheet row-record limit of "
+                            f"{MAX_PREFLIGHT_ROWS})"
+                        )
                     row_reference = element.attrib.get("r")
                     if row_reference is None:
                         row_number = inferred_row_number + 1
@@ -708,12 +722,48 @@ def _preflight_worksheet_xml(
                             f"{sheet_name} exceeds preflight row limit of "
                             f"{MAX_PREFLIGHT_ROWS}"
                         )
+                elif local_name == "col":
+                    column_dimension_count += 1
+                    if (
+                        column_dimension_count
+                        > MAX_PREFLIGHT_COLUMN_DIMENSION_RECORDS
+                    ):
+                        raise WorkbookStructureError(
+                            f"{sheet_name} exceeds worksheet column-dimension "
+                            "record limit of "
+                            f"{MAX_PREFLIGHT_COLUMN_DIMENSION_RECORDS}"
+                        )
+                    _validate_preflight_column_dimension(element.attrib, sheet_name)
                 element.clear()
     except ParseError as error:
         raise WorkbookStructureError(
             f"Worksheet XML is malformed for {sheet_name}"
         ) from error
     return cell_count, materialized_cell_count
+
+
+def _validate_preflight_column_dimension(
+    attributes: dict[str, str], sheet_name: str
+) -> None:
+    minimum = _parse_bounded_decimal(attributes.get("min"), MAX_EXCEL_COLUMNS)
+    maximum = _parse_bounded_decimal(attributes.get("max"), MAX_EXCEL_COLUMNS)
+    if minimum is None or maximum is None or maximum < minimum:
+        raise WorkbookStructureError(
+            f"{sheet_name} contains an invalid column dimension"
+        )
+
+
+def _parse_bounded_decimal(value: str | None, maximum: int) -> int | None:
+    if (
+        value is None
+        or not value
+        or len(value) > len(str(maximum))
+        or not value.isascii()
+        or not value.isdecimal()
+    ):
+        return None
+    parsed = int(value)
+    return parsed if 1 <= parsed <= maximum else None
 
 
 def _validate_materialized_cell_count(sheet_name: str, count: int) -> None:
