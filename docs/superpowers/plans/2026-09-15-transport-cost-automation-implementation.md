@@ -385,7 +385,7 @@ git commit -m "feat: add manual monthly quantity and sales inputs"
 - Create: `transport_report/tests/fixtures/build_transport_fixture.py`
 - Create: `transport_report/tests/unit/test_transport_importer.py`
 
-- [ ] **Step 1: Build a synthetic workbook fixture**
+- [x] **Step 1: Build a synthetic workbook fixture**
 
 Generate a workbook containing:
 
@@ -395,7 +395,7 @@ Generate a workbook containing:
 - One known alias and one unknown alias.
 - Fractional trip count `1.25`.
 
-- [ ] **Step 2: Write failing parser tests**
+- [x] **Step 2: Write failing parser tests**
 
 ```python
 def test_parser_normalizes_day_columns_and_fractional_trips(fixture_path):
@@ -410,13 +410,13 @@ def test_import_is_idempotent(import_service, fixture_path):
     assert second.status == "duplicate"
 ```
 
-- [ ] **Step 3: Run the tests and verify failure**
+- [x] **Step 3: Run the tests and verify failure**
 
 Run: `python -m pytest tests/unit/test_transport_importer.py -v`
 
 Expected: FAIL because the parser is missing.
 
-- [ ] **Step 4: Implement safe workbook parsing**
+- [x] **Step 4: Implement safe workbook parsing**
 
 Open uploaded workbooks with `openpyxl.load_workbook(..., data_only=True, read_only=False, keep_vba=False)`. Never execute macros or external links. Reject files missing required sheets or headers.
 
@@ -430,17 +430,17 @@ For the regular sheet:
 
 For each subcontracted-car sheet, read detail rows only and exclude displayed total rows. Use amount column `I` as nonregular transport cost.
 
-- [ ] **Step 5: Implement staging and alias resolution**
+- [x] **Step 5: Implement staging and alias resolution**
 
 Store the SHA-256 file hash in `import_batches`. Stage all rows first, resolve aliases, and commit the batch only when structural checks pass. Unknown aliases remain imported with `destination_id=NULL` and become blocking validation errors.
 
-- [ ] **Step 6: Run parser tests**
+- [x] **Step 6: Run parser tests**
 
 Run: `python -m pytest tests/unit/test_transport_importer.py -v`
 
 Expected: PASS for normal rows, fractional trips, repeated headers, unknown aliases, duplicate imports, and subtotal mismatch.
 
-- [ ] **Step 7: Commit the importer**
+- [x] **Step 7: Commit the importer**
 
 ```powershell
 git add transport_report/app/importers/hwaseong_workbook.py transport_report/app/repositories/transport_entries.py transport_report/app/services/import_service.py transport_report/tests
