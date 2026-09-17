@@ -190,17 +190,37 @@ def _add_worksheet_chart(path: Path) -> None:
 def _add_worksheet_hyperlink(
     path: Path,
     *,
+    sheet_name: str = REGULAR_SHEET,
     target: str | None = "https://example.test/report",
     location: str | None = None,
 ) -> None:
     workbook = load_workbook(path)
-    cell = workbook[REGULAR_SHEET]["A1"]
+    cell = workbook[sheet_name]["A1"]
     if target is None:
         cell.hyperlink = Hyperlink(ref=cell.coordinate, location=location)
     else:
         cell.hyperlink = target
     workbook.save(path)
     workbook.close()
+
+
+def _external_hyperlink_relationships(count: int, *, start: int = 1) -> bytes:
+    return b"".join(
+        b'<Relationship Id="external-%d" ' % relationship_id
+        + b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+        + b'Target="https://example.test/%d" TargetMode="External"/>'
+        % relationship_id
+        for relationship_id in range(start, start + count)
+    )
+
+
+def _relationship_record_count(path: Path) -> int:
+    with ZipFile(path) as archive:
+        return sum(
+            archive.read(info.filename).count(b"<Relationship ")
+            for info in archive.infolist()
+            if info.filename.endswith(".rels")
+        )
 
 
 def _add_drawing_hyperlink(path: Path) -> None:
@@ -1868,6 +1888,102 @@ def test_preflight_counts_duplicate_relationship_edges_before_openpyxl(
         match=r"relationship edge limit.*1",
     ):
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("relationships_member", "description"),
+    (
+        ("_rels/.rels", "Package relationships"),
+        ("xl/_rels/workbook.xml.rels", "Workbook relationships"),
+    ),
+)
+def test_preflight_rejects_too_many_package_relationship_records_before_openpyxl(
+    api, fixture_path, monkeypatch, relationships_member, description
+):
+    parser_module, _, _ = api
+    _rewrite_zip_member(
+        fixture_path,
+        relationships_member,
+        lambda data: data.replace(
+            b"</Relationships>",
+            _external_hyperlink_relationships(4_097) + b"</Relationships>",
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=rf"{description} exceeds relationship record limit.*4096",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_too_many_unused_nested_relationship_records_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            _external_hyperlink_relationships(4_097) + b"</Relationships>",
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship graph relationships exceeds relationship record limit.*4096",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_total_relationship_records_across_many_parts_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    for sheet_name in (REGULAR_SHEET, *SUBCONTRACT_SHEETS):
+        _add_worksheet_hyperlink(fixture_path, sheet_name=sheet_name)
+    monkeypatch.setattr(
+        parser_module,
+        "MAX_PREFLIGHT_TOTAL_RELATIONSHIP_RECORDS",
+        _relationship_record_count(fixture_path) - 1,
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"total relationship record limit",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_exact_relationship_record_part_limit_and_external_hyperlinks(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    relationship_limit = parser_module.MAX_PREFLIGHT_RELATIONSHIP_RECORDS
+    _rewrite_zip_member(
+        fixture_path,
+        "_rels/.rels",
+        lambda _: (
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            b'<Relationship Id="rId1" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            b'Target="xl/workbook.xml"/>'
+            + _external_hyperlink_relationships(relationship_limit - 1)
+            + b"</Relationships>"
+        ),
+    )
+    _add_worksheet_hyperlink(fixture_path)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
 
 
 def test_preflight_rejects_relationship_part_limit_before_openpyxl(

@@ -63,6 +63,11 @@ MAX_PREFLIGHT_SHARED_STRING_CHARACTERS = 8_000_000
 MAX_PREFLIGHT_STYLE_COLLECTION_RECORDS = 65_536
 MAX_PREFLIGHT_STYLE_RECORDS = 100_000
 MAX_PREFLIGHT_RELATIONSHIP_PARTS = 1_024
+# A relationship part is parsed into OpenPyXL relationship objects even when its
+# records are unused. Bound records before materializing them; the four-part
+# global allowance also prevents many smaller sidecars from bypassing the cap.
+MAX_PREFLIGHT_RELATIONSHIP_RECORDS = 4_096
+MAX_PREFLIGHT_TOTAL_RELATIONSHIP_RECORDS = 16_384
 MAX_PREFLIGHT_RELATIONSHIP_EDGES = 4_096
 MAX_PREFLIGHT_RELATIONSHIP_DEPTH = 64
 MAX_PREFLIGHT_RELATIONSHIP_QUEUE = 1_024
@@ -256,6 +261,38 @@ class _RelationshipTarget:
     relationship_type: str
     source_member: str
     expected_semantic: str | None = None
+
+
+class _RelationshipRecordBudget:
+    def __init__(self) -> None:
+        self._counted_members: set[str] = set()
+        self._total_records = 0
+
+    def begins_part(self, member_name: str) -> bool:
+        if member_name in self._counted_members:
+            return False
+        self._counted_members.add(member_name)
+        return True
+
+    def record(
+        self,
+        description: str,
+        part_records: int,
+        count_toward_total: bool,
+    ) -> None:
+        if part_records > MAX_PREFLIGHT_RELATIONSHIP_RECORDS:
+            raise WorkbookStructureError(
+                f"{description} exceeds relationship record limit of "
+                f"{MAX_PREFLIGHT_RELATIONSHIP_RECORDS}"
+            )
+        if not count_toward_total:
+            return
+        self._total_records += 1
+        if self._total_records > MAX_PREFLIGHT_TOTAL_RELATIONSHIP_RECORDS:
+            raise WorkbookStructureError(
+                "Workbook exceeds total relationship record limit of "
+                f"{MAX_PREFLIGHT_TOTAL_RELATIONSHIP_RECORDS}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -853,7 +890,10 @@ def _require_content_type(
 
 
 def _preflight_package_parts(
-    archive: ZipFile, content_types: _ContentTypes, workbook_member: str
+    archive: ZipFile,
+    content_types: _ContentTypes,
+    workbook_member: str,
+    relationship_records: _RelationshipRecordBudget,
 ) -> None:
     _require_content_type(
         content_types, workbook_member, _CONTENT_TYPE_WORKBOOKS, "workbook"
@@ -903,14 +943,19 @@ def _preflight_package_parts(
             _preflight_bounded_xml(archive, member_name, description)
         else:
             specialized_preflight(archive, member_name)
-    _preflight_package_relationships(archive, content_types, workbook_member)
+    _preflight_package_relationships(
+        archive, content_types, workbook_member, relationship_records
+    )
 
 
 def _preflight_package_relationships(
-    archive: ZipFile, content_types: _ContentTypes, workbook_member: str
+    archive: ZipFile,
+    content_types: _ContentTypes,
+    workbook_member: str,
+    relationship_records: _RelationshipRecordBudget,
 ) -> None:
     root_relationships = _read_package_relationships(
-        archive, "_rels/.rels", "Package relationships"
+        archive, "_rels/.rels", "Package relationships", relationship_records
     )
     office_document_count = 0
     for relationship in root_relationships:
@@ -962,6 +1007,7 @@ def _preflight_package_relationships(
         archive,
         "xl/_rels/workbook.xml.rels",
         "Workbook relationships",
+        relationship_records,
     )
     expected_members = {
         "styles": "xl/styles.xml",
@@ -1002,7 +1048,10 @@ def _preflight_package_relationships(
 
 
 def _read_package_relationships(
-    archive: ZipFile, member_name: str, description: str
+    archive: ZipFile,
+    member_name: str,
+    description: str,
+    relationship_records: _RelationshipRecordBudget,
 ) -> list[_Relationship]:
     member = _required_xml_member(
         archive, member_name, f"{description} XML is missing"
@@ -1014,6 +1063,8 @@ def _read_package_relationships(
         )
     relationships: list[_Relationship] = []
     relationship_ids: set[str] = set()
+    part_records = 0
+    count_toward_total = relationship_records.begins_part(member_name)
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
@@ -1021,6 +1072,10 @@ def _read_package_relationships(
             )
             for _, element in iterparse(limited_source, events=("end",)):
                 if _xml_local_name(element.tag) == "Relationship":
+                    part_records += 1
+                    relationship_records.record(
+                        description, part_records, count_toward_total
+                    )
                     relationship_id = element.attrib.get("Id")
                     relationship_type = element.attrib.get("Type")
                     target = element.attrib.get("Target")
@@ -1206,10 +1261,13 @@ def _preflight_workbook_resources(path: Path) -> None:
         with ZipFile(path, "r") as archive:
             content_types = _read_content_types(archive)
             workbook_member = _select_workbook_member(content_types)
-            _preflight_package_parts(archive, content_types, workbook_member)
+            relationship_records = _RelationshipRecordBudget()
+            _preflight_package_parts(
+                archive, content_types, workbook_member, relationship_records
+            )
             sheet_refs = _read_workbook_sheet_refs(archive)
             worksheet_members, chartsheet_members = _resolve_sheet_members(
-                archive, sheet_refs, content_types
+                archive, sheet_refs, content_types, relationship_records
             )
             relationship_roots: dict[str, list[_RelationshipTarget]] = {}
             for _, member_name, relationship in chartsheet_members:
@@ -1240,6 +1298,7 @@ def _preflight_workbook_resources(path: Path) -> None:
                     table_ids,
                     hyperlink_ids,
                     relationship_roots,
+                    relationship_records,
                 )
                 materialized_cell_count += comment_count
                 _validate_materialized_cell_count(
@@ -1258,10 +1317,10 @@ def _preflight_workbook_resources(path: Path) -> None:
                         f"{MAX_PREFLIGHT_TOTAL_CELLS}"
                     )
             _add_workbook_pivot_cache_roots(
-                archive, relationship_roots
+                archive, relationship_roots, relationship_records
             )
             _preflight_relationship_graph(
-                archive, relationship_roots, content_types
+                archive, relationship_roots, content_types, relationship_records
             )
     except WorkbookStructureError:
         raise
@@ -1302,16 +1361,25 @@ def _resolve_sheet_members(
     archive: ZipFile,
     sheet_refs: list[tuple[str, str]],
     content_types: _ContentTypes,
+    relationship_records: _RelationshipRecordBudget,
 ) -> tuple[
     list[tuple[str, str, _Relationship]],
     list[tuple[str, str, _Relationship]],
 ]:
     wanted_ids = {relationship_id for _, relationship_id in sheet_refs}
     relationships: dict[str, tuple[str, str, str | None]] = {}
+    part_records = 0
+    count_toward_total = relationship_records.begins_part(
+        "xl/_rels/workbook.xml.rels"
+    )
     try:
         with archive.open("xl/_rels/workbook.xml.rels") as source:
             for _, element in iterparse(source, events=("end",)):
                 if _xml_local_name(element.tag) == "Relationship":
+                    part_records += 1
+                    relationship_records.record(
+                        "Workbook relationships", part_records, count_toward_total
+                    )
                     relationship_id = element.attrib.get("Id")
                     if relationship_id in wanted_ids:
                         if relationship_id in relationships:
@@ -1469,6 +1537,7 @@ def _preflight_worksheet_relationships(
     table_relationship_ids: set[str],
     hyperlink_relationship_ids: set[str],
     relationship_roots: dict[str, list[_RelationshipTarget]],
+    relationship_records: _RelationshipRecordBudget,
 ) -> int:
     worksheet_path = PurePosixPath(worksheet_member)
     relationships_member = str(
@@ -1500,6 +1569,8 @@ def _preflight_worksheet_relationships(
 
     relationships: list[_Relationship] = []
     relationship_ids: set[str] = set()
+    part_records = 0
+    count_toward_total = relationship_records.begins_part(relationships_member)
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
@@ -1509,6 +1580,12 @@ def _preflight_worksheet_relationships(
             )
             for _, element in iterparse(limited_source, events=("end",)):
                 if _xml_local_name(element.tag) == "Relationship":
+                    part_records += 1
+                    relationship_records.record(
+                        f"{sheet_name} worksheet relationships",
+                        part_records,
+                        count_toward_total,
+                    )
                     relationship_id = element.attrib.get("Id")
                     if not relationship_id:
                         raise WorkbookStructureError(
@@ -1667,7 +1744,9 @@ def _validate_hyperlink_relationship(
 
 
 def _add_workbook_pivot_cache_roots(
-    archive: ZipFile, relationship_roots: dict[str, list[_RelationshipTarget]]
+    archive: ZipFile,
+    relationship_roots: dict[str, list[_RelationshipTarget]],
+    relationship_records: _RelationshipRecordBudget,
 ) -> None:
     cache_ids: list[str] = []
     try:
@@ -1698,6 +1777,10 @@ def _add_workbook_pivot_cache_roots(
 
     wanted_ids = set(cache_ids)
     relationships: dict[str, _Relationship] = {}
+    part_records = 0
+    count_toward_total = relationship_records.begins_part(
+        "xl/_rels/workbook.xml.rels"
+    )
     try:
         with archive.open("xl/_rels/workbook.xml.rels") as source:
             limited_source = _SizeLimitedReader(
@@ -1707,6 +1790,12 @@ def _add_workbook_pivot_cache_roots(
             )
             for _, element in iterparse(limited_source, events=("end",)):
                 if _xml_local_name(element.tag) == "Relationship":
+                    part_records += 1
+                    relationship_records.record(
+                        "Workbook pivot cache relationships",
+                        part_records,
+                        count_toward_total,
+                    )
                     relationship_id = element.attrib.get("Id")
                     if relationship_id in wanted_ids:
                         if relationship_id in relationships:
@@ -1779,6 +1868,7 @@ def _preflight_relationship_graph(
     archive: ZipFile,
     root_members: dict[str, list[_RelationshipTarget]],
     content_types: _ContentTypes,
+    relationship_records: _RelationshipRecordBudget,
 ) -> None:
     if len(root_members) > MAX_PREFLIGHT_RELATIONSHIP_QUEUE:
         raise WorkbookStructureError(
@@ -1834,7 +1924,7 @@ def _preflight_relationship_graph(
             )
 
         relationships, relationships_by_id = _read_graph_relationships(
-            archive, member_name
+            archive, member_name, relationship_records
         )
         if not relationship_references.issubset(relationships_by_id):
             raise WorkbookStructureError(
@@ -1908,7 +1998,9 @@ def _preflight_relationship_graph(
 
 
 def _read_graph_relationships(
-    archive: ZipFile, source_member: str
+    archive: ZipFile,
+    source_member: str,
+    relationship_records: _RelationshipRecordBudget,
 ) -> tuple[list[_Relationship], dict[str, _Relationship]]:
     source_path = PurePosixPath(source_member)
     relationships_member = str(
@@ -1929,6 +2021,8 @@ def _read_graph_relationships(
         )
 
     relationships: list[_Relationship] = []
+    part_records = 0
+    count_toward_total = relationship_records.begins_part(relationships_member)
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
@@ -1938,6 +2032,12 @@ def _read_graph_relationships(
             )
             for _, element in iterparse(limited_source, events=("end",)):
                 if _xml_local_name(element.tag) == "Relationship":
+                    part_records += 1
+                    relationship_records.record(
+                        f"{source_member} relationship graph relationships",
+                        part_records,
+                        count_toward_total,
+                    )
                     relationship_id = element.attrib.get("Id")
                     relationship_type = element.attrib.get("Type")
                     target = element.attrib.get("Target")
