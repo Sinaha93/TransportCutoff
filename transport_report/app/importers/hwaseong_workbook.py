@@ -30,6 +30,10 @@ _TOTAL_LABELS = {"합계", "총계", "계"}
 _SUBCONTRACT_TOTAL_LABEL_COLUMNS = (1, 7)
 _SUBCONTRACT_LAST_FOOTPRINT_COLUMN = 10
 _SQLITE_MAX = 2**63 - 1
+# Layout bounds are intentionally well above the real workbook's 116 rows/54 columns.
+MAX_WORKSHEET_ROWS = 2_000
+MAX_WORKSHEET_COLUMNS = 128
+MAX_PARSED_ENTRIES = 20_000
 # Conservative source-cell limits: 10,000 trips/day, 4 decimals, 16 canonical chars.
 MAX_TRIP_COUNT = Decimal("10000")
 MAX_TRIP_COUNT_SCALE = 4
@@ -121,10 +125,13 @@ class HwaseongWorkbookParser:
 
             regular_sheet = workbook[regular_sheets[0]]
             _validate_regular_sheet_month(regular_sheet.title, report_month)
+            for sheet_name in (regular_sheets[0], *SUBCONTRACT_SHEETS):
+                _validate_worksheet_bounds(workbook[sheet_name])
             rows = self._parse_regular(
                 regular_sheet,
                 formula_workbook[regular_sheets[0]],
                 report_month,
+                MAX_PARSED_ENTRIES,
             )
             for sheet_name in SUBCONTRACT_SHEETS:
                 rows.extend(
@@ -132,6 +139,7 @@ class HwaseongWorkbookParser:
                         workbook[sheet_name],
                         formula_workbook[sheet_name],
                         report_month,
+                        MAX_PARSED_ENTRIES - len(rows),
                     )
                 )
             return rows
@@ -140,7 +148,7 @@ class HwaseongWorkbookParser:
             formula_workbook.close()
 
     def _parse_regular(
-        self, sheet, formula_sheet, report_month: str
+        self, sheet, formula_sheet, report_month: str, entry_limit: int
     ) -> list[ParsedTransportEntry]:
         header_row = _find_regular_header(sheet)
         if header_row is None:
@@ -297,7 +305,8 @@ class HwaseongWorkbookParser:
                     trip_count * unit_rate,
                     f"{sheet.title} row {row_number} day {day} calculated cost",
                 )
-                row_entries.append(
+                _append_parsed_entry(
+                    row_entries,
                     ParsedTransportEntry(
                         report_month=report_month,
                         destination_alias=destination_alias,
@@ -310,7 +319,8 @@ class HwaseongWorkbookParser:
                         unit_rate_won=unit_rate,
                         cost_won=cost_won,
                         vehicle_driver_group=vehicle_driver_group,
-                    )
+                    ),
+                    entry_limit - len(rows),
                 )
 
             cached_count = _nonnegative_decimal(
@@ -350,7 +360,7 @@ class HwaseongWorkbookParser:
         return rows
 
     def _parse_subcontract(
-        self, sheet, formula_sheet, report_month: str
+        self, sheet, formula_sheet, report_month: str, entry_limit: int
     ) -> list[ParsedTransportEntry]:
         header = _find_subcontract_header(sheet)
         if header is None:
@@ -371,6 +381,10 @@ class HwaseongWorkbookParser:
         displayed_total_found = False
         for row_number in range(header_row + 1, sheet.max_row + 1):
             if _is_displayed_total_row(sheet, row_number):
+                if displayed_total_found:
+                    raise WorkbookStructureError(
+                        f"{sheet.title} row {row_number} contains a second displayed total"
+                    )
                 cached_total = _integer_won(
                     _required_cached_value(
                         sheet.cell(row_number, 9).value,
@@ -386,19 +400,35 @@ class HwaseongWorkbookParser:
                     raise SubcontractTotalMismatchError(
                         f"Total mismatch in {sheet.title} row {row_number}: "
                         f"calculated {calculated_total}, cached {cached_total}"
-                    )
+                )
                 displayed_total_found = True
-                break
+                continue
             footprint_values = [
                 sheet.cell(row_number, column).value
                 for column in range(1, last_footprint_column + 1)
             ]
-            if not any(_has_value(value) for value in footprint_values):
+            formula_footprint_values = [
+                formula_sheet.cell(row_number, column).value
+                for column in range(1, last_footprint_column + 1)
+            ]
+            if not any(
+                _has_value(value)
+                for value in (*footprint_values, *formula_footprint_values)
+            ):
                 continue
             if _is_subcontract_template_row(
                 sheet, row_number, number_column, last_footprint_column
             ):
                 continue
+            if displayed_total_found:
+                if _is_subcontract_formula_footer(
+                    sheet, formula_sheet, row_number, last_footprint_column
+                ):
+                    continue
+                raise WorkbookStructureError(
+                    f"{sheet.title} row {row_number} contains detail after "
+                    "the displayed total"
+                )
             raw_date = sheet.cell(row_number, date_column).value
             transport_date = _transport_date(
                 raw_date, f"{sheet.title} row {row_number} date"
@@ -435,7 +465,8 @@ class HwaseongWorkbookParser:
                 f"{sheet.title} row {row_number} amount",
             )
             calculated_total += amount
-            rows.append(
+            _append_parsed_entry(
+                rows,
                 ParsedTransportEntry(
                     report_month=report_month,
                     destination_alias=destination_alias,
@@ -448,13 +479,37 @@ class HwaseongWorkbookParser:
                     unit_rate_won=None,
                     cost_won=amount,
                     vehicle_type=vehicle_type,
-                )
+                ),
+                entry_limit,
             )
         if not displayed_total_found:
             raise WorkbookStructureError(
                 f"{sheet.title} displayed cached total is required"
             )
         return rows
+
+
+def _validate_worksheet_bounds(sheet) -> None:
+    if sheet.max_row > MAX_WORKSHEET_ROWS:
+        raise WorkbookStructureError(
+            f"{sheet.title} exceeds worksheet row limit of {MAX_WORKSHEET_ROWS} "
+            f"(found {sheet.max_row})"
+        )
+    if sheet.max_column > MAX_WORKSHEET_COLUMNS:
+        raise WorkbookStructureError(
+            f"{sheet.title} exceeds worksheet column limit of "
+            f"{MAX_WORKSHEET_COLUMNS} (found {sheet.max_column})"
+        )
+
+
+def _append_parsed_entry(
+    rows: list[ParsedTransportEntry], entry: ParsedTransportEntry, limit: int
+) -> None:
+    if len(rows) >= limit:
+        raise WorkbookStructureError(
+            f"Workbook parsed entry limit of {MAX_PARSED_ENTRIES} exceeded"
+        )
+    rows.append(entry)
 
 
 def _find_regular_header(sheet) -> int | None:
@@ -580,6 +635,17 @@ def _is_subcontract_template_row(
         _has_value(sheet.cell(row_number, column).value)
         for column in range(1, last_footprint_column + 1)
         if column != number_column
+    )
+
+
+def _is_subcontract_formula_footer(
+    sheet, formula_sheet, row_number: int, last_footprint_column: int
+) -> bool:
+    return _is_formula(formula_sheet.cell(row_number, 9).value) and not any(
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
+        for column in range(1, last_footprint_column + 1)
+        if column != 9
     )
 
 

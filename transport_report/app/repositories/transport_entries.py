@@ -3,10 +3,12 @@ from __future__ import annotations
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 from app.db import Database
 from app.importers.hwaseong_workbook import (
     ParsedTransportEntry,
+    WorkbookStructureError,
     canonical_trip_count,
 )
 from app.repositories.monthly_inputs import MonthLockGuard
@@ -36,6 +38,7 @@ class TransportEntryRepository:
         file_sha256: str,
         rows: list[ParsedTransportEntry],
     ) -> ImportCommitResult:
+        _validate_import_rows(report_month, rows)
         connection = self.database.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -156,3 +159,49 @@ class TransportEntryRepository:
             f"Unknown destination alias: {alias}" for alias in unknown_aliases
         )
         return staged, blocking_errors
+
+
+def _validate_import_rows(
+    report_month: str, rows: list[ParsedTransportEntry]
+) -> None:
+    try:
+        report_month_start = date.fromisoformat(f"{report_month}-01")
+    except ValueError as error:
+        raise WorkbookStructureError("report_month must use YYYY-MM") from error
+    if report_month_start.strftime("%Y-%m") != report_month:
+        raise WorkbookStructureError("report_month must use YYYY-MM")
+
+    report_year_month = (report_month_start.year, report_month_start.month)
+    previous_month_day = report_month_start - timedelta(days=1)
+    previous_year_month = (previous_month_day.year, previous_month_day.month)
+    for row in rows:
+        label = f"{row.source_sheet} row {row.source_row}"
+        if row.report_month != report_month:
+            raise WorkbookStructureError(
+                f"{label} report_month must match import report_month "
+                f"{report_month}"
+            )
+        if not isinstance(row.source_date, date):
+            raise WorkbookStructureError(f"{label} source_date is required")
+        if row.day != row.source_date.day:
+            raise WorkbookStructureError(
+                f"{label} day must match source_date day {row.source_date.day}"
+            )
+        if row.transport_type not in {"regular", "nonregular"}:
+            raise WorkbookStructureError(
+                f"{label} transport_type must be regular or nonregular"
+            )
+
+        source_year_month = (row.source_date.year, row.source_date.month)
+        if row.transport_type == "regular" and source_year_month != report_year_month:
+            raise WorkbookStructureError(
+                f"{label} regular source_date must be in report_month {report_month}"
+            )
+        if row.transport_type == "nonregular" and source_year_month not in {
+            report_year_month,
+            previous_year_month,
+        }:
+            raise WorkbookStructureError(
+                f"{label} nonregular source_date must be in report_month "
+                "or the previous calendar month"
+            )

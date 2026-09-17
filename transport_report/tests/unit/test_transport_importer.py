@@ -48,6 +48,23 @@ def database(tmp_path):
     return result
 
 
+def _parsed_entry(parser_module, **overrides):
+    values = {
+        "report_month": "2026-08",
+        "destination_alias": "Known Plant",
+        "source_sheet": REGULAR_SHEET,
+        "source_row": 3,
+        "source_date": date(2026, 8, 1),
+        "day": 1,
+        "transport_type": "regular",
+        "trip_count": Decimal("1"),
+        "unit_rate_won": 1,
+        "cost_won": 1,
+    }
+    values.update(overrides)
+    return parser_module.ParsedTransportEntry(**values)
+
+
 def test_parser_normalizes_day_columns_and_fractional_trips(api, fixture_path):
     parser_module, _, _ = api
 
@@ -441,6 +458,97 @@ def test_parser_rejects_total_label_text_in_ancillary_detail_column(
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
+def test_parser_rejects_subcontract_detail_after_displayed_total(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[SUBCONTRACT_SHEETS[0]]
+    sheet.cell(4, 1, 2)
+    sheet.cell(4, 2, date(2026, 8, 6))
+    sheet.cell(4, 6, "Known Plant")
+    sheet.cell(4, 8, "5톤")
+    sheet.cell(4, 9, 60_000)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row 4.*detail after.*total"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_rejects_second_subcontract_displayed_total(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[SUBCONTRACT_SHEETS[0]]
+    sheet.cell(4, 1, "총계")
+    sheet.cell(4, 9, 50_000)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row 4.*second displayed total"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_accepts_actual_post_total_blank_template_and_formula_footer_shapes(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "post-total-footers.xlsx",
+        include_subcontract_post_total_rows=True,
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+    assert len(rows) == 5
+
+
+@pytest.mark.parametrize("sheet_name", [REGULAR_SHEET, *SUBCONTRACT_SHEETS[:1]])
+def test_parser_rejects_worksheet_row_dimension_abuse(
+    api, fixture_path, sheet_name
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[sheet_name].cell(2_001, 1).number_format = "0"
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row limit.*2000"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize("sheet_name", [REGULAR_SHEET, *SUBCONTRACT_SHEETS[:1]])
+def test_parser_rejects_worksheet_column_dimension_abuse(
+    api, fixture_path, sheet_name
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[sheet_name].cell(1, 129).number_format = "0"
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"column limit.*128"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_caps_total_entries_across_workbook(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    monkeypatch.setattr(parser_module, "MAX_PARSED_ENTRIES", 4, raising=False)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"entry limit.*4"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
 def test_parser_rejects_regular_sheet_month_mismatch(api, tmp_path):
     parser_module, _, _ = api
     path = build_structural_clone_fixture(tmp_path / "august.xlsx")
@@ -737,6 +845,88 @@ def test_repository_rejects_exponent_abuse_before_persistence(api, database):
         )
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"report_month": "2026-07"}, "report_month must match"),
+        ({"day": 2}, "day must match source_date"),
+        ({"source_date": None}, "source_date is required"),
+        ({"transport_type": "charter"}, "transport_type"),
+        (
+            {"source_date": date(2026, 7, 31), "day": 31},
+            "regular source_date",
+        ),
+        (
+            {
+                "source_date": date(2026, 6, 30),
+                "day": 30,
+                "transport_type": "nonregular",
+                "unit_rate_won": None,
+            },
+            "nonregular source_date",
+        ),
+        (
+            {
+                "source_date": date(2026, 9, 1),
+                "transport_type": "nonregular",
+                "unit_rate_won": None,
+            },
+            "nonregular source_date",
+        ),
+    ],
+    ids=(
+        "wrong-row-month",
+        "wrong-day",
+        "missing-source-date",
+        "invalid-type",
+        "regular-prior-month",
+        "nonregular-too-old",
+        "nonregular-future",
+    ),
+)
+def test_repository_rejects_inconsistent_entries_before_commit(
+    api, database, overrides, message
+):
+    parser_module, repository_module, _ = api
+    row = _parsed_entry(parser_module, **overrides)
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=message):
+        repository_module.TransportEntryRepository(database).import_entries(
+            report_month="2026-08",
+            source_filename="synthetic.xlsx",
+            file_sha256="d" * 64,
+            rows=[row],
+        )
+
+    with database.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM import_batches").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM transport_entries").fetchone()[0] == 0
+
+
+def test_repository_accepts_nonregular_previous_month_across_year_boundary(
+    api, database
+):
+    parser_module, repository_module, _ = api
+    row = _parsed_entry(
+        parser_module,
+        report_month="2026-01",
+        source_date=date(2025, 12, 31),
+        day=31,
+        transport_type="nonregular",
+        unit_rate_won=None,
+    )
+
+    result = repository_module.TransportEntryRepository(database).import_entries(
+        report_month="2026-01",
+        source_filename="synthetic.xlsx",
+        file_sha256="c" * 64,
+        rows=[row],
+    )
+
+    assert result.status == "imported"
+    assert result.inserted_count == 1
+
+
 def test_duplicate_import_restores_newline_alias_blockers_from_entries(api, database):
     parser_module, repository_module, _ = api
     rows = [
@@ -746,7 +936,7 @@ def test_duplicate_import_restores_newline_alias_blockers_from_entries(api, data
             source_sheet=REGULAR_SHEET,
             source_row=source_row,
             source_date=date(2026, 8, 1),
-            day=source_row,
+            day=1,
             transport_type="regular",
             trip_count=Decimal("1"),
             unit_rate_won=1,

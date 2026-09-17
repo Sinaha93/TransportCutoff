@@ -78,6 +78,7 @@ def build_structural_clone_fixture(
     missing_inactive_regular_count_formula_cache: bool = False,
     missing_inactive_regular_subtotal_formula_cache: bool = False,
     include_subcontract_template_rows: bool = False,
+    include_subcontract_post_total_rows: bool = False,
 ) -> Path:
     workbook = Workbook()
     regular = workbook.active
@@ -172,6 +173,10 @@ def build_structural_clone_fixture(
         sheet.cell(total_row, total_column, "합계")
         sheet.cell(total_row, 9, "=SUM(I3:I3)")
         cached_values[sheet_number] = {f"I{total_row}": str(amount)}
+        if include_subcontract_post_total_rows and sheet_number == 2:
+            sheet.cell(total_row + 1, 1, 2)
+            sheet.cell(total_row + 3, 9, f"=I{total_row}")
+            cached_values[sheet_number][f"I{total_row + 3}"] = str(amount)
         if sheet_number == 2:
             cached_values[sheet_number]["I3"] = str(amount)
 
