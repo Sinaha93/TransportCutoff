@@ -3,10 +3,12 @@ from __future__ import annotations
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
-from decimal import Decimal
 
 from app.db import Database
-from app.importers.hwaseong_workbook import ParsedTransportEntry
+from app.importers.hwaseong_workbook import (
+    ParsedTransportEntry,
+    canonical_trip_count,
+)
 from app.repositories.monthly_inputs import MonthLockGuard
 
 
@@ -73,10 +75,10 @@ class TransportEntryRepository:
             connection.executemany(
                 "INSERT INTO transport_entries"
                 "(import_batch_id, report_month, destination_id, unresolved_alias, "
-                "source_alias, source_sheet, source_row, transport_day, transport_type, "
-                "vehicle_type, vehicle_driver_group, trip_count_text, unit_rate_won, "
-                "cost_won, source_note) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "source_alias, source_sheet, source_row, source_date, transport_day, "
+                "transport_type, vehicle_type, vehicle_driver_group, trip_count_text, "
+                "unit_rate_won, cost_won, source_note) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         batch_id,
@@ -86,11 +88,12 @@ class TransportEntryRepository:
                         row.destination_alias,
                         row.source_sheet,
                         row.source_row,
+                        row.source_date.isoformat(),
                         row.day,
                         row.transport_type,
                         row.vehicle_type,
                         row.vehicle_driver_group,
-                        _canonical_decimal(row.trip_count),
+                        canonical_trip_count(row.trip_count),
                         row.unit_rate_won,
                         row.cost_won,
                         row.source_note,
@@ -140,10 +143,3 @@ class TransportEntryRepository:
             f"Unknown destination alias: {alias}" for alias in unknown_aliases
         )
         return staged, blocking_errors
-
-
-def _canonical_decimal(value: Decimal) -> str:
-    if value == 0:
-        return "0"
-    text = format(value, "f")
-    return text.rstrip("0").rstrip(".") if "." in text else text

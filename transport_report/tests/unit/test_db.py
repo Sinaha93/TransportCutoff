@@ -61,7 +61,7 @@ def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
     assert {
         "report_month",
         "is_locked",
@@ -156,6 +156,17 @@ def test_transport_source_alias_migration_preserves_known_legacy_state(tmp_path)
                 3_000,
             ),
         )
+        connection.execute(
+            "INSERT INTO month_locks"
+            "(report_month, is_locked, locked_at, input_revision) "
+            "VALUES (?, 1, ?, ?)",
+            ("2026-08", "2026-09-01T00:00:00", "legacy-revision"),
+        )
+        locked_update_trigger_before = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' "
+            "AND name = 'transport_entries_reject_locked_update'"
+        ).fetchone()["sql"]
         connection.commit()
 
     upgraded = Database(database_path)
@@ -163,7 +174,7 @@ def test_transport_source_alias_migration_preserves_known_legacy_state(tmp_path)
 
     with upgraded.connection() as connection:
         rows = connection.execute(
-            "SELECT destination_id, unresolved_alias, source_alias "
+            "SELECT destination_id, unresolved_alias, source_alias, source_date "
             "FROM transport_entries ORDER BY source_row"
         ).fetchall()
         versions = [
@@ -172,10 +183,64 @@ def test_transport_source_alias_migration_preserves_known_legacy_state(tmp_path)
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-    assert versions == [1, 2, 3]
-    assert tuple(rows[0]) == (destination_id, None, None)
-    assert tuple(rows[1]) == (None, "Legacy Unknown", "Legacy Unknown")
-    assert tuple(rows[2]) == (destination_id, "   ", None)
+        lock = connection.execute(
+            "SELECT is_locked, input_revision FROM month_locks "
+            "WHERE report_month = '2026-08'"
+        ).fetchone()
+        locked_update_trigger_after = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' "
+            "AND name = 'transport_entries_reject_locked_update'"
+        ).fetchone()["sql"]
+        with pytest.raises(sqlite3.IntegrityError, match="report month locked"):
+            connection.execute(
+                "UPDATE transport_entries SET cost_won = cost_won + 1 "
+                "WHERE source_row = 3"
+            )
+    assert versions == [1, 2, 3, 4]
+    assert tuple(rows[0]) == (destination_id, None, None, None)
+    assert tuple(rows[1]) == (None, "Legacy Unknown", "Legacy Unknown", None)
+    assert tuple(rows[2]) == (destination_id, "   ", None, None)
+    assert tuple(lock) == (1, "legacy-revision")
+    assert locked_update_trigger_after == locked_update_trigger_before
+
+
+def test_failed_migration_rolls_back_dropped_locked_update_trigger(tmp_path):
+    bundled = Database(tmp_path / "unused.db").migrations_dir
+    migrations = tmp_path / "failing-migrations"
+    migrations.mkdir()
+    for filename in ("001_initial.sql", "002_month_locks.sql"):
+        shutil.copyfile(bundled / filename, migrations / filename)
+    database = Database(tmp_path / "app.db", migrations_dir=migrations)
+    database.migrate()
+    with database.connection() as connection:
+        trigger_before = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE name = 'transport_entries_reject_locked_update'"
+        ).fetchone()["sql"]
+
+    (migrations / "003_fails.sql").write_text(
+        "DROP TRIGGER transport_entries_reject_locked_update;\n"
+        "INSERT INTO table_that_does_not_exist(value) VALUES (1);\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        database.migrate()
+
+    with database.connection() as connection:
+        trigger_after = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE name = 'transport_entries_reject_locked_update'"
+        ).fetchone()["sql"]
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+    assert trigger_after == trigger_before
+    assert versions == [1, 2]
 
 
 def test_transport_source_alias_rejects_blank_nonnull_values(tmp_path):
@@ -583,7 +648,7 @@ def test_migrations_are_repeatable(tmp_path):
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
 
 
 def test_migrate_rejects_schema_versions_newer_than_bundled_migrations(tmp_path):
@@ -778,6 +843,7 @@ def test_schema_includes_required_business_and_audit_fields(tmp_path):
             "source_sheet",
             "source_row",
             "source_alias",
+            "source_date",
             "transport_day",
             "transport_type",
             "trip_count_text",
@@ -808,6 +874,80 @@ def test_schema_includes_required_business_and_audit_fields(tmp_path):
 
     for table, required in expected_columns.items():
         assert required <= actual_columns[table]
+
+
+@pytest.mark.parametrize(
+    "invalid_source_date",
+    ["2026-8-01", "2026/08/01", "2026-02-30", "not-a-date", ""],
+)
+def test_transport_source_date_requires_valid_iso_date_when_present(
+    tmp_path, invalid_source_date
+):
+    db = Database(tmp_path / "app.db")
+    db.migrate()
+    with db.connection() as connection:
+        destination_id = connection.execute(
+            "INSERT INTO destinations(name, display_order) VALUES (?, ?)",
+            ("Destination", 1),
+        ).lastrowid
+        batch_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-08", "transport", "source.xlsx", "d" * 64, "imported"),
+        ).lastrowid
+        sql = (
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, destination_id, source_sheet, "
+            "source_row, source_date, transport_day, transport_type, "
+            "trip_count_text, cost_won) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                sql,
+                (
+                    batch_id,
+                    "2026-08",
+                    destination_id,
+                    "Sheet1",
+                    2,
+                    invalid_source_date,
+                    1,
+                    "regular",
+                    "1",
+                    1000,
+                ),
+            )
+        connection.execute(
+            sql,
+            (
+                batch_id,
+                "2026-08",
+                destination_id,
+                "Sheet1",
+                3,
+                "2026-08-01",
+                1,
+                "regular",
+                "1",
+                1000,
+            ),
+        )
+        connection.execute(
+            sql,
+            (
+                batch_id,
+                "2026-08",
+                destination_id,
+                "Sheet1",
+                4,
+                None,
+                1,
+                "regular",
+                "1",
+                1000,
+            ),
+        )
 
 
 def test_monetary_values_require_integer_won(tmp_path):
@@ -1171,7 +1311,7 @@ def test_concurrent_migrate_calls_do_not_reapply_versions(tmp_path, monkeypatch)
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
 
 
 def _schema_objects(db):

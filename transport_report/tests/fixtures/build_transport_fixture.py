@@ -17,11 +17,11 @@ SUBCONTRACT_SHEETS = (
 
 
 def build_transport_fixture(
-    path: Path, *, subtotal_mismatch: bool = False
+    path: Path, *, subtotal_mismatch: bool = False, month: int = 8
 ) -> Path:
     workbook = Workbook()
     regular = workbook.active
-    regular.title = REGULAR_SHEET
+    regular.title = f"화성운반비내역({month}월)"
     _write_regular_header(regular, 2)
 
     regular.cell(3, 1, "5톤 / 기사A")
@@ -40,17 +40,23 @@ def build_transport_fixture(
     regular.cell(5, 36, 3_000)
     regular.cell(5, 37, 3_000)
 
-    for offset, sheet_name in enumerate(SUBCONTRACT_SHEETS, start=5):
+    total_label_columns = (1, 7, 1)
+    for offset, (sheet_name, total_column) in enumerate(
+        zip(SUBCONTRACT_SHEETS, total_label_columns, strict=True), start=5
+    ):
         sheet = workbook.create_sheet(sheet_name)
         sheet.cell(1, 1, "일자")
         sheet.cell(1, 2, "운반지역")
+        sheet.cell(1, 3, "의뢰담당")
+        sheet.cell(1, 4, "출발지")
         sheet.cell(1, 8, "톤수")
         sheet.cell(1, 9, "금액")
-        sheet.cell(2, 1, date(2026, 8, offset))
+        sheet.cell(1, 10, "처리기사")
+        sheet.cell(2, 1, date(2026, month, offset))
         sheet.cell(2, 2, "Known Plant")
         sheet.cell(2, 8, f"{offset}톤")
         sheet.cell(2, 9, offset * 10_000)
-        sheet.cell(3, 2, "합계")
+        sheet.cell(3, total_column, "합계")
         sheet.cell(3, 9, offset * 10_000)
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +66,16 @@ def build_transport_fixture(
 
 
 def build_structural_clone_fixture(
-    path: Path, *, month: int = 8, include_inactive_regular_rows: bool = False
+    path: Path,
+    *,
+    month: int = 8,
+    include_inactive_regular_rows: bool = False,
+    include_regular_footer: bool = False,
+    include_regular_footer_lookalike: bool = False,
+    missing_regular_day_formula_cache: bool = False,
+    missing_regular_unit_formula_cache: bool = False,
+    missing_inactive_regular_unit_formula_cache: bool = False,
+    include_subcontract_template_rows: bool = False,
 ) -> Path:
     workbook = Workbook()
     regular = workbook.active
@@ -69,9 +84,9 @@ def build_structural_clone_fixture(
 
     regular.cell(3, 1, "5톤 / 기사A")
     regular.cell(3, 2, "Known Plant")
-    regular.cell(3, 14, 1.25)
+    regular.cell(3, 14, "=1.25" if missing_regular_day_formula_cache else 1.25)
     regular.cell(3, 34, "=SUM(C3:AG3)")
-    regular.cell(3, 36, 2_000)
+    regular.cell(3, 36, "=2000" if missing_regular_unit_formula_cache else 2_000)
     regular.cell(3, 37, "=AH3*AJ3")
 
     _write_structural_clone_regular_header(regular, 4)
@@ -88,10 +103,16 @@ def build_structural_clone_fixture(
     cached_values: dict[int, dict[str, str | None]] = {
         1: {"AH3": "1.25", "AK3": "2500", "AH5": "1", "AK5": "3000"}
     }
+    if missing_regular_day_formula_cache:
+        cached_values[1]["N3"] = None
+    if missing_regular_unit_formula_cache:
+        cached_values[1]["AJ3"] = None
     if include_inactive_regular_rows:
         regular.cell(6, 1, "8-ton / Driver B")
         regular.cell(6, 2, "Dormant Blank Destination")
         regular.cell(6, 34, 0)
+        if missing_inactive_regular_unit_formula_cache:
+            regular.cell(6, 36, "=0")
         regular.cell(6, 37, 0)
 
         regular.cell(7, 2, "Dormant Zero Destination")
@@ -106,6 +127,13 @@ def build_structural_clone_fixture(
         regular.cell(8, 36, 4_000)
         regular.cell(8, 37, "=AH8*AJ8")
         cached_values[1].update({"AH8": "1", "AK8": "4000"})
+    if include_regular_footer:
+        # Mirrors the source workbook's non-detail footer footprint without
+        # retaining its business labels or values.
+        regular.cell(113, 37, "Regular transport footer")
+        regular.cell(113, 38, 1)
+    if include_regular_footer_lookalike:
+        regular.cell(114, 37, "Unexpected subtotal text")
     for sheet_number, (sheet_name, total_column) in enumerate(
         zip(SUBCONTRACT_SHEETS, total_label_columns, strict=True), start=2
     ):
@@ -126,9 +154,14 @@ def build_structural_clone_fixture(
         sheet.cell(3, 8, 5)
         amount = (3 + sheet_number) * 10_000
         sheet.cell(3, 9, f"={amount}" if sheet_number == 2 else amount)
-        sheet.cell(4, total_column, "합계")
-        sheet.cell(4, 9, "=SUM(I3:I3)")
-        cached_values[sheet_number] = {"I4": str(amount)}
+        total_row = 4
+        if include_subcontract_template_rows and sheet_number == 2:
+            sheet.cell(4, 1, 2)
+            sheet.cell(5, 1, 3)
+            total_row = 6
+        sheet.cell(total_row, total_column, "합계")
+        sheet.cell(total_row, 9, "=SUM(I3:I3)")
+        cached_values[sheet_number] = {f"I{total_row}": str(amount)}
         if sheet_number == 2:
             cached_values[sheet_number]["I3"] = str(amount)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from decimal import Decimal
 from importlib import import_module
 from pathlib import Path
@@ -95,6 +96,30 @@ def test_parser_accepts_anonymized_real_workbook_structure_and_formula_caches(
     assert not {"합계", "총계", "계"} & {row.destination_alias for row in rows}
 
 
+def test_parser_skips_anonymized_regular_footer_without_destination(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "regular-footer.xlsx", include_regular_footer=True
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+    assert not any(
+        row.source_sheet == REGULAR_SHEET and row.source_row == 113 for row in rows
+    )
+
+
+def test_parser_rejects_ak_only_regular_footer_lookalike(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "regular-footer-lookalike.xlsx",
+        include_regular_footer_lookalike=True,
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="destination"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
 def test_parser_skips_both_inactive_regular_row_shapes_and_updates_group(
     api, tmp_path
 ):
@@ -114,6 +139,21 @@ def test_parser_skips_both_inactive_regular_row_shapes_and_updates_group(
         if row.source_sheet == REGULAR_SHEET and row.source_row == 8
     )
     assert trailing_row.vehicle_driver_group == "8-ton / Driver B"
+
+
+def test_parser_rejects_missing_aj_cache_on_inactive_looking_row(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "inactive-missing-aj-cache.xlsx",
+        include_inactive_regular_rows=True,
+        missing_inactive_regular_unit_formula_cache=True,
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"row 6 cell AJ6 cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
 def test_parser_rejects_numeric_string_regular_unit_rate(api, fixture_path):
@@ -233,7 +273,7 @@ def test_parser_rejects_regular_total_count_mismatch(api, fixture_path):
 
 @pytest.mark.parametrize(
     ("coordinate", "message"),
-    [("AH3", "cached total count"), ("AK3", "cached subtotal")],
+    [("AH3", "AH3"), ("AK3", "AK3")],
 )
 def test_parser_rejects_missing_regular_formula_cache(
     api, tmp_path, coordinate, message
@@ -242,7 +282,33 @@ def test_parser_rejects_missing_regular_formula_cache(
     path = build_structural_clone_fixture(tmp_path / "missing-cache.xlsx")
     patch_formula_cached_values(path, 1, {coordinate: None})
 
-    with pytest.raises(parser_module.WorkbookStructureError, match=message):
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=rf"row 3 cell {message} cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("fixture_option", "coordinate"),
+    [
+        ("missing_regular_day_formula_cache", "N3"),
+        ("missing_regular_unit_formula_cache", "AJ3"),
+    ],
+)
+def test_parser_reports_missing_daily_and_unit_formula_caches(
+    api, tmp_path, fixture_option, coordinate
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / f"missing-{coordinate}-cache.xlsx",
+        **{fixture_option: True},
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=rf"row 3 cell {coordinate} cached value is missing.*recalculate.*Excel",
+    ):
         parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
@@ -251,8 +317,98 @@ def test_parser_rejects_missing_subcontract_formula_cache(api, tmp_path):
     path = build_structural_clone_fixture(tmp_path / "missing-sub-cache.xlsx")
     patch_formula_cached_values(path, 2, {"I3": None})
 
-    with pytest.raises(parser_module.WorkbookStructureError, match="amount"):
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"row 3 cell I3 cached value is missing.*recalculate.*Excel",
+    ):
         parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_rejects_missing_subcontract_total_formula_cache(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(tmp_path / "missing-total-cache.xlsx")
+    patch_formula_cached_values(path, 2, {"I4": None})
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"row 4 cell I4 cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_rejects_stale_subcontract_total_formula_cache(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(tmp_path / "stale-total-cache.xlsx")
+    patch_formula_cached_values(path, 2, {"I4": "50001"})
+
+    with pytest.raises(parser_module.SubcontractTotalMismatchError, match="row 4"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+@pytest.mark.parametrize("sheet_name", SUBCONTRACT_SHEETS)
+def test_parser_requires_one_displayed_subcontract_total(api, fixture_path, sheet_name):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[sheet_name]
+    for cell in sheet[3]:
+        cell.value = None
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match="displayed cached total"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize("sheet_name", SUBCONTRACT_SHEETS)
+def test_parser_rejects_non_numeric_subcontract_total(api, fixture_path, sheet_name):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[sheet_name].cell(3, 9, "not-a-total")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="cached total"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize("sheet_name", SUBCONTRACT_SHEETS)
+def test_parser_rejects_mismatched_subcontract_total(api, fixture_path, sheet_name):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[sheet_name]
+    sheet.cell(3, 9, sheet.cell(3, 9).value + 1)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.SubcontractTotalMismatchError, match="row 3"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_reconciles_anonymized_total_rows_in_columns_a_and_g(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(tmp_path / "total-placements.xlsx")
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+    assert len([row for row in rows if row.transport_type == "nonregular"]) == 3
+
+
+def test_parser_rejects_total_label_text_in_ancillary_detail_column(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[SUBCONTRACT_SHEETS[0]]
+    sheet.insert_rows(3)
+    sheet.cell(3, 3, "계")
+    sheet.cell(3, 9, 50_000)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="date"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
 def test_parser_rejects_regular_sheet_month_mismatch(api, tmp_path):
@@ -261,6 +417,73 @@ def test_parser_rejects_regular_sheet_month_mismatch(api, tmp_path):
 
     with pytest.raises(parser_module.WorkbookStructureError, match="sheet month"):
         parser_module.HwaseongWorkbookParser().parse(path, "2026-09")
+
+
+def test_parser_accepts_previous_calendar_month_as_august_billing(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_transport_fixture(tmp_path / "previous-month.xlsx")
+    workbook = load_workbook(path)
+    workbook[SUBCONTRACT_SHEETS[0]].cell(2, 1, date(2026, 7, 31))
+    workbook.save(path)
+    workbook.close()
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+    billed = next(
+        row
+        for row in rows
+        if row.source_sheet == SUBCONTRACT_SHEETS[0] and row.source_row == 2
+    )
+    assert billed.report_month == "2026-08"
+    assert billed.day == 31
+    assert billed.source_date == date(2026, 7, 31)
+
+
+def test_parser_accepts_previous_calendar_month_across_year_boundary(api, tmp_path):
+    parser_module, _, _ = api
+    path = build_transport_fixture(tmp_path / "january.xlsx", month=1)
+    workbook = load_workbook(path)
+    workbook[SUBCONTRACT_SHEETS[0]].cell(2, 1, date(2025, 12, 31))
+    workbook.save(path)
+    workbook.close()
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-01")
+
+    billed = next(
+        row
+        for row in rows
+        if row.source_sheet == SUBCONTRACT_SHEETS[0] and row.source_row == 2
+    )
+    assert billed.report_month == "2026-01"
+    assert billed.source_date == date(2025, 12, 31)
+
+
+@pytest.mark.parametrize("outside_date", [date(2026, 6, 30), date(2026, 9, 1)])
+def test_parser_rejects_subcontract_dates_outside_billing_window(
+    api, tmp_path, outside_date
+):
+    parser_module, _, _ = api
+    path = build_transport_fixture(tmp_path / "outside-window.xlsx")
+    workbook = load_workbook(path)
+    workbook[SUBCONTRACT_SHEETS[0]].cell(2, 1, outside_date)
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="billing window"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_preserves_full_regular_source_date(api, fixture_path):
+    parser_module, _, _ = api
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    regular = next(
+        row
+        for row in rows
+        if row.source_sheet == REGULAR_SHEET and row.source_row == 3
+    )
+    assert regular.source_date == date(2026, 8, 12)
 
 
 def test_parser_rejects_invalid_generated_calendar_date(api, tmp_path):
@@ -321,6 +544,61 @@ def test_parser_rejects_data_row_missing_subcontract_destination(api, fixture_pa
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
+def test_parser_rejects_subcontract_detail_missing_vehicle(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[SUBCONTRACT_SHEETS[0]].cell(2, 8).value = None
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="vehicle"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize("candidate_column", [3, 4, 10])
+def test_parser_rejects_partial_subcontract_candidate_across_full_footprint(
+    api, fixture_path, candidate_column
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[SUBCONTRACT_SHEETS[0]]
+    sheet.insert_rows(3)
+    sheet.cell(3, candidate_column, "partial detail")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="date"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_checks_driver_column_when_its_header_is_blank(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[SUBCONTRACT_SHEETS[0]]
+    sheet.cell(1, 10).value = None
+    sheet.insert_rows(3)
+    sheet.cell(3, 10, "partial driver")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="date"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_skips_pre_numbered_blank_subcontract_template_rows(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "pre-numbered-templates.xlsx",
+        include_subcontract_template_rows=True,
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+    assert len(rows) == 5
+
+
 @pytest.mark.parametrize(
     ("column", "value", "message"),
     [(1, None, "date"), (9, None, "amount"), (9, "invalid", "amount")],
@@ -359,6 +637,76 @@ def test_parser_rejects_subtotal_mismatch(api, tmp_path):
         parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
+@pytest.mark.parametrize(
+    "invalid_count",
+    ["10000.0001", "0.00001", "1e100000", "12345678901234567"],
+)
+def test_parser_rejects_abusive_trip_counts_before_cost_calculation(
+    api, fixture_path, invalid_count
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[REGULAR_SHEET]
+    sheet.cell(3, 14, invalid_count)
+    sheet.cell(3, 34, invalid_count)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="trip count"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_accepts_trip_count_upper_boundary(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    sheet = workbook[REGULAR_SHEET]
+    sheet.cell(3, 14, 10_000)
+    sheet.cell(3, 34, 10_000)
+    sheet.cell(3, 36, 1)
+    sheet.cell(3, 37, 10_000)
+    workbook.save(fixture_path)
+    workbook.close()
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    boundary = next(row for row in rows if row.source_row == 3)
+    assert boundary.trip_count == Decimal("10000")
+
+
+def test_repository_rejects_exponent_abuse_before_persistence(api, database):
+    parser_module, repository_module, _ = api
+    row = parser_module.ParsedTransportEntry(
+        report_month="2026-08",
+        destination_alias="Known Plant",
+        source_sheet=REGULAR_SHEET,
+        source_row=3,
+        source_date=date(2026, 8, 1),
+        day=1,
+        transport_type="regular",
+        trip_count=Decimal("1e100000"),
+        unit_rate_won=1,
+        cost_won=1,
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="trip count"):
+        repository_module.TransportEntryRepository(database).import_entries(
+            report_month="2026-08",
+            source_filename="synthetic.xlsx",
+            file_sha256="e" * 64,
+            rows=[row],
+        )
+
+    with database.connection() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM import_batches").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM transport_entries").fetchone()[0]
+            == 0
+        )
+
+
 def test_import_is_idempotent_and_stores_file_hash(api, database, fixture_path):
     _, _, service_module = api
     service = service_module.TransportImportService(database)
@@ -377,6 +725,27 @@ def test_import_is_idempotent_and_stores_file_hash(api, database, fixture_path):
     assert batches[0]["file_sha256"] == hashlib.sha256(
         fixture_path.read_bytes()
     ).hexdigest()
+
+
+def test_import_persists_complete_source_dates(api, database, tmp_path):
+    _, _, service_module = api
+    path = build_transport_fixture(tmp_path / "source-dates.xlsx")
+    workbook = load_workbook(path)
+    workbook[SUBCONTRACT_SHEETS[0]].cell(2, 1, date(2026, 7, 31))
+    workbook.save(path)
+    workbook.close()
+
+    service_module.TransportImportService(database).import_transport(path, "2026-08")
+
+    with database.connection() as connection:
+        source_dates = {
+            row["source_date"]
+            for row in connection.execute(
+                "SELECT source_date FROM transport_entries"
+            )
+        }
+    assert "2026-07-31" in source_dates
+    assert "2026-08-12" in source_dates
 
 
 def test_import_snapshots_once_then_hashes_and_parses_the_same_bytes(
