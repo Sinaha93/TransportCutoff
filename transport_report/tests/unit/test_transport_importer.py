@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from decimal import Decimal
 from importlib import import_module
+from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -12,6 +13,9 @@ import pytest
 from openpyxl import load_workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.comments import Comment
+from openpyxl.drawing.image import Image as WorksheetImage
+from openpyxl.worksheet.table import Table
+from PIL import Image as PillowImage
 
 from app.db import Database
 from app.repositories.masters import MasterRepository
@@ -118,6 +122,74 @@ def _remove_zip_member(path: Path, member_name: str) -> None:
         for info, data in members:
             destination.writestr(info, data)
     temporary.replace(path)
+
+
+def _add_zip_member(path: Path, member_name: str, data: bytes) -> None:
+    with ZipFile(path, "a", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(member_name, data)
+
+
+def _add_workbook_pivot_cache_reference(path: Path, target: str) -> None:
+    _rewrite_zip_member(
+        path,
+        "xl/workbook.xml",
+        lambda data: data.replace(
+            b"<calcPr ",
+            b'<pivotCaches xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            b'<pivotCache cacheId="1" r:id="rId99"/>'
+            b"</pivotCaches><calcPr ",
+            1,
+        ),
+    )
+    _rewrite_zip_member(
+        path,
+        "xl/_rels/workbook.xml.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId99" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" '
+            + f'Target="{target}"/>'.encode()
+            + b"</Relationships>",
+            1,
+        ),
+    )
+
+
+def _add_worksheet_chart(path: Path) -> None:
+    workbook = load_workbook(path)
+    source = workbook[REGULAR_SHEET]
+    chart = BarChart()
+    chart.add_data(Reference(source, min_col=1, min_row=1, max_row=2))
+    source.add_chart(chart, "A10")
+    workbook.save(path)
+    workbook.close()
+
+
+def _add_worksheet_table(path: Path) -> None:
+    workbook = load_workbook(path)
+    source = workbook[REGULAR_SHEET]
+    source["AZ1"] = "First"
+    source["BA1"] = "Second"
+    source["AZ2"] = 1
+    source["BA2"] = 2
+    source.add_table(Table(displayName="AuditTable", ref="AZ1:BA2"))
+    workbook.save(path)
+    workbook.close()
+
+
+def _add_worksheet_chart_and_image(path: Path) -> None:
+    image_bytes = BytesIO()
+    PillowImage.new("RGB", (2, 2), "red").save(image_bytes, format="PNG")
+    image_bytes.seek(0)
+    image = PillowImage.open(image_bytes)
+    workbook = load_workbook(path)
+    source = workbook[REGULAR_SHEET]
+    chart = BarChart()
+    chart.add_data(Reference(source, min_col=1, min_row=1, max_row=2))
+    source.add_chart(chart, "A10")
+    source.add_image(WorksheetImage(image), "F10")
+    workbook.save(path)
+    workbook.close()
 
 
 def test_parser_normalizes_day_columns_and_fractional_trips(api, fixture_path):
@@ -1330,6 +1402,448 @@ def test_preflight_rejects_missing_eager_drawing_part_before_openpyxl(
         match=r"Worksheet related XML is missing",
     ):
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_chartsheet_drawing_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    _remove_zip_member(fixture_path, "xl/drawings/drawing1.xml")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_worksheet_chart_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _remove_zip_member(fixture_path, "xl/charts/chart1.xml")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_drawing_relationships_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _remove_zip_member(fixture_path, "xl/drawings/_rels/drawing1.xml.rels")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship references are missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_follows_table_part_id_regardless_of_relationship_type(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_table(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b"/relationships/table\"",
+            b"/relationships/notTable\"",
+            1,
+        ),
+    )
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/tables/table1.xml",
+        lambda data: data[:-1],
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Related XML is malformed",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_external_hyperlink_used_as_table_part_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_table(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" '
+            b'Target="/xl/tables/table1.xml"',
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+            b'Target="https://example.test/table.xml" TargetMode="External"',
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"unsupported external worksheet relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_unsafe_nested_relationship_target_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b'Target="/xl/charts/chart1.xml"',
+            b'Target="../../../outside.xml"',
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"unsafe relationship graph target",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_nested_xml_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/charts/chart1.xml",
+        lambda data: data[:-1],
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Related XML is malformed",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_invalid_nested_relationship_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" ',
+            b"",
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph relationships are invalid",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_oversized_nested_xml_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    with ZipFile(fixture_path) as archive:
+        protected_sizes = [
+            archive.getinfo(member_name).file_size
+            for member_name in (
+                "xl/workbook.xml",
+                "xl/_rels/workbook.xml.rels",
+                "xl/drawings/drawing1.xml",
+                "xl/charts/chart1.xml",
+            )
+        ]
+    limit = max(protected_sizes) + 1
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/charts/chart1.xml",
+        lambda data: data.replace(b"</chartSpace>", b" " * limit + b"</chartSpace>"),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATED_XML_BYTES", limit)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=rf"related XML size limit.*{limit}",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_relationship_graph_cycle_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _add_zip_member(
+        fixture_path,
+        "xl/charts/_rels/chart1.xml.rels",
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="urn:test:cycle" '
+        b'Target="/xl/drawings/drawing1.xml"/>'
+        b"</Relationships>",
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship graph contains a cycle",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_counts_duplicate_relationship_edges_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b"</Relationships>",
+            b'<Relationship Id="duplicate" Type="urn:test:duplicate" '
+            b'Target="/xl/charts/chart1.xml"/></Relationships>',
+        ),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATIONSHIP_EDGES", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship edge limit.*1",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_relationship_part_limit_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATIONSHIP_PARTS", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship part limit.*1",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_relationship_depth_limit_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATIONSHIP_DEPTH", 0)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship depth limit.*0",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_relationship_queue_limit_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATIONSHIP_QUEUE", 0)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship queue limit.*0",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_bounds_relationship_roots_while_collecting_them(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    for sheet_name in (REGULAR_SHEET, SUBCONTRACT_SHEETS[0]):
+        source = workbook[sheet_name]
+        chart = BarChart()
+        chart.add_data(Reference(source, min_col=1, min_row=1, max_row=2))
+        source.add_chart(chart, "A10")
+    workbook.save(fixture_path)
+    workbook.close()
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATIONSHIP_QUEUE", 1)
+    monkeypatch.setattr(
+        parser_module,
+        "_preflight_relationship_graph",
+        lambda *args: pytest.fail("relationship roots were not bounded during collection"),
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"relationship queue limit.*1",
+    ):
+        parser_module._preflight_workbook_resources(fixture_path)
+
+
+def test_preflight_rejects_missing_nested_image_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart_and_image(fixture_path)
+    _remove_zip_member(fixture_path, "xl/media/image1.png")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_oversized_nested_binary_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart_and_image(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATED_PART_BYTES", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"related part size limit.*1",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_nested_external_relationship_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_chart(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        lambda data: data.replace(
+            b'Target="/xl/charts/chart1.xml"',
+            b'Target="https://example.test/chart.xml" TargetMode="External"',
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"unsupported external relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_workbook_pivot_cache_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_workbook_pivot_cache_reference(
+        fixture_path, "/xl/pivotCache/missing.xml"
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_follows_pivot_cache_records_chain_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_workbook_pivot_cache_reference(
+        fixture_path, "/xl/pivotCache/pivotCacheDefinition1.xml"
+    )
+    _add_zip_member(
+        fixture_path,
+        "xl/pivotCache/pivotCacheDefinition1.xml",
+        b'<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        b'r:id="rId1"/>',
+    )
+    _add_zip_member(
+        fixture_path,
+        "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels",
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" '
+        b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" '
+        b'Target="/xl/pivotCache/missingRecords.xml"/></Relationships>',
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_follows_table_query_chain_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_worksheet_table(fixture_path)
+    _add_zip_member(
+        fixture_path,
+        "xl/tables/_rels/table1.xml.rels",
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" '
+        b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/queryTable" '
+        b'Target="/xl/queryTables/missing.xml"/></Relationships>',
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Relationship graph target is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_valid_worksheet_chart_and_image(api, fixture_path):
+    parser_module, _, _ = api
+    _add_worksheet_chart_and_image(fixture_path)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
 
 
 @pytest.mark.parametrize(
