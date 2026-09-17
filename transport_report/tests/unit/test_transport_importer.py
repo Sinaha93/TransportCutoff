@@ -91,6 +91,32 @@ def test_parser_skips_repeated_headers_and_displayed_totals(api, fixture_path):
     assert not {"운반지역", "합계"} & {row.destination_alias for row in rows}
 
 
+def test_parser_rejects_repeated_regular_header_with_uncached_ancillary_formula(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET].cell(4, 35, "=1")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=r"row 4"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_parser_rejects_initial_regular_header_with_uncached_ancillary_formula(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET].cell(2, 35, "=1")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="header"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
 def test_parser_accepts_anonymized_real_workbook_structure_and_formula_caches(
     api, tmp_path
 ):
@@ -124,6 +150,41 @@ def test_parser_skips_anonymized_regular_footer_without_destination(api, tmp_pat
     assert not any(
         row.source_sheet == REGULAR_SHEET and row.source_row == 113 for row in rows
     )
+
+
+@pytest.mark.parametrize(("column", "coordinate"), [(34, "AH113"), (36, "AJ113")])
+def test_parser_rejects_uncached_regular_footer_formula(
+    api, tmp_path, column, coordinate
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / f"regular-footer-{coordinate}-formula.xlsx",
+        include_regular_footer=True,
+        regular_footer_uncached_formula_column=column,
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=rf"row 113 cell {coordinate} cached value is missing.*recalculate.*Excel",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+@pytest.mark.parametrize("ancillary_value", ["=1", 1], ids=("formula", "value"))
+def test_parser_rejects_regular_footer_with_ancillary_content(
+    api, tmp_path, ancillary_value
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / f"regular-footer-ancillary-{ancillary_value!s}.xlsx",
+        include_regular_footer=True,
+        regular_footer_ancillary_value=ancillary_value,
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row 113.*destination"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
 def test_parser_rejects_ak_only_regular_footer_lookalike(api, tmp_path):
@@ -201,6 +262,35 @@ def test_parser_rejects_missing_ak_cache_on_inactive_looking_row(api, tmp_path):
         match=r"row 6 cell AK6 cached value is missing.*recalculate.*Excel",
     ):
         parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_rejects_inactive_regular_row_with_uncached_ancillary_formula(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "inactive-ancillary-formula.xlsx",
+        include_inactive_regular_rows=True,
+        inactive_regular_ancillary_value="=1",
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=r"row 6.*unit"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_rejects_blank_regular_row_with_uncached_ancillary_formula(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET].cell(6, 35, "=1")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row 6.*destination"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
 
 
 def test_parser_rejects_numeric_string_regular_unit_rate(api, fixture_path):
@@ -533,6 +623,19 @@ def test_parser_accepts_actual_post_total_blank_template_and_formula_footer_shap
     rows = parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
     assert len(rows) == 5
+
+
+def test_parser_rejects_subcontract_header_with_uncached_ancillary_formula(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "subcontract-header-ancillary-formula.xlsx",
+        subcontract_header_ancillary_value="=1",
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="header"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
 
 
 @pytest.mark.parametrize("sheet_name", [REGULAR_SHEET, *SUBCONTRACT_SHEETS[:1]])

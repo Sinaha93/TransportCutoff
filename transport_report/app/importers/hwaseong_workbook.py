@@ -150,7 +150,7 @@ class HwaseongWorkbookParser:
     def _parse_regular(
         self, sheet, formula_sheet, report_month: str, entry_limit: int
     ) -> list[ParsedTransportEntry]:
-        header_row = _find_regular_header(sheet)
+        header_row = _find_regular_header(sheet, formula_sheet)
         if header_row is None:
             raise WorkbookStructureError(
                 f"Required header was not found in sheet {sheet.title}"
@@ -159,7 +159,7 @@ class HwaseongWorkbookParser:
         rows: list[ParsedTransportEntry] = []
         vehicle_driver_group: str | None = None
         for row_number in range(header_row + 1, sheet.max_row + 1):
-            if _is_regular_header(sheet, row_number):
+            if _is_regular_header(sheet, formula_sheet, row_number):
                 continue
 
             group_value = _optional_text(sheet.cell(row_number, 1).value)
@@ -177,43 +177,9 @@ class HwaseongWorkbookParser:
                 formula_sheet.cell(row_number, column).value
                 for column in range(3, 34)
             ]
-            has_missing_day_formula_cache = any(
-                not _has_value(cached_value) and _is_formula(formula_value)
-                for cached_value, formula_value in zip(
-                    day_values, day_formula_values, strict=True
-                )
-            )
             cached_count_value = sheet.cell(row_number, 34).value
             unit_value = sheet.cell(row_number, 36).value
             cached_subtotal_value = sheet.cell(row_number, 37).value
-            footer_marker_value = sheet.cell(row_number, 38).value
-            if _is_regular_footer_or_note(
-                destination_alias,
-                day_values,
-                cached_count_value,
-                unit_value,
-                cached_subtotal_value,
-                footer_marker_value,
-                has_missing_day_formula_cache,
-            ):
-                continue
-            detail_values = (
-                destination_alias,
-                *day_values,
-                cached_count_value,
-                unit_value,
-                cached_subtotal_value,
-                footer_marker_value,
-            )
-            if (
-                not any(_has_value(value) for value in detail_values)
-                and not has_missing_day_formula_cache
-            ):
-                continue
-            if destination_alias is None:
-                raise WorkbookStructureError(
-                    f"{sheet.title} row {row_number} destination is required"
-                )
             for column, (cached_value, formula_value) in enumerate(
                 zip(day_values, day_formula_values, strict=True), start=3
             ):
@@ -260,12 +226,15 @@ class HwaseongWorkbookParser:
                     f"AK{row_number}",
                     "cached subtotal",
                 )
-            if (
-                not _has_value(unit_value)
-                and all(_is_blank_or_numeric_zero(value) for value in day_values)
-                and _is_blank_or_numeric_zero(cached_count_value)
-                and _is_blank_or_numeric_zero(cached_subtotal_value)
-            ):
+            if _is_regular_footer_or_note(sheet, formula_sheet, row_number):
+                continue
+            if _is_regular_blank_or_group_row(sheet, formula_sheet, row_number):
+                continue
+            if destination_alias is None:
+                raise WorkbookStructureError(
+                    f"{sheet.title} row {row_number} destination is required"
+                )
+            if _is_regular_inactive_row(sheet, formula_sheet, row_number):
                 continue
             unit_value = _required_cached_value(
                 unit_value,
@@ -362,7 +331,7 @@ class HwaseongWorkbookParser:
     def _parse_subcontract(
         self, sheet, formula_sheet, report_month: str, entry_limit: int
     ) -> list[ParsedTransportEntry]:
-        header = _find_subcontract_header(sheet)
+        header = _find_subcontract_header(sheet, formula_sheet)
         if header is None:
             raise WorkbookStructureError(
                 f"Required header was not found in sheet {sheet.title}"
@@ -516,14 +485,35 @@ def _append_parsed_entry(
     rows.append(entry)
 
 
-def _find_regular_header(sheet) -> int | None:
+def _find_regular_header(sheet, formula_sheet) -> int | None:
     for row_number in range(1, min(sheet.max_row, 50) + 1):
-        if _is_regular_header(sheet, row_number):
+        if _is_regular_header_view(sheet, row_number):
+            if not _is_regular_header(sheet, formula_sheet, row_number):
+                return None
             return row_number
     return None
 
 
-def _is_regular_header(sheet, row_number: int) -> bool:
+def _is_regular_header(sheet, formula_sheet, row_number: int) -> bool:
+    if not all(
+        _is_regular_header_view(workbook_sheet, row_number)
+        for workbook_sheet in (sheet, formula_sheet)
+    ):
+        return False
+    if any(
+        _has_value(workbook_sheet.cell(row_number, 35).value)
+        for workbook_sheet in (sheet, formula_sheet)
+    ):
+        return False
+    return all(
+        sheet.cell(row_number, column).value
+        == formula_sheet.cell(row_number, column).value
+        and not _is_formula(formula_sheet.cell(row_number, column).value)
+        for column in (1, 38)
+    )
+
+
+def _is_regular_header_view(sheet, row_number: int) -> bool:
     destination = _header_text(sheet.cell(row_number, 2).value)
     total_count = _header_text(sheet.cell(row_number, 34).value)
     unit = _header_text(sheet.cell(row_number, 36).value)
@@ -539,33 +529,49 @@ def _is_regular_header(sheet, row_number: int) -> bool:
 
 
 def _find_subcontract_header(
-    sheet,
+    sheet, formula_sheet
 ) -> tuple[int, int, int, int, int | None, int] | None:
     for row_number in range(1, min(sheet.max_row, 50) + 1):
-        columns: dict[str, int] = {}
-        for column in range(1, sheet.max_column + 1):
-            value = _header_text(sheet.cell(row_number, column).value)
-            if value in _DATE_HEADERS:
-                columns.setdefault("date", column)
-            if value in _DESTINATION_HEADERS:
-                columns.setdefault("destination", column)
-            if value in _TONNAGE_HEADERS:
-                columns.setdefault("tonnage", column)
-            if value.casefold() in _NUMBER_HEADERS:
-                columns.setdefault("number", column)
-        amount_header = _header_text(sheet.cell(row_number, 9).value)
+        header = _subcontract_header_view(sheet, row_number)
+        if header is None:
+            continue
         if (
-            {"date", "destination", "tonnage"} <= columns.keys()
-            and amount_header in _AMOUNT_HEADERS
-        ):
-            return (
-                row_number,
-                columns["date"],
-                columns["destination"],
-                columns["tonnage"],
-                columns.get("number"),
-                _SUBCONTRACT_LAST_FOOTPRINT_COLUMN,
+            _subcontract_header_view(formula_sheet, row_number) != header
+            or any(
+                _is_formula(formula_sheet.cell(row_number, column).value)
+                for column in range(1, _SUBCONTRACT_LAST_FOOTPRINT_COLUMN + 1)
             )
+        ):
+            return None
+        return (row_number, *header, _SUBCONTRACT_LAST_FOOTPRINT_COLUMN)
+    return None
+
+
+def _subcontract_header_view(
+    sheet, row_number: int
+) -> tuple[int, int, int, int | None] | None:
+    columns: dict[str, int] = {}
+    for column in range(1, sheet.max_column + 1):
+        value = _header_text(sheet.cell(row_number, column).value)
+        if value in _DATE_HEADERS:
+            columns.setdefault("date", column)
+        if value in _DESTINATION_HEADERS:
+            columns.setdefault("destination", column)
+        if value in _TONNAGE_HEADERS:
+            columns.setdefault("tonnage", column)
+        if value.casefold() in _NUMBER_HEADERS:
+            columns.setdefault("number", column)
+    amount_header = _header_text(sheet.cell(row_number, 9).value)
+    if (
+        {"date", "destination", "tonnage"} <= columns.keys()
+        and amount_header in _AMOUNT_HEADERS
+    ):
+        return (
+            columns["date"],
+            columns["destination"],
+            columns["tonnage"],
+            columns.get("number"),
+        )
     return None
 
 
@@ -609,25 +615,66 @@ def _is_displayed_total_row(sheet, formula_sheet, row_number: int) -> bool:
     )
 
 
-def _is_regular_footer_or_note(
-    destination_alias: str | None,
-    day_values: list[object],
-    cached_count_value: object,
-    unit_value: object,
-    cached_subtotal_value: object,
-    footer_marker_value: object,
-    has_missing_day_formula_cache: bool,
-) -> bool:
+def _is_regular_footer_or_note(sheet, formula_sheet, row_number: int) -> bool:
+    if any(
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
+        for column in range(1, 37)
+    ):
+        return False
+    cached_label = sheet.cell(row_number, 37).value
+    formula_label = formula_sheet.cell(row_number, 37).value
+    if not all(
+        isinstance(value, str) and bool(value.strip()) and not _is_formula(value)
+        for value in (cached_label, formula_label)
+    ):
+        return False
+    cached_marker = sheet.cell(row_number, 38).value
+    formula_marker = formula_sheet.cell(row_number, 38).value
     return (
-        destination_alias is None
-        and not any(_has_value(value) for value in day_values)
-        and not _has_value(cached_count_value)
-        and not _has_value(unit_value)
-        and not has_missing_day_formula_cache
-        and isinstance(cached_subtotal_value, str)
-        and bool(cached_subtotal_value.strip())
-        and not isinstance(footer_marker_value, bool)
-        and isinstance(footer_marker_value, (int, float, Decimal))
+        not isinstance(cached_marker, bool)
+        and isinstance(cached_marker, (int, float, Decimal))
+        and (
+            _is_formula(formula_marker)
+            or (
+                not isinstance(formula_marker, bool)
+                and isinstance(formula_marker, (int, float, Decimal))
+            )
+        )
+    )
+
+
+def _is_regular_blank_or_group_row(sheet, formula_sheet, row_number: int) -> bool:
+    cached_group = sheet.cell(row_number, 1).value
+    formula_group = formula_sheet.cell(row_number, 1).value
+    if _has_value(formula_group) and not _has_value(cached_group):
+        return False
+    return not any(
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
+        for column in range(2, 39)
+    )
+
+
+def _is_regular_inactive_row(sheet, formula_sheet, row_number: int) -> bool:
+    cached_group = sheet.cell(row_number, 1).value
+    formula_group = formula_sheet.cell(row_number, 1).value
+    if _has_value(formula_group) and not _has_value(cached_group):
+        return False
+    if any(
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
+        for column in (35, 38)
+    ):
+        return False
+    return (
+        not _has_value(sheet.cell(row_number, 36).value)
+        and all(
+            _is_blank_or_numeric_zero(sheet.cell(row_number, column).value)
+            for column in range(3, 34)
+        )
+        and _is_blank_or_numeric_zero(sheet.cell(row_number, 34).value)
+        and _is_blank_or_numeric_zero(sheet.cell(row_number, 37).value)
     )
 
 

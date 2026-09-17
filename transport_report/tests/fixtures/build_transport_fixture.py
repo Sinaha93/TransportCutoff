@@ -72,17 +72,21 @@ def build_structural_clone_fixture(
     include_inactive_regular_rows: bool = False,
     include_regular_footer: bool = False,
     include_regular_footer_lookalike: bool = False,
+    regular_footer_uncached_formula_column: int | None = None,
+    regular_footer_ancillary_value: object | None = None,
     missing_regular_day_formula_cache: bool = False,
     missing_regular_unit_formula_cache: bool = False,
     missing_inactive_regular_unit_formula_cache: bool = False,
     missing_inactive_regular_count_formula_cache: bool = False,
     missing_inactive_regular_subtotal_formula_cache: bool = False,
+    inactive_regular_ancillary_value: object | None = None,
     include_subcontract_template_rows: bool = False,
     include_subcontract_post_total_rows: bool = False,
     include_subcontract_pre_total_uncached_formula_row: bool = False,
     include_subcontract_post_total_uncached_formula_row: bool = False,
     subcontract_total_ancillary_value: object | None = None,
     subcontract_total_ancillary_cached_value: str | None = None,
+    subcontract_header_ancillary_value: object | None = None,
 ) -> Path:
     workbook = Workbook()
     regular = workbook.active
@@ -129,6 +133,8 @@ def build_structural_clone_fixture(
             37,
             "=AH6*AJ6" if missing_inactive_regular_subtotal_formula_cache else 0,
         )
+        if inactive_regular_ancillary_value is not None:
+            regular.cell(6, 35, inactive_regular_ancillary_value)
 
         regular.cell(7, 2, "Dormant Zero Destination")
         for column in range(3, 34):
@@ -146,7 +152,12 @@ def build_structural_clone_fixture(
         # Mirrors the source workbook's non-detail footer footprint without
         # retaining its business labels or values.
         regular.cell(113, 37, "Regular transport footer")
-        regular.cell(113, 38, 1)
+        regular.cell(113, 38, "=1")
+        cached_values[1]["AL113"] = "1"
+        if regular_footer_uncached_formula_column is not None:
+            regular.cell(113, regular_footer_uncached_formula_column, "=1")
+        if regular_footer_ancillary_value is not None:
+            regular.cell(113, 35, regular_footer_ancillary_value)
     if include_regular_footer_lookalike:
         regular.cell(114, 37, "Unexpected subtotal text")
     for sheet_number, (sheet_name, total_column) in enumerate(
@@ -163,6 +174,8 @@ def build_structural_clone_fixture(
         sheet.cell(2, 8, "차종(t)" if sheet_number == 2 else "차종(톤)")
         sheet.cell(2, 9, "기본요금")
         sheet.cell(2, 10, "처리기사")
+        if subcontract_header_ancillary_value is not None and sheet_number == 2:
+            sheet.cell(2, 3, subcontract_header_ancillary_value)
         sheet.cell(3, 1, 1)
         sheet.cell(3, 2, date(2026, month, 5 + sheet_number))
         sheet.cell(3, 6, "Known Plant")
