@@ -154,6 +154,12 @@ class HwaseongWorkbookParser:
                 and _is_blank_or_numeric_zero(cached_subtotal_value)
             ):
                 continue
+            if isinstance(unit_value, bool) or not isinstance(
+                unit_value, (int, float, Decimal)
+            ):
+                raise WorkbookStructureError(
+                    f"{sheet.title} row {row_number} unit cost must be numeric"
+                )
 
             unit_rate = _integer_won(
                 unit_value,

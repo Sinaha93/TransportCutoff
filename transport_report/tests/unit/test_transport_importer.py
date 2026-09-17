@@ -116,6 +116,17 @@ def test_parser_skips_both_inactive_regular_row_shapes_and_updates_group(
     assert trailing_row.vehicle_driver_group == "8-ton / Driver B"
 
 
+def test_parser_rejects_numeric_string_regular_unit_rate(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET].cell(3, 36, "2000")
+    workbook.save(fixture_path)
+    workbook.close()
+
+    with pytest.raises(parser_module.WorkbookStructureError, match="unit cost"):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
 @pytest.mark.parametrize(
     ("column", "value"),
     [
