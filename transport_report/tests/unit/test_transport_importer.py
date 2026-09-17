@@ -103,6 +103,26 @@ def _add_chartsheet(path: Path) -> None:
     workbook.close()
 
 
+def _add_shared_strings(path: Path, records: bytes) -> None:
+    _add_zip_member(
+        path,
+        "xl/sharedStrings.xml",
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        + records
+        + b"</sst>",
+    )
+    _rewrite_zip_member(
+        path,
+        "[Content_Types].xml",
+        lambda data: data.replace(
+            b"</Types>",
+            b'<Override PartName="/xl/sharedStrings.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            b"</Types>",
+        ),
+    )
+
+
 def _add_comment(path: Path, reference: str = "A1") -> None:
     workbook = load_workbook(path)
     workbook[REGULAR_SHEET][reference].comment = Comment("note", "author")
@@ -2735,6 +2755,64 @@ def test_preflight_rejects_shared_string_text_budget_before_openpyxl(
         parser_module.WorkbookStructureError, match=r"shared string character limit.*4"
     ):
         parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("run_xml", "description"),
+    (
+        (b"<r/>", "rich text"),
+        (b'<rPh sb="0" eb="0"/>', "phonetic"),
+    ),
+)
+def test_preflight_rejects_shared_string_run_records_before_openpyxl(
+    api, fixture_path, monkeypatch, run_xml, description
+):
+    parser_module, _, _ = api
+    record_limit = parser_module.MAX_PREFLIGHT_SHARED_STRING_OBJECT_RECORDS
+    _add_shared_strings(
+        fixture_path,
+        b"<si>" + run_xml * (record_limit + 1) + b"</si>",
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=rf"shared string object limit.*{record_limit}",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_exact_shared_string_object_limit_with_rich_text(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    record_limit = parser_module.MAX_PREFLIGHT_SHARED_STRING_OBJECT_RECORDS
+    _add_shared_strings(
+        fixture_path,
+        b"<si><r><t>ordinary text</t></r>"
+        + b"<r/>" * (record_limit - 2)
+        + b"</si>",
+    )
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_ignores_unrelated_rich_text_elements_in_shared_strings(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_shared_strings(
+        fixture_path,
+        b'<si><t>ordinary text</t><extLst><ext uri="urn:test">'
+        b'<w:r xmlns:w="urn:unrelated"/></ext></extLst></si>',
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_SHARED_STRING_RECORDS", 1)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
 
 
 def test_preflight_accepts_bounded_shared_strings_with_unusual_name(

@@ -59,6 +59,11 @@ MAX_PREFLIGHT_RELATED_PART_BYTES = 64 * 1024 * 1024
 # format ceiling is 65,490, so 65,536 leaves ordinary workbooks headroom.
 MAX_PREFLIGHT_CONTENT_TYPE_RECORDS = 4_096
 MAX_PREFLIGHT_SHARED_STRING_RECORDS = 100_000
+# OpenPyXL creates a Text object for each <si> and a RichText/PhoneticText
+# object for every direct <r>/<rPh> child. Their non-repeating descendants
+# (rPr/phoneticPr and their properties) are bounded one-for-one by these parent
+# records, so this keeps the eager shared-string object graph bounded as well.
+MAX_PREFLIGHT_SHARED_STRING_OBJECT_RECORDS = 100_000
 MAX_PREFLIGHT_SHARED_STRING_CHARACTERS = 8_000_000
 MAX_PREFLIGHT_STYLE_COLLECTION_RECORDS = 65_536
 MAX_PREFLIGHT_STYLE_RECORDS = 100_000
@@ -114,6 +119,14 @@ _CONTENT_TYPE = re.compile(r"^[!#$&^_.+A-Za-z0-9-]+/[!#$&^_.+A-Za-z0-9-]+$")
 _CONTENT_TYPES_ROOT = (
     "{http://schemas.openxmlformats.org/package/2006/content-types}Types"
 )
+_SPREADSHEETML_MAIN_NAMESPACE = (
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+)
+_SHARED_STRING_ITEM_TAG = f"{{{_SPREADSHEETML_MAIN_NAMESPACE}}}si"
+_SHARED_STRING_RICH_TEXT_TAGS = {
+    f"{{{_SPREADSHEETML_MAIN_NAMESPACE}}}r",
+    f"{{{_SPREADSHEETML_MAIN_NAMESPACE}}}rPh",
+}
 
 _CONTENT_TYPE_WORKBOOKS = (
     "application/vnd.ms-excel.template.macroEnabled.main+xml",
@@ -1176,13 +1189,18 @@ def _preflight_shared_strings(archive: ZipFile, member_name: str) -> None:
             f"{MAX_PREFLIGHT_PACKAGE_XML_BYTES}"
         )
     record_count = 0
+    object_record_count = 0
     character_count = 0
+    element_stack: list[str] = []
     try:
         with archive.open(member) as source:
             limited_source = _SizeLimitedReader(
                 source, MAX_PREFLIGHT_PACKAGE_XML_BYTES, "Shared strings XML"
             )
-            for _, element in iterparse(limited_source, events=("end",)):
+            for event, element in iterparse(limited_source, events=("start", "end")):
+                if event == "start":
+                    element_stack.append(element.tag)
+                    continue
                 local_name = _xml_local_name(element.tag)
                 if local_name == "t" and element.text:
                     character_count += len(element.text)
@@ -1191,14 +1209,27 @@ def _preflight_shared_strings(archive: ZipFile, member_name: str) -> None:
                             "Workbook exceeds shared string character limit of "
                             f"{MAX_PREFLIGHT_SHARED_STRING_CHARACTERS}"
                         )
-                if local_name == "si":
+                if element.tag == _SHARED_STRING_ITEM_TAG:
                     record_count += 1
                     if record_count > MAX_PREFLIGHT_SHARED_STRING_RECORDS:
                         raise WorkbookStructureError(
                             "Workbook exceeds shared string record limit of "
                             f"{MAX_PREFLIGHT_SHARED_STRING_RECORDS}"
                         )
+                    object_record_count += 1
+                elif (
+                    len(element_stack) >= 2
+                    and element_stack[-2] == _SHARED_STRING_ITEM_TAG
+                    and element.tag in _SHARED_STRING_RICH_TEXT_TAGS
+                ):
+                    object_record_count += 1
+                if object_record_count > MAX_PREFLIGHT_SHARED_STRING_OBJECT_RECORDS:
+                    raise WorkbookStructureError(
+                        "Workbook exceeds shared string object limit of "
+                        f"{MAX_PREFLIGHT_SHARED_STRING_OBJECT_RECORDS}"
+                    )
                 element.clear()
+                element_stack.pop()
     except ParseError as error:
         raise WorkbookStructureError(
             f"Shared strings XML is malformed: {member_name}"
