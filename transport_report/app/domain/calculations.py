@@ -1,16 +1,16 @@
 """Pure calculations for monthly transport reporting.
 
-Unit costs use :data:`decimal.ROUND_HALF_UP` because Excel's ``ROUND``
-function rounds a positive half away from zero. Quantities and costs in this
-domain are nonnegative, so this reproduces the workbook's two-decimal unit-cost
-presentation. Other Decimal results are kept unrounded for downstream output.
+Displayed unit costs use :data:`decimal.ROUND_HALF_UP` at two decimals. The
+workbook calculates unit-cost variance from the unrounded ``cost / quantity``
+cells and applies number formatting only for display, so the stored unit-cost
+variance and percentage remain unrounded for review-threshold decisions.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Context, Decimal, DecimalException, ROUND_HALF_UP, localcontext
 from enum import Enum
 
 from app.domain.models import Destination, GroupMember
@@ -19,6 +19,12 @@ from app.domain.models import Destination, GroupMember
 UNIT_COST_QUANTUM = Decimal("0.01")
 DEFAULT_REVIEW_THRESHOLD = Decimal("0.15")
 MAX_SQLITE_INTEGER = 2**63 - 1
+# A billion delivered EA per month is deliberately above observed report
+# volumes while still rejecting accidental scientific-notation magnitudes.
+MAX_QUANTITY_EA = Decimal("1000000000")
+MAX_QUANTITY_SCALE = 4
+CALCULATION_PRECISION = 50
+_CALCULATION_CONTEXT = Context(prec=CALCULATION_PRECISION, rounding=ROUND_HALF_UP)
 _NUMERIC_RESULT_FIELDS = (
     "planned_quantity",
     "planned_cost_won",
@@ -296,15 +302,25 @@ def unit_cost(cost_won: int, quantity_ea: Decimal) -> Decimal | None:
     _require_nonnegative_int(
         cost_won, "cost_won", maximum=MAX_SQLITE_INTEGER
     )
-    _require_nonnegative_decimal(quantity_ea, "quantity_ea")
+    _require_quantity(quantity_ea, "quantity_ea")
     return _rounded_unit_cost(cost_won, quantity_ea)
 
 
 def _rounded_unit_cost(cost_won: int, quantity_ea: Decimal) -> Decimal | None:
+    raw_value = _raw_unit_cost(cost_won, quantity_ea)
+    if raw_value is None:
+        return None
+    return _decimal_result(
+        "unit_cost",
+        lambda: raw_value.quantize(UNIT_COST_QUANTUM, rounding=ROUND_HALF_UP),
+    )
+
+
+def _raw_unit_cost(cost_won: int, quantity_ea: Decimal) -> Decimal | None:
     if quantity_ea == 0:
         return None
-    return (Decimal(cost_won) / quantity_ea).quantize(
-        UNIT_COST_QUANTUM, rounding=ROUND_HALF_UP
+    return _decimal_result(
+        "unit_cost", lambda: Decimal(cost_won) / quantity_ea
     )
 
 
@@ -312,14 +328,17 @@ def variance(actual: Decimal, plan: Decimal) -> Decimal:
     """Return the unrounded absolute variance ``actual - plan``."""
     _require_finite_decimal(actual, "actual")
     _require_finite_decimal(plan, "plan")
-    return actual - plan
+    return _decimal_result("variance", lambda: actual - plan)
 
 
 def variance_pct(actual: Decimal, plan: Decimal) -> Decimal | None:
     """Return the unrounded relative variance, or ``None`` for a zero plan."""
     _require_finite_decimal(actual, "actual")
     _require_finite_decimal(plan, "plan")
-    return None if plan == 0 else variance(actual, plan) / plan
+    if plan == 0:
+        return None
+    difference = variance(actual, plan)
+    return _decimal_result("variance_pct", lambda: difference / plan)
 
 
 def calculate_destination(
@@ -360,9 +379,10 @@ def calculate_total(
 ) -> DestinationCalculation:
     """Aggregate direct destinations using their editable total flags.
 
-    Derived report groups are not accepted as total rules, so calculations
-    with keys that do not correspond to a supplied destination are ignored.
-    Missing included values propagate as missing rather than becoming zero.
+    Every calculations-map entry must be a destination-bound direct result,
+    and each key must match that result's destination identity. Rules select
+    which validated entries contribute. Missing included values propagate as
+    missing rather than becoming zero.
     """
     rules = tuple(destinations)
     _validate_destination_rules(rules)
@@ -446,7 +466,7 @@ def select_unit_cost_reviews(
                     message="Unit cost or its plan variance is unavailable.",
                 )
             )
-        elif value <= -threshold or value >= threshold:
+        elif _meets_unit_cost_review_threshold(candidate.calculation, threshold):
             automatic.append(
                 ReviewItem(
                     destination_id=candidate.destination_id,
@@ -456,6 +476,44 @@ def select_unit_cost_reviews(
                 )
             )
     return ReviewSelection(tuple(automatic), tuple(validation))
+
+
+def _meets_unit_cost_review_threshold(
+    calculation: DestinationCalculation, threshold: Decimal
+) -> bool:
+    planned_cost_won = calculation.planned_cost_won
+    planned_quantity = calculation.planned_quantity
+    actual_cost_won = calculation.actual_cost_won
+    actual_quantity = calculation.actual_quantity
+    if (
+        planned_cost_won is None
+        or planned_quantity is None
+        or actual_cost_won is None
+        or actual_quantity is None
+        or planned_cost_won == 0
+        or planned_quantity == 0
+        or actual_quantity == 0
+    ):
+        return False
+    planned_cross_product = _decimal_result(
+        "unit cost review threshold",
+        lambda: Decimal(planned_cost_won) * actual_quantity,
+    )
+    variance_cross_product = _decimal_result(
+        "unit cost review threshold",
+        lambda: (
+            Decimal(actual_cost_won) * planned_quantity
+            - planned_cross_product
+        ),
+    )
+    threshold_cross_product = _decimal_result(
+        "unit cost review threshold",
+        lambda: threshold * planned_cross_product,
+    )
+    return (
+        variance_cross_product <= threshold_cross_product.copy_negate()
+        or variance_cross_product >= threshold_cross_product
+    )
 
 
 def _make_calculation(
@@ -529,13 +587,15 @@ def _calculated_fields(
 ) -> dict[str, Decimal | int | None]:
     planned_unit = _optional_unit_cost(planned_cost_won, planned_quantity)
     actual_unit = _optional_unit_cost(actual_cost_won, actual_quantity)
+    planned_unit_raw = _optional_raw_unit_cost(planned_cost_won, planned_quantity)
+    actual_unit_raw = _optional_raw_unit_cost(actual_cost_won, actual_quantity)
     quantity_difference = _optional_variance(actual_quantity, planned_quantity)
     cost_difference = (
         None
         if actual_cost_won is None or planned_cost_won is None
         else actual_cost_won - planned_cost_won
     )
-    unit_difference = _optional_variance(actual_unit, planned_unit)
+    unit_difference = _optional_variance(actual_unit_raw, planned_unit_raw)
     return {
         "planned_unit_cost": planned_unit,
         "actual_unit_cost": actual_unit,
@@ -550,7 +610,7 @@ def _calculated_fields(
         ),
         "actual_unit_cost_variance": unit_difference,
         "actual_unit_cost_variance_pct": _optional_variance_pct(
-            actual_unit, planned_unit
+            actual_unit_raw, planned_unit_raw
         ),
     }
 
@@ -561,6 +621,27 @@ def _optional_unit_cost(
     if cost_won is None or quantity_ea is None:
         return None
     return _rounded_unit_cost(cost_won, quantity_ea)
+
+
+def _optional_raw_unit_cost(
+    cost_won: int | None, quantity_ea: Decimal | None
+) -> Decimal | None:
+    if cost_won is None or quantity_ea is None:
+        return None
+    return _raw_unit_cost(cost_won, quantity_ea)
+
+
+def _decimal_result(field: str, operation: Callable[[], Decimal]) -> Decimal:
+    try:
+        with localcontext(_CALCULATION_CONTEXT):
+            result = operation()
+    except DecimalException as error:
+        raise ValueError(
+            f"{field} calculation is outside the supported Decimal domain"
+        ) from error
+    if not result.is_finite():
+        raise ValueError(f"{field} calculation is outside the supported Decimal domain")
+    return result
 
 
 def _optional_variance(
@@ -605,7 +686,16 @@ def _sum_metric(
         if value is None:
             return None
         values.append(value)
-    return sum(values, start=zero)
+    if isinstance(zero, Decimal):
+        result = _decimal_result(
+            value_field,
+            lambda: sum(values, start=zero),
+        )
+        _require_quantity(result, value_field)
+        return result
+    result = sum(values, start=zero)
+    _require_nonnegative_int(result, value_field, maximum=MAX_SQLITE_INTEGER)
+    return result
 
 
 def _validate_calculation_map(
@@ -704,8 +794,17 @@ def _average_for_months(
     missing = tuple(month for month in expected_months if monthly_values.get(month) is None)
     if missing:
         return AverageResult(expected_months, missing, None, False)
-    total = sum((monthly_values[month] for month in expected_months), Decimal(0))
-    return AverageResult(expected_months, (), total / Decimal(len(expected_months)), True)
+    total = _decimal_result(
+        "historical average",
+        lambda: sum(
+            (monthly_values[month] for month in expected_months), Decimal(0)
+        ),
+    )
+    average = _decimal_result(
+        "historical average", lambda: total / Decimal(len(expected_months))
+    )
+    _require_nonnegative_decimal_bound(average, "historical average")
+    return AverageResult(expected_months, (), average, True)
 
 
 def _prior_months(report_month: str, count: int) -> tuple[str, ...]:
@@ -738,12 +837,7 @@ def _validate_monthly_values(values: Mapping[str, Decimal | None]) -> None:
     for month, value in values.items():
         _parse_month(month, "monthly_values month")
         if value is not None:
-            try:
-                _require_nonnegative_decimal(value, "monthly_values")
-            except ValueError as error:
-                raise ValueError(
-                    "monthly_values must contain nonnegative finite Decimal values or None"
-                ) from error
+            _require_quantity(value, f"monthly_values[{month}]")
 
 
 def _validate_period_inputs(
@@ -752,7 +846,7 @@ def _validate_period_inputs(
     if (quantity is None) != (cost_won is None):
         raise ValueError(f"{label} quantity and cost must both be supplied or missing")
     if quantity is not None:
-        _require_nonnegative_decimal(quantity, f"{label}_quantity")
+        _require_quantity(quantity, f"{label}_quantity")
         _require_nonnegative_int(
             cost_won,
             f"{label}_cost_won",
@@ -771,8 +865,8 @@ def _validate_calculation_sources(
         _validate_period_inputs(planned_quantity, planned_cost_won, "planned")
         _validate_period_inputs(actual_quantity, actual_cost_won, "actual")
         return
-    _require_optional_nonnegative_decimal(planned_quantity, "planned_quantity")
-    _require_optional_nonnegative_decimal(actual_quantity, "actual_quantity")
+    _require_optional_quantity(planned_quantity, "planned_quantity")
+    _require_optional_quantity(actual_quantity, "actual_quantity")
     _require_optional_nonnegative_int(
         planned_cost_won,
         "planned_cost_won",
@@ -881,6 +975,36 @@ def _require_nonnegative_decimal(value: object, field: str) -> None:
         raise ValueError(f"{field} must be a nonnegative finite Decimal")
 
 
+def _require_quantity(value: object, field: str) -> None:
+    _require_nonnegative_decimal(value, field)
+    if value > MAX_QUANTITY_EA:
+        raise ValueError(f"{field} must be no greater than {MAX_QUANTITY_EA} EA")
+    if _effective_decimal_places(value) > MAX_QUANTITY_SCALE:
+        raise ValueError(
+            f"{field} must have at most {MAX_QUANTITY_SCALE} decimal places"
+        )
+
+
+def _require_nonnegative_decimal_bound(value: object, field: str) -> None:
+    _require_nonnegative_decimal(value, field)
+    if value > MAX_QUANTITY_EA:
+        raise ValueError(f"{field} must be no greater than {MAX_QUANTITY_EA}")
+
+
+def _effective_decimal_places(value: Decimal) -> int:
+    if value == 0:
+        return 0
+    exponent = value.as_tuple().exponent
+    if exponent >= 0:
+        return 0
+    trailing_zeroes = 0
+    for digit in reversed(value.as_tuple().digits):
+        if digit != 0:
+            break
+        trailing_zeroes += 1
+    return max(0, -exponent - trailing_zeroes)
+
+
 def _require_nonnegative_int(
     value: object,
     field: str,
@@ -902,6 +1026,11 @@ def _require_nonnegative_int(
 def _require_optional_nonnegative_decimal(value: object, field: str) -> None:
     if value is not None:
         _require_nonnegative_decimal(value, field)
+
+
+def _require_optional_quantity(value: object, field: str) -> None:
+    if value is not None:
+        _require_quantity(value, field)
 
 
 def _require_optional_finite_decimal(value: object, field: str) -> None:

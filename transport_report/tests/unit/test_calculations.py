@@ -1,5 +1,5 @@
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, Inexact, localcontext
 
 import pytest
 
@@ -158,7 +158,7 @@ def test_missing_included_metric_propagates_instead_of_becoming_zero():
 
 
 def test_history_windows_end_before_report_month_and_use_preceding_year():
-    from app.domain.calculations import historical_averages
+    from app.domain.calculations import CALCULATION_PRECISION, historical_averages
 
     values = {
         f"2025-{month:02d}": Decimal(month) for month in range(1, 13)
@@ -201,7 +201,10 @@ def test_history_windows_end_before_report_month_and_use_preceding_year():
     )
     assert result.three_month.value == Decimal("26")
     assert result.six_month.value == Decimal("24.5")
-    assert result.twelve_month.value == Decimal("218") / Decimal("12")
+    with localcontext() as context:
+        context.prec = CALCULATION_PRECISION
+        expected_twelve_month = Decimal("218") / Decimal("12")
+    assert result.twelve_month.value == expected_twelve_month
     assert result.comparison_year.value == Decimal("6.5")
 
 
@@ -283,6 +286,158 @@ def test_review_selector_includes_exact_thresholds_and_orders_deterministically(
         Decimal("0.15"),
     ]
     assert result.validation_items == ()
+
+
+def test_unit_cost_review_uses_unrounded_workbook_formula_chain():
+    from app.domain.calculations import (
+        ReviewCandidate,
+        calculate_destination,
+        select_unit_cost_reviews,
+    )
+
+    calculation = calculate_destination(
+        Decimal("1"), 1, Decimal("27"), 23, destination_id=1
+    )
+
+    assert calculation.planned_unit_cost == Decimal("1.00")
+    assert calculation.actual_unit_cost == Decimal("0.85")
+    assert calculation.actual_unit_cost_variance > Decimal("-0.15")
+    assert calculation.actual_unit_cost_variance_pct > Decimal("-0.15")
+    result = select_unit_cost_reviews(
+        [ReviewCandidate(1, "Raw-ratio regression", 1, calculation)]
+    )
+    assert result.automatic_items == ()
+
+
+@pytest.mark.parametrize(
+    (
+        "planned_cost_won",
+        "planned_quantity",
+        "actual_cost_won",
+        "actual_quantity",
+        "expected_pct",
+        "selected",
+    ),
+    [
+        (1, Decimal("1"), 17, Decimal("20"), Decimal("-0.15"), True),
+        (1, Decimal("1"), 850_001, Decimal("1000000"), Decimal("-0.149999"), False),
+        (1, Decimal("1"), 849_999, Decimal("1000000"), Decimal("-0.150001"), True),
+        (1, Decimal("1"), 23, Decimal("20"), Decimal("0.15"), True),
+        (1, Decimal("1"), 1_149_999, Decimal("1000000"), Decimal("0.149999"), False),
+        (1, Decimal("1"), 1_150_001, Decimal("1000000"), Decimal("0.150001"), True),
+    ],
+)
+def test_review_thresholds_follow_unrounded_workbook_values(
+    planned_cost_won,
+    planned_quantity,
+    actual_cost_won,
+    actual_quantity,
+    expected_pct,
+    selected,
+):
+    from app.domain.calculations import (
+        ReviewCandidate,
+        calculate_destination,
+        select_unit_cost_reviews,
+    )
+
+    calculation = calculate_destination(
+        planned_quantity,
+        planned_cost_won,
+        actual_quantity,
+        actual_cost_won,
+        destination_id=1,
+    )
+    result = select_unit_cost_reviews(
+        [ReviewCandidate(1, "Boundary", 1, calculation)]
+    )
+
+    assert calculation.actual_unit_cost_variance_pct == expected_pct
+    assert bool(result.automatic_items) is selected
+
+
+@pytest.mark.parametrize(
+    ("planned_cost_won", "planned_quantity", "actual_cost_won", "actual_quantity"),
+    [
+        (5, Decimal("7"), 17, Decimal("28")),
+        (1, Decimal("23"), 1, Decimal("20")),
+    ],
+)
+def test_review_thresholds_include_exact_ratios_with_repeating_unit_costs(
+    planned_cost_won, planned_quantity, actual_cost_won, actual_quantity
+):
+    from app.domain.calculations import (
+        CALCULATION_PRECISION,
+        DEFAULT_REVIEW_THRESHOLD,
+        ReviewCandidate,
+        calculate_destination,
+        select_unit_cost_reviews,
+    )
+
+    calculation = calculate_destination(
+        planned_quantity,
+        planned_cost_won,
+        actual_quantity,
+        actual_cost_won,
+        destination_id=1,
+    )
+    result = select_unit_cost_reviews(
+        [ReviewCandidate(1, "Repeating exact boundary", 1, calculation)]
+    )
+
+    with localcontext() as context:
+        context.prec = CALCULATION_PRECISION
+        stored_magnitude = abs(calculation.actual_unit_cost_variance_pct)
+    assert stored_magnitude < DEFAULT_REVIEW_THRESHOLD
+    assert len(result.automatic_items) == 1
+
+
+def test_negative_review_boundary_ignores_ambient_decimal_context():
+    from app.domain.calculations import (
+        ReviewCandidate,
+        calculate_destination,
+        select_unit_cost_reviews,
+    )
+
+    quantity = Decimal("830839729.9876")
+    calculation = calculate_destination(
+        quantity,
+        3_359_510_071_930_000_560,
+        quantity,
+        2_855_583_561_140_500_476,
+        destination_id=1,
+    )
+    with localcontext() as context:
+        context.prec = 6
+        context.traps[Inexact] = True
+        result = select_unit_cost_reviews(
+            [ReviewCandidate(1, "Large negative boundary", 1, calculation)]
+        )
+
+    assert len(result.automatic_items) == 1
+
+
+def test_unit_cost_variance_percentage_preserves_workbook_formula_chain():
+    from app.domain.calculations import CALCULATION_PRECISION, calculate_destination
+
+    planned_cost_won = 7_921_731_534
+    planned_quantity = Decimal("3475.1218")
+    actual_cost_won = 1_806_341_205
+    actual_quantity = Decimal("6862.2132")
+    with localcontext() as context:
+        context.prec = CALCULATION_PRECISION
+        planned_raw = Decimal(planned_cost_won) / planned_quantity
+        actual_raw = Decimal(actual_cost_won) / actual_quantity
+        expected = (actual_raw - planned_raw) / planned_raw
+
+    calculation = calculate_destination(
+        planned_quantity,
+        planned_cost_won,
+        actual_quantity,
+        actual_cost_won,
+    )
+
+    assert calculation.actual_unit_cost_variance_pct == expected
 
 
 def test_review_selector_surfaces_unavailable_variance_without_narrative():
@@ -405,6 +560,93 @@ def test_helpers_reject_bool_float_and_nonfinite_values():
         variance(1.0, Decimal("1"))
     with pytest.raises(ValueError, match="plan"):
         variance_pct(Decimal("1"), Decimal("NaN"))
+
+
+def test_quantity_domain_accepts_business_boundaries_and_rejects_tiny_scale():
+    from app.domain.calculations import (
+        MAX_QUANTITY_EA,
+        MAX_SQLITE_INTEGER,
+        calculate_destination,
+        unit_cost,
+    )
+
+    boundary = calculate_destination(
+        MAX_QUANTITY_EA, 1, Decimal("0.0001"), 1
+    )
+    assert boundary.planned_quantity == MAX_QUANTITY_EA
+    assert boundary.actual_quantity == Decimal("0.0001")
+    assert unit_cost(1, Decimal("0.0001")) == Decimal("10000.00")
+    with localcontext() as context:
+        context.prec = 6
+        largest_unit_cost = unit_cost(MAX_SQLITE_INTEGER, Decimal("0.0001"))
+    assert largest_unit_cost == Decimal("92233720368547758070000.00")
+
+    with pytest.raises(ValueError, match="at most 4 decimal places"):
+        calculate_destination(Decimal("1E-28"), 1, Decimal("1"), 1)
+    with pytest.raises(ValueError, match="at most 4 decimal places"):
+        unit_cost(1, Decimal("0.00001"))
+    with pytest.raises(ValueError, match="no greater than"):
+        calculate_destination(MAX_QUANTITY_EA + Decimal("0.0001"), 1, Decimal("1"), 1)
+
+
+def test_quantity_aggregate_preserves_scale_and_rejects_domain_overflow():
+    from app.domain.calculations import calculate_destination, calculate_total
+
+    destinations = [_destination(1, "First", 1), _destination(2, "Second", 2)]
+    at_limit = {
+        1: calculate_destination(
+            Decimal("500000000.0001"), 1, Decimal("500000000.0001"), 1,
+            destination_id=1,
+        ),
+        2: calculate_destination(
+            Decimal("499999999.9999"), 1, Decimal("499999999.9999"), 1,
+            destination_id=2,
+        ),
+    }
+    overflow = {
+        **at_limit,
+        2: calculate_destination(
+            Decimal("500000000.0000"), 1, Decimal("500000000.0000"), 1,
+            destination_id=2,
+        ),
+    }
+
+    assert calculate_total(at_limit, destinations).planned_quantity == Decimal(
+        "1000000000.0000"
+    )
+    with pytest.raises(ValueError, match="planned_quantity.*no greater than"):
+        calculate_total(overflow, destinations)
+
+
+def test_history_uses_local_precision_and_validates_quantity_domain():
+    from app.domain.calculations import CALCULATION_PRECISION, historical_averages
+
+    values = {
+        f"2025-{month:02d}": Decimal("1") for month in range(1, 13)
+    }
+    values["2025-12"] = Decimal("2")
+    with localcontext() as context:
+        context.prec = 6
+        result = historical_averages("2026-01", values)
+
+    with localcontext() as context:
+        context.prec = CALCULATION_PRECISION
+        expected = Decimal("4") / Decimal("3")
+    assert result.three_month.value == expected
+
+    invalid_scale = {**values, "2025-12": Decimal("1E-28")}
+    with pytest.raises(ValueError, match="monthly_values.*at most 4 decimal places"):
+        historical_averages("2026-01", invalid_scale)
+    invalid_maximum = {**values, "2025-12": Decimal("1000000000.0001")}
+    with pytest.raises(ValueError, match="monthly_values.*no greater than"):
+        historical_averages("2026-01", invalid_maximum)
+
+
+def test_decimal_arithmetic_errors_are_translated_to_domain_errors():
+    from app.domain.calculations import variance
+
+    with pytest.raises(ValueError, match="outside the supported Decimal domain"):
+        variance(Decimal("9E+999999"), Decimal("-9E+999999"))
 
 
 @pytest.mark.parametrize(
@@ -722,9 +964,9 @@ def test_aggregate_validates_cost_bound_before_unit_cost_arithmetic():
     ]
     calculations = {
         1: calculate_destination(
-            Decimal("0.0000000000000000000000000001"),
+            Decimal("0.0001"),
             0,
-            Decimal("0.0000000000000000000000000001"),
+            Decimal("0.0001"),
             0,
             destination_id=1,
         ),
