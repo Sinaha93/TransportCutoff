@@ -10,6 +10,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from openpyxl import load_workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.comments import Comment
 
 from app.db import Database
 from app.repositories.masters import MasterRepository
@@ -84,6 +86,38 @@ def _rewrite_zip_member(path: Path, member_name: str, transform) -> None:
 
 def _fail_if_openpyxl_loads(*args, **kwargs):
     pytest.fail("load_workbook was called before workbook resource preflight")
+
+
+def _add_chartsheet(path: Path) -> None:
+    workbook = load_workbook(path)
+    source = workbook[REGULAR_SHEET]
+    chart = BarChart()
+    chart.add_data(Reference(source, min_col=1, min_row=1, max_row=2))
+    workbook.create_chartsheet("Chart").add_chart(chart)
+    workbook.save(path)
+    workbook.close()
+
+
+def _add_comment(path: Path, reference: str = "A1") -> None:
+    workbook = load_workbook(path)
+    workbook[REGULAR_SHEET][reference].comment = Comment("note", "author")
+    workbook.save(path)
+    workbook.close()
+
+
+def _remove_zip_member(path: Path, member_name: str) -> None:
+    with ZipFile(path, "r") as source:
+        members = [
+            (info, source.read(info.filename))
+            for info in source.infolist()
+            if info.filename != member_name
+        ]
+
+    temporary = path.with_name(path.name + ".rewritten")
+    with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as destination:
+        for info, data in members:
+            destination.writestr(info, data)
+    temporary.replace(path)
 
 
 def test_parser_normalizes_day_columns_and_fractional_trips(api, fixture_path):
@@ -1092,6 +1126,329 @@ def test_preflight_accepts_normal_synthetic_workbook(api, fixture_path):
     parser_module, _, _ = api
 
     parser_module._preflight_workbook_resources(fixture_path)
+
+
+def test_preflight_accepts_valid_chartsheet_and_parser_reads_required_sheets(
+    api, fixture_path
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_counts_chartsheets_in_workbook_sheet_limit(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEETS", 4)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"worksheet count limit.*4"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        ("../chartsheets/sheet1.xml", "unsafe chartsheet relationship target"),
+        ("/etc/passwd", "unsafe chartsheet relationship target"),
+    ],
+    ids=("traversal", "absolute-outside-xl"),
+)
+def test_preflight_rejects_unsafe_chartsheet_target_before_openpyxl(
+    api, fixture_path, monkeypatch, target, message
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/_rels/workbook.xml.rels",
+        lambda data: data.replace(
+            b'Target="/xl/chartsheets/sheet1.xml"',
+            f'Target="{target}"'.encode(),
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=message):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_external_chartsheet_target_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/_rels/workbook.xml.rels",
+        lambda data: data.replace(
+            b'Target="/xl/chartsheets/sheet1.xml"',
+            b'Target="https://example.test/chart.xml" TargetMode="External"',
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"external chartsheet relationship",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_chartsheet_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    _remove_zip_member(fixture_path, "xl/chartsheets/sheet1.xml")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Chartsheet XML is missing"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_chartsheet_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/chartsheets/sheet1.xml",
+        lambda data: data[:-1],
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Chartsheet XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_oversized_chartsheet_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_chartsheet(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_RELATED_XML_BYTES", 1)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"chartsheet XML size limit.*1"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_worksheet_relationships_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data[:-1],
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Worksheet relationships XML is malformed",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["../../../outside.xml", "../../xl/comments/comment1.xml"],
+    ids=("outside-root", "escape-and-return"),
+)
+def test_preflight_rejects_unsafe_worksheet_relationship_target_before_openpyxl(
+    api, fixture_path, monkeypatch, target
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda data: data.replace(
+            b'Target="/xl/comments/comment1.xml"',
+            f'Target="{target}"'.encode(),
+            1,
+        ),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"unsafe worksheet relationship target",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_comment_part_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    _remove_zip_member(fixture_path, "xl/comments/comment1.xml")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Comment XML is missing"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_missing_eager_drawing_part_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    source = workbook[REGULAR_SHEET]
+    chart = BarChart()
+    chart.add_data(Reference(source, min_col=1, min_row=1, max_row=2))
+    source.add_chart(chart, "A10")
+    workbook.save(fixture_path)
+    workbook.close()
+    _remove_zip_member(fixture_path, "xl/drawings/drawing1.xml")
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"Worksheet related XML is missing",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+@pytest.mark.parametrize(
+    ("reference", "message"),
+    [
+        ("A20001", r"preflight row limit.*20000"),
+        ("SS1", r"preflight column limit.*512"),
+        ("A1:B2", r"invalid cell reference"),
+    ],
+    ids=("row", "column", "range"),
+)
+def test_preflight_rejects_invalid_comment_reference_before_openpyxl(
+    api, fixture_path, monkeypatch, reference, message
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/comments/comment1.xml",
+        lambda data: data.replace(b'ref="A1"', f'ref="{reference}"'.encode(), 1),
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=message):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_out_of_bounds_comment_on_irrelevant_sheet(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook.create_sheet("Irrelevant")["A20001"].comment = Comment("note", "author")
+    workbook.save(fixture_path)
+    workbook.close()
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"preflight row limit.*20000"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_rejects_malformed_comment_xml_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/comments/comment1.xml",
+        lambda data: data[:-1],
+    )
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"Comment XML is malformed"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_charges_duplicate_comments_to_sheet_budget_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    _rewrite_zip_member(
+        fixture_path,
+        "xl/comments/comment1.xml",
+        lambda data: data.replace(
+            b"</commentList>",
+            b'<comment ref="A1" authorId="0"><text><t>duplicate</t></text></comment>'
+            b"</commentList>",
+        ),
+    )
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_WORKSHEET_CELLS", 84)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"cell materialization limit.*84",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_charges_comments_to_workbook_budget_before_openpyxl(
+    api, fixture_path, monkeypatch
+):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+    monkeypatch.setattr(parser_module, "MAX_PREFLIGHT_TOTAL_CELLS", 123)
+    monkeypatch.setattr(parser_module, "load_workbook", _fail_if_openpyxl_loads)
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError,
+        match=r"workbook cell materialization limit.*123",
+    ):
+        parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+
+def test_preflight_accepts_normal_comment(api, fixture_path):
+    parser_module, _, _ = api
+    _add_comment(fixture_path)
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
+
+
+def test_preflight_accepts_external_hyperlink_relationship(api, fixture_path):
+    parser_module, _, _ = api
+    workbook = load_workbook(fixture_path)
+    workbook[REGULAR_SHEET]["A1"].hyperlink = "https://example.test/report"
+    workbook.save(fixture_path)
+    workbook.close()
+
+    rows = parser_module.HwaseongWorkbookParser().parse(fixture_path, "2026-08")
+
+    assert len(rows) == 5
 
 
 def test_parser_caps_total_entries_across_workbook(

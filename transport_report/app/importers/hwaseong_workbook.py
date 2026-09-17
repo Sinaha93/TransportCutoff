@@ -45,6 +45,7 @@ MAX_PARSED_ENTRIES = 20_000
 # OpenPyXL creates a MergedCell object for each covered coordinate.
 MAX_PREFLIGHT_WORKSHEETS = 256
 MAX_PREFLIGHT_WORKSHEET_XML_BYTES = 8 * 1024 * 1024
+MAX_PREFLIGHT_RELATED_XML_BYTES = 8 * 1024 * 1024
 MAX_PREFLIGHT_WORKSHEET_CELLS = 50_000
 MAX_PREFLIGHT_TOTAL_CELLS = 100_000
 MAX_PREFLIGHT_ROWS = 20_000
@@ -61,6 +62,18 @@ MAX_TRIP_COUNT_CANONICAL_LENGTH = 16
 _CELL_REFERENCE = re.compile(r"^(?P<column>[A-Za-z]+)(?P<row>[1-9][0-9]*)$")
 _DOCUMENT_RELATIONSHIP_ID = (
     "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+)
+_COMMENTS_RELATIONSHIP = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+)
+_OPENPYXL_EAGER_SHEET_RELATIONSHIPS = {
+    _COMMENTS_RELATIONSHIP,
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
+}
+_HYPERLINK_RELATIONSHIP = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
 )
 
 
@@ -518,12 +531,23 @@ def _preflight_workbook_resources(path: Path) -> None:
     try:
         with ZipFile(path, "r") as archive:
             sheet_refs = _read_workbook_sheet_refs(archive)
-            worksheet_members = _resolve_worksheet_members(archive, sheet_refs)
+            worksheet_members, chartsheet_members = _resolve_sheet_members(
+                archive, sheet_refs
+            )
+            for sheet_name, member_name in chartsheet_members:
+                _preflight_chartsheet_xml(archive, sheet_name, member_name)
             total_cells = 0
             total_materialized_cells = 0
             for sheet_name, member_name in worksheet_members:
                 cell_count, materialized_cell_count = _preflight_worksheet_xml(
                     archive, sheet_name, member_name
+                )
+                comment_count = _preflight_worksheet_relationships(
+                    archive, sheet_name, member_name
+                )
+                materialized_cell_count += comment_count
+                _validate_materialized_cell_count(
+                    sheet_name, materialized_cell_count
                 )
                 total_cells += cell_count
                 if total_cells > MAX_PREFLIGHT_TOTAL_CELLS:
@@ -572,9 +596,9 @@ def _read_workbook_sheet_refs(archive: ZipFile) -> list[tuple[str, str]]:
     return refs
 
 
-def _resolve_worksheet_members(
+def _resolve_sheet_members(
     archive: ZipFile, sheet_refs: list[tuple[str, str]]
-) -> list[tuple[str, str]]:
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     wanted_ids = {relationship_id for _, relationship_id in sheet_refs}
     relationships: dict[str, tuple[str, str, str | None]] = {}
     try:
@@ -600,7 +624,8 @@ def _resolve_worksheet_members(
             "Workbook relationships XML is malformed"
         ) from error
 
-    result: list[tuple[str, str]] = []
+    worksheets: list[tuple[str, str]] = []
+    chartsheets: list[tuple[str, str]] = []
     for sheet_name, relationship_id in sheet_refs:
         relationship = relationships.get(relationship_id)
         if relationship is None:
@@ -608,36 +633,265 @@ def _resolve_worksheet_members(
                 f"Workbook sheet {sheet_name} has no relationship"
             )
         relationship_type, target, target_mode = relationship
+        # OpenPyXL treats every workbook sheet relationship except a chartsheet
+        # as a worksheet and eagerly parses its target.
+        if "chartsheet" in relationship_type:
+            if target_mode == "External":
+                raise WorkbookStructureError(
+                    f"Workbook sheet {sheet_name} has an external chartsheet relationship"
+                )
+            chartsheets.append(
+                (sheet_name, _safe_sheet_member(sheet_name, target, "chartsheets"))
+            )
+            continue
         if target_mode == "External":
             raise WorkbookStructureError(
                 f"Workbook sheet {sheet_name} has an external worksheet relationship"
             )
-        # OpenPyXL treats every workbook sheet relationship except a chartsheet
-        # as a worksheet and eagerly parses its target.
-        if "chartsheet" in relationship_type:
-            continue
-        result.append((sheet_name, _safe_worksheet_member(sheet_name, target)))
-    return result
+        worksheets.append(
+            (sheet_name, _safe_sheet_member(sheet_name, target, "worksheets"))
+        )
+    return worksheets, chartsheets
 
 
-def _safe_worksheet_member(sheet_name: str, target: str) -> str:
-    if not target or "\\" in target or "\x00" in target:
+def _safe_sheet_member(sheet_name: str, target: str, sheet_kind: str) -> str:
+    if (
+        not target
+        or "\\" in target
+        or "\x00" in target
+        or ":" in target
+        or "?" in target
+        or "#" in target
+    ):
         raise WorkbookStructureError(
-            f"Workbook sheet {sheet_name} has an unsafe worksheet relationship target"
+            f"Workbook sheet {sheet_name} has an unsafe {sheet_kind[:-1]} "
+            "relationship target"
         )
     target_path = PurePosixPath(target)
     if ".." in target_path.parts:
         raise WorkbookStructureError(
-            f"Workbook sheet {sheet_name} has an unsafe worksheet relationship target"
+            f"Workbook sheet {sheet_name} has an unsafe {sheet_kind[:-1]} "
+            "relationship target"
         )
     candidate = target[1:] if target.startswith("/") else posix_join("xl", target)
     member_name = posix_normpath(candidate)
     parts = PurePosixPath(member_name).parts
-    if len(parts) < 3 or parts[:2] != ("xl", "worksheets"):
+    if len(parts) < 3 or parts[:2] != ("xl", sheet_kind):
         raise WorkbookStructureError(
-            f"Workbook sheet {sheet_name} has an unsafe worksheet relationship target"
+            f"Workbook sheet {sheet_name} has an unsafe {sheet_kind[:-1]} "
+            "relationship target"
         )
     return member_name
+
+
+class _SizeLimitedReader:
+    def __init__(self, source, limit: int, description: str) -> None:
+        self._source = source
+        self._limit = limit
+        self._description = description
+        self._bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._source.read(size)
+        self._bytes_read += len(chunk)
+        if self._bytes_read > self._limit:
+            raise WorkbookStructureError(
+                f"{self._description} exceeds XML size limit of {self._limit}"
+            )
+        return chunk
+
+
+def _preflight_chartsheet_xml(
+    archive: ZipFile, sheet_name: str, member_name: str
+) -> None:
+    member = _required_xml_member(
+        archive, member_name, f"Chartsheet XML is missing for {sheet_name}"
+    )
+    if member.file_size > MAX_PREFLIGHT_RELATED_XML_BYTES:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds chartsheet XML size limit of "
+            f"{MAX_PREFLIGHT_RELATED_XML_BYTES}"
+        )
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source,
+                MAX_PREFLIGHT_RELATED_XML_BYTES,
+                f"{sheet_name} chartsheet",
+            )
+            for _, element in iterparse(limited_source, events=("end",)):
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Chartsheet XML is malformed for {sheet_name}"
+        ) from error
+
+
+def _preflight_worksheet_relationships(
+    archive: ZipFile, sheet_name: str, worksheet_member: str
+) -> int:
+    worksheet_path = PurePosixPath(worksheet_member)
+    relationships_member = str(
+        worksheet_path.parent
+        / "_rels"
+        / f"{worksheet_path.name}.rels"
+    )
+    try:
+        member = archive.getinfo(relationships_member)
+    except KeyError:
+        return 0
+    if member.is_dir():
+        raise WorkbookStructureError(
+            f"Worksheet relationships XML is invalid for {sheet_name}"
+        )
+    if member.file_size > MAX_PREFLIGHT_RELATED_XML_BYTES:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds worksheet relationships XML size limit of "
+            f"{MAX_PREFLIGHT_RELATED_XML_BYTES}"
+        )
+
+    relationships: list[tuple[str, str, str | None]] = []
+    relationship_ids: set[str] = set()
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source,
+                MAX_PREFLIGHT_RELATED_XML_BYTES,
+                f"{sheet_name} worksheet relationships",
+            )
+            for _, element in iterparse(limited_source, events=("end",)):
+                if _xml_local_name(element.tag) == "Relationship":
+                    relationship_id = element.attrib.get("Id")
+                    if not relationship_id or relationship_id in relationship_ids:
+                        raise WorkbookStructureError(
+                            f"Worksheet relationships are invalid for {sheet_name}"
+                        )
+                    relationship_ids.add(relationship_id)
+                    relationships.append(
+                        (
+                            element.attrib.get("Type", ""),
+                            element.attrib.get("Target", ""),
+                            element.attrib.get("TargetMode"),
+                        )
+                    )
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Worksheet relationships XML is malformed for {sheet_name}"
+        ) from error
+
+    comment_count = 0
+    for relationship_type, target, target_mode in relationships:
+        if target_mode == "External":
+            if relationship_type != _HYPERLINK_RELATIONSHIP:
+                raise WorkbookStructureError(
+                    f"{sheet_name} has an unsupported external worksheet relationship"
+                )
+            continue
+
+        target_member = _safe_worksheet_related_member(
+            sheet_name, worksheet_member, target
+        )
+        if relationship_type not in _OPENPYXL_EAGER_SHEET_RELATIONSHIPS:
+            continue
+        if relationship_type == _COMMENTS_RELATIONSHIP:
+            parts = PurePosixPath(target_member).parts
+            if len(parts) < 3 or parts[:2] != ("xl", "comments"):
+                raise WorkbookStructureError(
+                    f"{sheet_name} has an unsafe comment relationship target"
+                )
+            related_member = _required_xml_member(
+                archive,
+                target_member,
+                f"Comment XML is missing for {sheet_name}",
+            )
+            comment_count += _preflight_comment_xml(
+                archive, sheet_name, related_member
+            )
+            continue
+        _required_xml_member(
+            archive,
+            target_member,
+            f"Worksheet related XML is missing for {sheet_name}",
+        )
+        # Tables, drawings, and pivot definitions do not create worksheet cells.
+        # Their direct parts and targets are checked here; the import service's
+        # ZIP member and aggregate limits bound their remaining object graphs.
+    return comment_count
+
+
+def _safe_worksheet_related_member(
+    sheet_name: str, worksheet_member: str, target: str
+) -> str:
+    if (
+        not target
+        or "\\" in target
+        or "\x00" in target
+        or ":" in target
+        or "?" in target
+        or "#" in target
+    ):
+        raise WorkbookStructureError(
+            f"{sheet_name} has an unsafe worksheet relationship target"
+        )
+    parts = [] if target.startswith("/") else list(
+        PurePosixPath(worksheet_member).parent.parts
+    )
+    for part in PurePosixPath(target).parts:
+        if part in ("/", "."):
+            continue
+        if part == "..":
+            if len(parts) <= 1:
+                raise WorkbookStructureError(
+                    f"{sheet_name} has an unsafe worksheet relationship target"
+                )
+            parts.pop()
+            continue
+        parts.append(part)
+    if len(parts) < 2 or parts[0] != "xl":
+        raise WorkbookStructureError(
+            f"{sheet_name} has an unsafe worksheet relationship target"
+        )
+    return "/".join(parts)
+
+
+def _required_xml_member(archive: ZipFile, member_name: str, message: str):
+    try:
+        member = archive.getinfo(member_name)
+    except KeyError as error:
+        raise WorkbookStructureError(message) from error
+    if member.is_dir():
+        raise WorkbookStructureError(message)
+    return member
+
+
+def _preflight_comment_xml(archive: ZipFile, sheet_name: str, member) -> int:
+    if member.file_size > MAX_PREFLIGHT_RELATED_XML_BYTES:
+        raise WorkbookStructureError(
+            f"{sheet_name} exceeds comment XML size limit of "
+            f"{MAX_PREFLIGHT_RELATED_XML_BYTES}"
+        )
+    comment_count = 0
+    try:
+        with archive.open(member) as source:
+            limited_source = _SizeLimitedReader(
+                source,
+                MAX_PREFLIGHT_RELATED_XML_BYTES,
+                f"{sheet_name} comment",
+            )
+            for _, element in iterparse(limited_source, events=("end",)):
+                if _xml_local_name(element.tag) == "comment":
+                    comment_count += 1
+                    _validate_materialized_cell_count(sheet_name, comment_count)
+                    _validate_preflight_cell_reference(
+                        element.attrib.get("ref"), sheet_name
+                    )
+                element.clear()
+    except ParseError as error:
+        raise WorkbookStructureError(
+            f"Comment XML is malformed for {sheet_name}"
+        ) from error
+    return comment_count
 
 
 def _preflight_worksheet_xml(
