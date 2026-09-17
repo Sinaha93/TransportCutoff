@@ -737,6 +737,34 @@ def test_parser_skips_pre_numbered_blank_subcontract_template_rows(
     assert len(rows) == 5
 
 
+def test_parser_rejects_pre_total_numbered_subcontract_row_with_uncached_formula(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "pre-total-uncached-formula.xlsx",
+        include_subcontract_pre_total_uncached_formula_row=True,
+    )
+
+    with pytest.raises(parser_module.WorkbookStructureError, match=r"row 4.*date"):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
+def test_parser_rejects_post_total_numbered_subcontract_row_with_uncached_formula(
+    api, tmp_path
+):
+    parser_module, _, _ = api
+    path = build_structural_clone_fixture(
+        tmp_path / "post-total-uncached-formula.xlsx",
+        include_subcontract_post_total_uncached_formula_row=True,
+    )
+
+    with pytest.raises(
+        parser_module.WorkbookStructureError, match=r"row 5.*detail after.*total"
+    ):
+        parser_module.HwaseongWorkbookParser().parse(path, "2026-08")
+
+
 @pytest.mark.parametrize(
     ("column", "value", "message"),
     [(1, None, "date"), (9, None, "amount"), (9, "invalid", "amount")],

@@ -417,7 +417,11 @@ class HwaseongWorkbookParser:
             ):
                 continue
             if _is_subcontract_template_row(
-                sheet, row_number, number_column, last_footprint_column
+                sheet,
+                formula_sheet,
+                row_number,
+                number_column,
+                last_footprint_column,
             ):
                 continue
             if displayed_total_found:
@@ -625,6 +629,7 @@ def _is_regular_footer_or_note(
 
 def _is_subcontract_template_row(
     sheet,
+    formula_sheet,
     row_number: int,
     number_column: int | None,
     last_footprint_column: int,
@@ -632,7 +637,8 @@ def _is_subcontract_template_row(
     if number_column is None:
         return False
     return _has_value(sheet.cell(row_number, number_column).value) and not any(
-        _has_value(sheet.cell(row_number, column).value)
+        _has_value(workbook_sheet.cell(row_number, column).value)
+        for workbook_sheet in (sheet, formula_sheet)
         for column in range(1, last_footprint_column + 1)
         if column != number_column
     )
