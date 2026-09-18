@@ -47,6 +47,13 @@ class CalculationKind(Enum):
     GRAND_TOTAL = "grand_total"
 
 
+class HistoricalValueKind(Enum):
+    """Validation domain for values supplied to :func:`historical_averages`."""
+
+    QUANTITY = "quantity"
+    MONEY = "money"
+
+
 @dataclass(frozen=True, slots=True)
 class DestinationProvenance:
     destination_id: int | None
@@ -421,22 +428,35 @@ def calculate_group(
 
 
 def historical_averages(
-    report_month: str, monthly_values: Mapping[str, Decimal | None]
+    report_month: str,
+    monthly_values: Mapping[str, Decimal | int | None],
+    *,
+    value_kind: HistoricalValueKind = HistoricalValueKind.QUANTITY,
 ) -> HistoricalAverages:
     """Calculate complete prior-month windows and the prior calendar year.
 
     A missing key and an explicit ``None`` both mark an incomplete period. No
     average is returned until every expected calendar month is present.
+    ``QUANTITY`` is the backward-compatible default and enforces the EA domain;
+    ``MONEY`` accepts only nonnegative integral won within SQLite's integer
+    range. Averages are Decimal values and may be fractional for either kind.
     """
     report_year, _ = _parse_month(report_month, "report_month")
-    _validate_monthly_values(monthly_values)
+    _validate_monthly_values(monthly_values, value_kind)
     return HistoricalAverages(
-        three_month=_average_for_months(monthly_values, _prior_months(report_month, 3)),
-        six_month=_average_for_months(monthly_values, _prior_months(report_month, 6)),
-        twelve_month=_average_for_months(monthly_values, _prior_months(report_month, 12)),
+        three_month=_average_for_months(
+            monthly_values, _prior_months(report_month, 3), value_kind
+        ),
+        six_month=_average_for_months(
+            monthly_values, _prior_months(report_month, 6), value_kind
+        ),
+        twelve_month=_average_for_months(
+            monthly_values, _prior_months(report_month, 12), value_kind
+        ),
         comparison_year=_average_for_months(
             monthly_values,
             tuple(f"{report_year - 1:04d}-{month:02d}" for month in range(1, 13)),
+            value_kind,
         ),
     )
 
@@ -466,7 +486,7 @@ def select_unit_cost_reviews(
                     message="Unit cost or its plan variance is unavailable.",
                 )
             )
-        elif _meets_unit_cost_review_threshold(candidate.calculation, threshold):
+        elif value <= threshold.copy_negate() or value >= threshold:
             automatic.append(
                 ReviewItem(
                     destination_id=candidate.destination_id,
@@ -476,44 +496,6 @@ def select_unit_cost_reviews(
                 )
             )
     return ReviewSelection(tuple(automatic), tuple(validation))
-
-
-def _meets_unit_cost_review_threshold(
-    calculation: DestinationCalculation, threshold: Decimal
-) -> bool:
-    planned_cost_won = calculation.planned_cost_won
-    planned_quantity = calculation.planned_quantity
-    actual_cost_won = calculation.actual_cost_won
-    actual_quantity = calculation.actual_quantity
-    if (
-        planned_cost_won is None
-        or planned_quantity is None
-        or actual_cost_won is None
-        or actual_quantity is None
-        or planned_cost_won == 0
-        or planned_quantity == 0
-        or actual_quantity == 0
-    ):
-        return False
-    planned_cross_product = _decimal_result(
-        "unit cost review threshold",
-        lambda: Decimal(planned_cost_won) * actual_quantity,
-    )
-    variance_cross_product = _decimal_result(
-        "unit cost review threshold",
-        lambda: (
-            Decimal(actual_cost_won) * planned_quantity
-            - planned_cross_product
-        ),
-    )
-    threshold_cross_product = _decimal_result(
-        "unit cost review threshold",
-        lambda: threshold * planned_cross_product,
-    )
-    return (
-        variance_cross_product <= threshold_cross_product.copy_negate()
-        or variance_cross_product >= threshold_cross_product
-    )
 
 
 def _make_calculation(
@@ -609,8 +591,11 @@ def _calculated_fields(
             None if planned_cost_won is None else Decimal(planned_cost_won),
         ),
         "actual_unit_cost_variance": unit_difference,
-        "actual_unit_cost_variance_pct": _optional_variance_pct(
-            actual_unit_raw, planned_unit_raw
+        "actual_unit_cost_variance_pct": _optional_unit_cost_variance_pct(
+            planned_cost_won,
+            planned_quantity,
+            actual_cost_won,
+            actual_quantity,
         ),
     }
 
@@ -629,6 +614,33 @@ def _optional_raw_unit_cost(
     if cost_won is None or quantity_ea is None:
         return None
     return _raw_unit_cost(cost_won, quantity_ea)
+
+
+def _optional_unit_cost_variance_pct(
+    planned_cost_won: int | None,
+    planned_quantity: Decimal | None,
+    actual_cost_won: int | None,
+    actual_quantity: Decimal | None,
+) -> Decimal | None:
+    if (
+        planned_cost_won is None
+        or planned_quantity is None
+        or actual_cost_won is None
+        or actual_quantity is None
+        or planned_cost_won == 0
+        or planned_quantity == 0
+        or actual_quantity == 0
+    ):
+        return None
+
+    def calculate() -> Decimal:
+        planned_cross_product = Decimal(planned_cost_won) * actual_quantity
+        return (
+            Decimal(actual_cost_won) * planned_quantity
+            - planned_cross_product
+        ) / planned_cross_product
+
+    return _decimal_result("actual_unit_cost_variance_pct", calculate)
 
 
 def _decimal_result(field: str, operation: Callable[[], Decimal]) -> Decimal:
@@ -789,7 +801,9 @@ def _validate_group_rules(
 
 
 def _average_for_months(
-    monthly_values: Mapping[str, Decimal | None], expected_months: tuple[str, ...]
+    monthly_values: Mapping[str, Decimal | int | None],
+    expected_months: tuple[str, ...],
+    value_kind: HistoricalValueKind,
 ) -> AverageResult:
     missing = tuple(month for month in expected_months if monthly_values.get(month) is None)
     if missing:
@@ -803,7 +817,7 @@ def _average_for_months(
     average = _decimal_result(
         "historical average", lambda: total / Decimal(len(expected_months))
     )
-    _require_nonnegative_decimal_bound(average, "historical average")
+    _require_historical_average(average, value_kind)
     return AverageResult(expected_months, (), average, True)
 
 
@@ -831,13 +845,21 @@ def _parse_month(value: object, field: str) -> tuple[int, int]:
     return year, month
 
 
-def _validate_monthly_values(values: Mapping[str, Decimal | None]) -> None:
+def _validate_monthly_values(
+    values: Mapping[str, Decimal | int | None], value_kind: HistoricalValueKind
+) -> None:
+    if not isinstance(value_kind, HistoricalValueKind):
+        raise ValueError("value_kind must be a HistoricalValueKind")
     if not isinstance(values, Mapping):
         raise ValueError("monthly_values must be a mapping")
     for month, value in values.items():
         _parse_month(month, "monthly_values month")
-        if value is not None:
+        if value is None:
+            continue
+        if value_kind is HistoricalValueKind.QUANTITY:
             _require_quantity(value, f"monthly_values[{month}]")
+        else:
+            _require_money(value, f"monthly_values[{month}]")
 
 
 def _validate_period_inputs(
@@ -985,10 +1007,37 @@ def _require_quantity(value: object, field: str) -> None:
         )
 
 
-def _require_nonnegative_decimal_bound(value: object, field: str) -> None:
+def _require_money(value: object, field: str) -> None:
+    if isinstance(value, bool):
+        valid = False
+    elif isinstance(value, int):
+        valid = 0 <= value <= MAX_SQLITE_INTEGER
+    elif isinstance(value, Decimal) and value.is_finite():
+        valid = (
+            value == value.to_integral_value()
+            and Decimal(0) <= value <= Decimal(MAX_SQLITE_INTEGER)
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError(
+            f"{field} must be a nonnegative integral won amount no greater than "
+            f"{MAX_SQLITE_INTEGER}"
+        )
+
+
+def _require_historical_average(
+    value: object, value_kind: HistoricalValueKind
+) -> None:
+    field = "historical average"
     _require_nonnegative_decimal(value, field)
-    if value > MAX_QUANTITY_EA:
-        raise ValueError(f"{field} must be no greater than {MAX_QUANTITY_EA}")
+    maximum = (
+        MAX_QUANTITY_EA
+        if value_kind is HistoricalValueKind.QUANTITY
+        else Decimal(MAX_SQLITE_INTEGER)
+    )
+    if value > maximum:
+        raise ValueError(f"{field} must be no greater than {maximum}")
 
 
 def _effective_decimal_places(value: Decimal) -> int:

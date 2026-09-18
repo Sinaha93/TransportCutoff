@@ -6,6 +6,28 @@ import pytest
 from app.domain.models import Destination, GroupMember
 
 
+_CALCULATION_VALUE_FIELDS = (
+    "planned_quantity",
+    "planned_cost_won",
+    "actual_quantity",
+    "actual_cost_won",
+    "planned_unit_cost",
+    "actual_unit_cost",
+    "quantity_variance",
+    "quantity_variance_pct",
+    "cost_variance_won",
+    "cost_variance_pct",
+    "actual_unit_cost_variance",
+    "actual_unit_cost_variance_pct",
+)
+
+
+def _calculation_values(calculation):
+    return {
+        field: getattr(calculation, field) for field in _CALCULATION_VALUE_FIELDS
+    }
+
+
 def test_unit_transport_cost_is_cost_divided_by_quantity():
     from app.domain.calculations import calculate_destination
 
@@ -244,6 +266,60 @@ def test_history_treats_explicit_zero_as_present():
     assert result.three_month.value == Decimal("0")
 
 
+def test_history_money_accepts_large_won_values_and_fractional_averages():
+    from app.domain.calculations import (
+        CALCULATION_PRECISION,
+        HistoricalValueKind,
+        historical_averages,
+    )
+
+    values = {
+        f"2025-{month:02d}": 3_400_000_000 for month in range(1, 13)
+    }
+    values["2025-12"] = Decimal("3400000001")
+
+    result = historical_averages(
+        "2026-01", values, value_kind=HistoricalValueKind.MONEY
+    )
+
+    with localcontext() as context:
+        context.prec = CALCULATION_PRECISION
+        expected = Decimal("10200000001") / Decimal("3")
+    assert result.three_month.value == expected
+    assert result.comparison_year.complete is True
+
+
+def test_history_money_accepts_sqlite_maximum_and_rejects_invalid_won_values():
+    from app.domain.calculations import (
+        HistoricalValueKind,
+        MAX_SQLITE_INTEGER,
+        historical_averages,
+    )
+
+    boundary = {
+        f"2025-{month:02d}": MAX_SQLITE_INTEGER for month in range(1, 13)
+    }
+    result = historical_averages(
+        "2026-01", boundary, value_kind=HistoricalValueKind.MONEY
+    )
+    assert result.three_month.value == Decimal(MAX_SQLITE_INTEGER)
+
+    for invalid in (True, Decimal("1.5"), -1, MAX_SQLITE_INTEGER + 1):
+        with pytest.raises(ValueError, match="monthly_values.*integral won"):
+            historical_averages(
+                "2026-01",
+                {"2025-12": invalid},
+                value_kind=HistoricalValueKind.MONEY,
+            )
+
+
+def test_history_requires_an_explicit_supported_value_kind():
+    from app.domain.calculations import historical_averages
+
+    with pytest.raises(ValueError, match="value_kind"):
+        historical_averages("2026-01", {}, value_kind="money")
+
+
 def test_review_selector_includes_exact_thresholds_and_orders_deterministically():
     from app.domain.calculations import (
         ReviewCandidate,
@@ -357,18 +433,26 @@ def test_review_thresholds_follow_unrounded_workbook_values(
 
 
 @pytest.mark.parametrize(
-    ("planned_cost_won", "planned_quantity", "actual_cost_won", "actual_quantity"),
+    (
+        "planned_cost_won",
+        "planned_quantity",
+        "actual_cost_won",
+        "actual_quantity",
+        "expected_pct",
+    ),
     [
-        (5, Decimal("7"), 17, Decimal("28")),
-        (1, Decimal("23"), 1, Decimal("20")),
+        (5, Decimal("7"), 17, Decimal("28"), Decimal("-0.15")),
+        (1, Decimal("23"), 1, Decimal("20"), Decimal("0.15")),
     ],
 )
 def test_review_thresholds_include_exact_ratios_with_repeating_unit_costs(
-    planned_cost_won, planned_quantity, actual_cost_won, actual_quantity
+    planned_cost_won,
+    planned_quantity,
+    actual_cost_won,
+    actual_quantity,
+    expected_pct,
 ):
     from app.domain.calculations import (
-        CALCULATION_PRECISION,
-        DEFAULT_REVIEW_THRESHOLD,
         ReviewCandidate,
         calculate_destination,
         select_unit_cost_reviews,
@@ -385,11 +469,8 @@ def test_review_thresholds_include_exact_ratios_with_repeating_unit_costs(
         [ReviewCandidate(1, "Repeating exact boundary", 1, calculation)]
     )
 
-    with localcontext() as context:
-        context.prec = CALCULATION_PRECISION
-        stored_magnitude = abs(calculation.actual_unit_cost_variance_pct)
-    assert stored_magnitude < DEFAULT_REVIEW_THRESHOLD
-    assert len(result.automatic_items) == 1
+    assert calculation.actual_unit_cost_variance_pct == expected_pct
+    assert result.automatic_items[0].variance_pct == expected_pct
 
 
 def test_negative_review_boundary_ignores_ambient_decimal_context():
@@ -417,7 +498,7 @@ def test_negative_review_boundary_ignores_ambient_decimal_context():
     assert len(result.automatic_items) == 1
 
 
-def test_unit_cost_variance_percentage_preserves_workbook_formula_chain():
+def test_unit_cost_variance_percentage_uses_direct_source_formula():
     from app.domain.calculations import CALCULATION_PRECISION, calculate_destination
 
     planned_cost_won = 7_921_731_534
@@ -426,9 +507,11 @@ def test_unit_cost_variance_percentage_preserves_workbook_formula_chain():
     actual_quantity = Decimal("6862.2132")
     with localcontext() as context:
         context.prec = CALCULATION_PRECISION
-        planned_raw = Decimal(planned_cost_won) / planned_quantity
-        actual_raw = Decimal(actual_cost_won) / actual_quantity
-        expected = (actual_raw - planned_raw) / planned_raw
+        planned_cross_product = Decimal(planned_cost_won) * actual_quantity
+        expected = (
+            Decimal(actual_cost_won) * planned_quantity
+            - planned_cross_product
+        ) / planned_cross_product
 
     calculation = calculate_destination(
         planned_quantity,
@@ -662,12 +745,13 @@ def test_decimal_arithmetic_errors_are_translated_to_domain_errors():
     ],
 )
 def test_result_records_reject_invalid_numeric_fields(changes, message):
-    from app.domain.calculations import calculate_destination
+    from app.domain.calculations import DestinationResult, calculate_destination
 
     valid = calculate_destination(Decimal("1"), 100, Decimal("1"), 100)
+    values = {**_calculation_values(valid), **changes}
 
-    with pytest.raises(TypeError, match="public factory"):
-        replace(valid, **changes)
+    with pytest.raises(ValueError, match=message):
+        DestinationResult._create(destination_id=None, values=values)
 
 
 @pytest.mark.parametrize(
@@ -688,14 +772,24 @@ def test_result_records_reject_invalid_numeric_fields(changes, message):
     ],
 )
 def test_result_records_reject_forged_calculated_fields(changes, message):
-    from app.domain.calculations import calculate_destination
+    from app.domain.calculations import DestinationResult, calculate_destination
 
     valid = calculate_destination(
         Decimal("10"), 100, Decimal("20"), 240, destination_id=1
     )
+    values = {**_calculation_values(valid), **changes}
+
+    with pytest.raises(ValueError, match=message):
+        DestinationResult._create(destination_id=1, values=values)
+
+
+def test_result_records_cannot_be_replaced_through_dataclass_constructor():
+    from app.domain.calculations import calculate_destination
+
+    valid = calculate_destination(Decimal("1"), 100, Decimal("1"), 100)
 
     with pytest.raises(TypeError, match="public factory"):
-        replace(valid, **changes)
+        replace(valid, planned_cost_won=101)
 
 
 def test_result_records_reject_kind_relabeling_without_matching_provenance():
