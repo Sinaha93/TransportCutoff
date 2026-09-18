@@ -1,6 +1,7 @@
 *.xlsx
 *.xls
 *.pptx
+!transport_report/assets/report_template.pptx
 *.pdf
 transport_report/runtime/
 transport_report/dist/
