@@ -116,7 +116,7 @@ def generate_pptx(template: str | Path, report: PptReport, output: str | Path) -
     _different_paths(template, output)
     presentation = load_template(template)
     targets = validate_template(presentation)
-    _validate_report(report)
+    validate_ppt_report(report)
     _validate_review_fit(presentation, targets[2, 'report.review_table'], report)
     _write(targets[1, 'report.title'].text_frame, '26년 8월 화성공장 운반비 보고')
     _write(targets[2, 'report.title'].text_frame, '▣ 26년 8월 운반비 종합')
@@ -276,7 +276,8 @@ def _save_atomic(presentation, output, template):
         temporary.unlink(missing_ok=True)
 
 
-def _validate_report(report):
+def validate_ppt_report(report):
+    """Validate that *report* satisfies the canonical monthly PPT contract."""
     if not isinstance(report, PptReport) or report.report_month != '2026-08':
         raise ValueError('PPT generation supports only the August 2026 PptReport')
     if not isinstance(report.created_on, date):

@@ -23,36 +23,79 @@ ERROR_TOKENS = {
 }
 
 
+def test_ppt_report_preflight_is_public():
+    from app.reporting.pptx_report import validate_ppt_report
+
+    assert callable(validate_ppt_report)
+
+
 def _report_bundle():
-    from app.domain.calculations import calculate_destination, calculate_group, calculate_total
+    from app.domain.calculations import (
+        calculate_destination,
+        calculate_group,
+        calculate_total,
+        historical_averages,
+    )
     from app.domain.models import Destination, DestinationAlias, GroupMember, ReportGroup
-    from app.domain.validation import ValidationIssue, ValidationResult
+    from app.domain.validation import (
+        DestinationValidationInput,
+        ImportBatchInput,
+        NextMonthPlanInput,
+        ReportMonthSources,
+        SalesInput,
+        ValidationContext,
+    )
     from app.reporting.charts import ChartReport
     from app.reporting.pptx_report import PlanReport, PptReport, ReportRow, SalesReport
     from app.reporting.xlsx_review import (
         ImportBatchEvidence,
         OperationEvidence,
-        ReviewWorkbookReport,
+        ReviewWorkbookData,
     )
 
-    destinations = (
-        Destination(1, "가상동부", 1, True, True, "가상품 A", True, True, True),
-        Destination(2, "가상서부", 2, True, True, None, True, True, False),
+    destinations = tuple(
+        Destination(
+            destination_id,
+            f"가상납품처{destination_id:02d}",
+            destination_id,
+            True,
+            True,
+            f"가상품 {destination_id:02d}" if destination_id == 1 else None,
+            True,
+            True,
+            True,
+        )
+        for destination_id in range(1, 13)
     )
-    aliases = (
-        DestinationAlias(1, 1, "동부 원천", "transport"),
-        DestinationAlias(2, 2, "서부 원천", "transport"),
+    aliases = tuple(
+        DestinationAlias(
+            destination_id,
+            destination_id,
+            f"원천납품처{destination_id:02d}",
+            "transport",
+        )
+        for destination_id in range(1, 13)
     )
-    group = ReportGroup(10, "가상권역", 1, True)
+    groups = (
+        ReportGroup(10, "가상권역", 1, True),
+        ReportGroup(11, "빈 가상권역", 2, True),
+    )
     members = (
-        GroupMember(10, 1, "가상동부", 1, True, True),
-        GroupMember(10, 2, "가상서부", 2, True, False),
+        GroupMember(10, 1, "가상납품처01", 1, True, True),
+        GroupMember(10, 2, "가상납품처02", 2, True, False),
     )
     calculations = {
-        1: calculate_destination(Decimal("100"), 10_000, Decimal("120"), 13_200, destination_id=1),
-        2: calculate_destination(Decimal("50"), 5_000, Decimal("0"), 0, destination_id=2),
+        destination.id: calculate_destination(
+            Decimal(100 + destination.id),
+            (100 + destination.id) * 100,
+            Decimal(0 if destination.id == 2 else 120 + destination.id),
+            0 if destination.id == 2 else (120 + destination.id) * 110,
+            destination_id=destination.id,
+        )
+        for destination in destinations
     }
     group_calculation = calculate_group(calculations, members, group_id=10)
+    empty_group_calculation = calculate_group(calculations, (), group_id=11)
     total_calculation = calculate_total(calculations, destinations)
     months = tuple(f"2025-{month:02d}" for month in range(1, 13)) + tuple(
         f"2026-{month:02d}" for month in range(1, 9)
@@ -65,9 +108,12 @@ def _report_bundle():
         costs["2026-08"] = calculation.actual_cost_won
         return ReportRow(key, label, calculation, quantities, costs)
 
-    first = row("1", "가상동부", calculations[1])
-    second = row("2", "가상서부", calculations[2])
+    direct_rows = tuple(
+        row(str(destination.id), destination.name, calculations[destination.id])
+        for destination in destinations
+    )
     group_row = row("group:10", "가상권역", group_calculation)
+    empty_group_row = row("group:11", "빈 가상권역", empty_group_calculation)
     total_row = row("total", "합계", total_calculation)
     nonregular = row(
         "nonregular",
@@ -77,22 +123,46 @@ def _report_bundle():
     sales_history = {month: 1_000_000 for month in months}
     sales_history["2026-08"] = 1_200_000
     sales = SalesReport(1_100_000, 1_200_000, sales_history)
-    next_rows = (
-        replace(first, calculation=calculate_destination(Decimal("130"), 14_300, None, None, destination_id=1)),
-        replace(second, calculation=calculate_destination(Decimal("60"), 6_600, None, None, destination_id=2)),
+    next_rows = tuple(
+        replace(
+            direct_rows[destination.id - 1],
+            calculation=calculate_destination(
+                Decimal(130 + destination.id),
+                (130 + destination.id) * 110,
+                None,
+                None,
+                destination_id=destination.id,
+            ),
+        )
+        for destination in destinations
     )
-    next_total = calculate_total({1: next_rows[0].calculation, 2: next_rows[1].calculation}, destinations)
+    next_total = calculate_total(
+        {destination.id: next_rows[destination.id - 1].calculation for destination in destinations},
+        destinations,
+    )
     chart = ChartReport(
         "2026-08",
-        {month: Decimal("150") for month in months},
+        {
+            month: (
+                total_calculation.planned_quantity
+                if month == "2026-08"
+                else Decimal("150")
+            )
+            for month in months
+        },
         {month: total_row.quantity_by_month[month] for month in months},
-        {month: 15_000 for month in months},
+        {
+            month: (
+                total_calculation.planned_cost_won if month == "2026-08" else 15_000
+            )
+            for month in months
+        },
         {month: total_row.cost_won_by_month[month] for month in months},
     )
     report = PptReport(
         "2026-08",
         date(2026, 9, 2),
-        (first, second, group_row),
+        (*direct_rows, group_row, empty_group_row),
         nonregular,
         total_row,
         sales,
@@ -115,60 +185,97 @@ def _report_bundle():
         imported_at=datetime(2026, 9, 1, 8, 30, 15),
     )
     operations = (
-        OperationEvidence(
-            input_kind="imported",
-            batch_id=42,
-            provenance_id="transport:2026-08:42",
-            report_month="2026-08",
-            raw_destination="동부 원천",
-            destination_id=1,
-            normalized_destination="가상동부",
-            quantity_ea=Decimal("120"),
-            cost_won=13_200,
-            source_locator=r"D:\fictional\화성운반비내역(8월)!12",
+        *(
+            OperationEvidence(
+                record_kind="destination",
+                value_role="actual",
+                input_kind="manual" if destination.id == 2 else "imported",
+                batch_id=None if destination.id == 2 else 42,
+                provenance_id=(
+                    "monthly-actual:2026-08:2"
+                    if destination.id == 2
+                    else "transport:2026-08:42"
+                ),
+                report_month="2026-08",
+                raw_destination=(
+                    None if destination.id == 2 else f"원천납품처{destination.id:02d}"
+                ),
+                destination_id=destination.id,
+                normalized_destination=destination.name,
+                quantity_ea=calculations[destination.id].actual_quantity,
+                cost_won=calculations[destination.id].actual_cost_won,
+                source_locator=rf"D:\fictional\화성운반비내역(8월)!{11 + destination.id}",
+            )
+            for destination in destinations
         ),
         OperationEvidence(
+            record_kind="nonregular",
+            value_role="plan",
             input_kind="manual",
             batch_id=None,
-            provenance_id="monthly-actual:2026-08:2",
+            provenance_id="monthly-plan:2026-08:nonregular",
             report_month="2026-08",
             raw_destination=None,
-            destination_id=2,
-            normalized_destination="가상서부",
+            destination_id=None,
+            normalized_destination="비정규 운반비",
             quantity_ea=Decimal("0"),
-            cost_won=None,
-            source_locator="당월 실적 입력",
+            cost_won=0,
+            source_locator="당월 계획 입력",
         ),
         OperationEvidence(
+            record_kind="nonregular",
+            value_role="actual",
             input_kind="imported",
             batch_id=42,
             provenance_id="transport:2026-08:42",
             report_month="2026-08",
-            raw_destination="서부 원천",
-            destination_id=2,
-            normalized_destination="가상서부",
-            quantity_ea=None,
+            raw_destination="비정규 원천",
+            destination_id=None,
+            normalized_destination="비정규 운반비",
+            quantity_ea=Decimal("0"),
             cost_won=0,
-            source_locator="화성운반비내역(8월)!13",
+            source_locator=r"D:\fictional\화성운반비내역(8월)!99",
         ),
     )
-    validation = ValidationResult(
-        (
-            ValidationIssue(
-                code="CHECK_NOTE",
-                severity="warning",
-                message="가상 검토 메모입니다.",
-                destination_id=2,
-                source_locator="당월 실적 입력",
+    validation_context = ValidationContext(
+        report_month="2026-08",
+        sales=SalesInput(1_200_000, "2026-09-01", "월 매출 입력"),
+        prior_year_history=historical_averages(
+            "2026-08", total_row.quantity_by_month
+        ).comparison_year,
+        month_sources=ReportMonthSources(
+            "2026-08", "2026-08", "2026-08", "2026-08", "2026-08"
+        ),
+        destinations=tuple(
+            DestinationValidationInput(
+                destination.id,
+                destination.name,
+                destination.display_order,
+                destination.required_for_report,
+                calculations[destination.id].actual_quantity,
+                NextMonthPlanInput(
+                    "2026-09", next_rows[destination.id - 1].calculation.planned_quantity
+                ),
+            )
+            for destination in destinations
+        ),
+        current_import_batches=(
+            ImportBatchInput(
+                batch.batch_id,
+                batch.report_month,
+                batch.source_type,
+                batch.file_sha256,
+                batch.source_filename,
+                True,
             ),
-        )
+        ),
     )
-    return ReviewWorkbookReport(
+    return ReviewWorkbookData(
         report=report,
-        validation=validation,
+        validation_context=validation_context,
         destinations=destinations,
         aliases=aliases,
-        groups=(group,),
+        groups=groups,
         group_members=members,
         import_batches=(batch,),
         operations=operations,
@@ -212,12 +319,13 @@ def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_
     assert summary.cell(total_row, 8).value == total.actual_cost_won
     assert summary.cell(total_row, 6).data_type == "n"
     assert summary.cell(total_row, 6).number_format == "0.0%"
-    zero_row = _find_row(summary, "가상서부")
+    zero_row = _find_row(summary, "가상납품처02")
     assert summary.cell(zero_row, 4).value == 0
     assert summary.cell(zero_row, 12).value is None
     assert summary.cell(zero_row, 14).value is None
     assert summary.cell(zero_row, 4).fill.fgColor.rgb == summary.cell(zero_row, 3).fill.fgColor.rgb
-    assert summary.cell(zero_row, 8).fill.fgColor.rgb == summary.cell(9, 8).fill.fgColor.rgb
+    assert summary.cell(zero_row, 8).fill.fgColor.rgb == summary.cell(zero_row, 7).fill.fgColor.rgb
+    assert summary.cell(zero_row, 8).fill.fgColor.rgb != summary.cell(9, 8).fill.fgColor.rgb
 
     sales_row = _find_row(summary, "매출액")
     assert summary.cell(sales_row, 3).value == 1_100_000
@@ -237,15 +345,22 @@ def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_
     assert evidence["B6"].value == datetime(2026, 9, 1, 8, 30, 15)
     assert evidence["B6"].is_date
     assert evidence["B7"].value == 42
-    assert _as_date(evidence["D10"].value) == date(2026, 8, 1)
-    assert evidence["D10"].is_date
+    assert _as_date(evidence["F10"].value) == date(2026, 8, 1)
+    assert evidence["F10"].is_date
     assert evidence["A10"].value == "가져오기"
-    assert evidence["I10"].value == "화성운반비내역(8월)!12"
-    assert "D:\\fictional" not in evidence["I10"].value
+    assert evidence["B10"].value == "납품처"
+    assert evidence["C10"].value == "실적"
+    assert evidence["K10"].value == "화성운반비내역(8월)!12"
+    assert "D:\\fictional" not in evidence["K10"].value
     assert evidence["A11"].value == "수기 입력"
-    assert evidence["G11"].value == 0
-    assert evidence["H11"].value is None
-    assert evidence["H12"].value == 0
+    assert evidence["I11"].value == 0
+    assert evidence["J11"].value == 0
+    assert evidence["B22"].value == "비정규"
+    assert evidence["C22"].value == "계획"
+    assert evidence["I22"].value == 0
+    assert evidence["J22"].value == 0
+    assert evidence["B23"].value == "비정규"
+    assert evidence["C23"].value == "실적"
     assert evidence["A10"].fill.fgColor.rgb != evidence["A11"].fill.fgColor.rgb
 
     checks = workbook["검증 결과"]
@@ -253,17 +368,19 @@ def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_
     assert checks["B4"].value == 0
     assert checks.freeze_panes == "A8"
     assert checks.auto_filter.ref
-    assert checks["B8"].value == "경고"
-    assert checks["B8"].fill.fgColor.rgb != "00000000"
+    assert checks["B8"].value == "정상"
+    assert checks["B8"].fill.fgColor.rgb in {"00000000", "00FFFFFF"}
 
     masters = workbook["마스터 기준"]
     assert masters.protection.sheet is True
     assert masters.freeze_panes == "A6"
     assert masters.auto_filter.ref
-    assert masters["B6"].value == "가상동부"
-    assert "동부 원천 (transport)" in masters["C6"].value
+    assert masters["B6"].value == "가상납품처01"
+    assert "원천납품처01 (transport)" in masters["C6"].value
     group_header = _find_row(masters, "그룹명")
     assert masters.cell(group_header + 1, 1).value == "가상권역"
+    assert masters.cell(group_header + 3, 1).value == "빈 가상권역"
+    assert masters.cell(group_header + 3, 4).value is None
 
     for sheet in workbook.worksheets:
         assert any(cell.style_id for row in sheet.iter_rows() for cell in row)
@@ -276,10 +393,9 @@ def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_
 
 
 def test_export_review_workbook_shows_neutral_valid_state(tmp_path):
-    from app.domain.validation import ValidationResult
     from app.reporting.xlsx_review import export_review_workbook
 
-    bundle = replace(_report_bundle(), validation=ValidationResult(()))
+    bundle = _report_bundle()
     output = tmp_path / "valid.xlsx"
     export_review_workbook(bundle, output)
 
@@ -292,20 +408,19 @@ def test_export_review_workbook_shows_neutral_valid_state(tmp_path):
 
 
 def test_export_review_workbook_shows_blocking_errors_distinctly(tmp_path):
-    from app.domain.validation import ValidationIssue, ValidationResult
+    from app.domain.validation import UnresolvedDestinationAlias
     from app.reporting.xlsx_review import export_review_workbook
 
+    bundle = _report_bundle()
     bundle = replace(
-        _report_bundle(),
-        validation=ValidationResult(
-            (
-                ValidationIssue(
-                    code="MISSING_SALES",
-                    severity="error",
-                    message="가상 매출 입력이 없습니다.",
-                    source_locator="월 매출 입력",
+        bundle,
+        validation_context=replace(
+            bundle.validation_context,
+            unresolved_aliases=(
+                UnresolvedDestinationAlias(
+                    "미등록 원천", r"D:\secret\source.xlsx!A2"
                 ),
-            )
+            ),
         ),
     )
     output = tmp_path / "blocked.xlsx"
@@ -316,6 +431,58 @@ def test_export_review_workbook_shows_blocking_errors_distinctly(tmp_path):
     assert checks["B4"].value == 1
     assert checks["B8"].value == "오류"
     assert checks["B8"].fill.fgColor.rgb != "00000000"
+    all_text = "\n".join(
+        cell.value
+        for sheet in load_workbook(output).worksheets
+        for row in sheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str)
+    )
+    assert r"D:\secret" not in all_text
+
+
+def test_export_review_workbook_rejects_forged_validation_result(tmp_path):
+    from app.domain.validation import UnresolvedDestinationAlias, ValidationResult
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    invalid = replace(
+        bundle,
+        validation_context=replace(
+            bundle.validation_context,
+            unresolved_aliases=(UnresolvedDestinationAlias("누락", "가상.xlsx!A2"),),
+        ),
+        validation_result=ValidationResult(()),
+    )
+    with pytest.raises(ValueError, match="supplied validation result"):
+        export_review_workbook(invalid, tmp_path / "forged.xlsx")
+
+
+@pytest.mark.parametrize("missing", ["sales", "actual", "next-plan", "history"])
+def test_export_review_workbook_rejects_validation_snapshot_conflicting_with_report(
+    tmp_path, missing
+):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    context = bundle.validation_context
+    if missing == "sales":
+        context = replace(context, sales=None)
+    elif missing == "actual":
+        item = replace(context.destinations[0], actual_quantity=None)
+        context = replace(context, destinations=(item, *context.destinations[1:]))
+    elif missing == "next-plan":
+        item = replace(context.destinations[0], next_month_plan=None)
+        context = replace(context, destinations=(item, *context.destinations[1:]))
+    else:
+        context = replace(context, prior_year_history=None)
+    output = tmp_path / f"missing-{missing}.xlsx"
+    output.write_bytes(b"preserve")
+
+    with pytest.raises(ValueError, match="validation snapshot"):
+        export_review_workbook(replace(bundle, validation_context=context), output)
+
+    assert output.read_bytes() == b"preserve"
 
 
 @pytest.mark.parametrize("case", ["duplicate", "missing"])
@@ -326,20 +493,23 @@ def test_export_review_workbook_rejects_duplicate_or_missing_report_identity(tmp
     bundle = _report_bundle()
     first = bundle.report.rows[0]
     if case == "duplicate":
-        rows = (first, first)
+        rows = (first, first, *bundle.report.rows[2:])
+        message = "duplicate"
     else:
         rows = (
-            replace(
-                first,
-                calculation=calculate_destination(
-                    Decimal("100"), 10_000, Decimal("120"), 13_200
-                ),
-            ),
+            replace(first, calculation=calculate_destination(
+                first.calculation.planned_quantity,
+                first.calculation.planned_cost_won,
+                first.calculation.actual_quantity,
+                first.calculation.actual_cost_won,
+            )),
+            *bundle.report.rows[1:],
         )
+        message = "missing destination identity"
     invalid = replace(bundle, report=replace(bundle.report, rows=rows))
     output = tmp_path / f"{case}.xlsx"
 
-    with pytest.raises(ValueError, match="identity"):
+    with pytest.raises(ValueError, match=message):
         export_review_workbook(invalid, output)
 
     assert not output.exists()
@@ -351,7 +521,7 @@ def test_export_review_workbook_rejects_duplicate_or_missing_report_identity(tmp
         ("alias", "alias identity"),
         ("evidence", "evidence does not reconcile"),
         ("duplicate-evidence", "duplicate identity"),
-        ("batch-month", "batch report month"),
+        ("batch-month", "validation snapshot import provenance"),
         ("group", "group calculation"),
         ("total", "total calculation"),
     ],
@@ -379,24 +549,68 @@ def test_export_review_workbook_rejects_inconsistent_audit_provenance(
     elif case == "group":
         calculations = {
             row.calculation.provenance.destination_id: row.calculation
-            for row in bundle.report.rows[:2]
+            for row in bundle.report.rows[:12]
             if row is not None
         }
         wrong = calculate_group(calculations, bundle.group_members[:1], group_id=10)
-        rows = (*bundle.report.rows[:2], replace(bundle.report.rows[2], calculation=wrong))
+        rows = (*bundle.report.rows[:12], replace(bundle.report.rows[12], calculation=wrong), bundle.report.rows[13])
         invalid = replace(bundle, report=replace(bundle.report, rows=rows))
     else:
-        direct_rows = tuple(row for row in bundle.report.rows if row is not None)[:2]
+        direct_rows = tuple(row for row in bundle.report.rows if row is not None)[:12]
         calculations = {
             row.calculation.provenance.destination_id: row.calculation
             for row in direct_rows
         }
-        wrong = calculate_total(calculations, bundle.destinations[:1])
+        wrong = calculate_total(calculations, bundle.destinations[:-1])
+        total = replace(
+            bundle.report.total,
+            calculation=wrong,
+            quantity_by_month={
+                **bundle.report.total.quantity_by_month,
+                "2026-08": wrong.actual_quantity,
+            },
+            cost_won_by_month={
+                **bundle.report.total.cost_won_by_month,
+                "2026-08": wrong.actual_cost_won,
+            },
+        )
+        next_total = replace(
+            bundle.report.next_month.total,
+            quantity_by_month={
+                **bundle.report.next_month.total.quantity_by_month,
+                "2026-08": wrong.actual_quantity,
+            },
+            cost_won_by_month={
+                **bundle.report.next_month.total.cost_won_by_month,
+                "2026-08": wrong.actual_cost_won,
+            },
+        )
+        charts = replace(
+            bundle.report.charts,
+            planned_quantity_by_month={
+                **bundle.report.charts.planned_quantity_by_month,
+                "2026-08": wrong.planned_quantity,
+            },
+            actual_quantity_by_month={
+                **bundle.report.charts.actual_quantity_by_month,
+                "2026-08": wrong.actual_quantity,
+            },
+            planned_cost_won_by_month={
+                **bundle.report.charts.planned_cost_won_by_month,
+                "2026-08": wrong.planned_cost_won,
+            },
+            actual_cost_won_by_month={
+                **bundle.report.charts.actual_cost_won_by_month,
+                "2026-08": wrong.actual_cost_won,
+            },
+        )
         invalid = replace(
             bundle,
             report=replace(
                 bundle.report,
-                total=replace(bundle.report.total, calculation=wrong),
+                total=total,
+                next_month=replace(bundle.report.next_month, total=next_total),
+                charts=charts,
             ),
         )
     output = tmp_path / f"{case}.xlsx"
@@ -405,6 +619,160 @@ def test_export_review_workbook_rejects_inconsistent_audit_provenance(
         export_review_workbook(invalid, output)
 
     assert not output.exists()
+
+
+def test_export_review_workbook_canonical_preflight_preserves_existing_output(tmp_path):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    chart_values = dict(bundle.report.charts.actual_quantity_by_month)
+    chart_values["2026-07"] += Decimal("1")
+    invalid = replace(
+        bundle,
+        report=replace(
+            bundle.report,
+            charts=replace(
+                bundle.report.charts, actual_quantity_by_month=chart_values
+            ),
+        ),
+    )
+    output = tmp_path / "existing.xlsx"
+    output.write_bytes(b"preserve")
+
+    with pytest.raises(ValueError, match="actual history conflict"):
+        export_review_workbook(invalid, output)
+
+    assert output.read_bytes() == b"preserve"
+
+
+def test_export_review_workbook_missing_canonical_sales_preserves_existing_output(tmp_path):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    invalid = replace(
+        bundle,
+        report=replace(
+            bundle.report,
+            sales=replace(bundle.report.sales, actual_won=None),
+        ),
+    )
+    output = tmp_path / "existing.xlsx"
+    output.write_bytes(b"preserve")
+
+    with pytest.raises(ValueError, match="current actual sales"):
+        export_review_workbook(invalid, output)
+
+    assert output.read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize("case", ["missing", "conflict"])
+def test_export_review_workbook_rejects_nonregular_without_exact_evidence(
+    tmp_path, case
+):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    if case == "missing":
+        operations = bundle.operations[:-1]
+    else:
+        operations = (*bundle.operations[:-1], replace(bundle.operations[-1], cost_won=1))
+    with pytest.raises(ValueError, match="nonregular evidence"):
+        export_review_workbook(
+            replace(bundle, operations=operations), tmp_path / f"{case}.xlsx"
+        )
+
+
+def test_export_review_workbook_preserves_missing_nonregular_as_blank(tmp_path):
+    from app.domain.calculations import calculate_destination
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    nonregular = replace(
+        bundle.report.nonregular,
+        calculation=calculate_destination(Decimal("0"), 0, None, None),
+        quantity_by_month={**bundle.report.nonregular.quantity_by_month, "2026-08": None},
+        cost_won_by_month={**bundle.report.nonregular.cost_won_by_month, "2026-08": None},
+    )
+    next_nonregular = replace(
+        bundle.report.next_month.nonregular,
+        quantity_by_month={
+            **bundle.report.next_month.nonregular.quantity_by_month,
+            "2026-08": None,
+        },
+        cost_won_by_month={
+            **bundle.report.next_month.nonregular.cost_won_by_month,
+            "2026-08": None,
+        },
+    )
+    report = replace(
+        bundle.report,
+        nonregular=nonregular,
+        next_month=replace(bundle.report.next_month, nonregular=next_nonregular),
+    )
+    operations = (*bundle.operations[:-1], replace(bundle.operations[-1], quantity_ea=None, cost_won=None))
+    output = tmp_path / "missing-nonregular.xlsx"
+
+    export_review_workbook(replace(bundle, report=report, operations=operations), output)
+
+    summary = load_workbook(output)["월간 종합"]
+    row = _find_row(summary, "비정규 운반비")
+    assert summary.cell(row, 4).value is None
+    assert summary.cell(row, 8).value is None
+
+
+@pytest.mark.parametrize(
+    "locator",
+    [r"D:\secret\source.xlsx!A2", r"\\server\share\secret\source.xlsx!A2", "/home/user/secret/source.xlsx!A2"],
+)
+def test_export_review_workbook_sanitizes_paths_in_all_visible_text(tmp_path, locator):
+    from app.domain.validation import UnresolvedDestinationAlias
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(UnresolvedDestinationAlias(locator, locator),),
+    )
+    output = tmp_path / "safe.xlsx"
+    export_review_workbook(replace(bundle, validation_context=context), output)
+
+    text = "\n".join(
+        cell.value
+        for sheet in load_workbook(output).worksheets
+        for row in sheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str)
+    )
+    assert "D:\\secret" not in text
+    assert "\\\\server\\share" not in text
+    assert "/home/user" not in text
+    assert "source.xlsx" in text
+
+
+@pytest.mark.parametrize(
+    "case", ["stale-name", "duplicate-order", "fabricated", "inclusion"]
+)
+def test_export_review_workbook_rejects_inconsistent_group_member_snapshot(
+    tmp_path, case
+):
+    from app.domain.models import GroupMember
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    if case == "stale-name":
+        members = (replace(bundle.group_members[0], name="오래된 이름"), *bundle.group_members[1:])
+    elif case == "duplicate-order":
+        members = (bundle.group_members[0], replace(bundle.group_members[1], display_order=1))
+    elif case == "fabricated":
+        members = (*bundle.group_members, GroupMember(10, 999, "조작", 3, True, True))
+    else:
+        members = (replace(bundle.group_members[0], include_cost=False), *bundle.group_members[1:])
+
+    message = "group calculation" if case == "inclusion" else "group member"
+    with pytest.raises(ValueError, match=message):
+        export_review_workbook(
+            replace(bundle, group_members=members), tmp_path / f"{case}.xlsx"
+        )
 
 
 def test_export_review_workbook_is_atomic_when_final_replace_fails(tmp_path, monkeypatch):

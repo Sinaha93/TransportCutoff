@@ -32,8 +32,8 @@ from app.domain.calculations import (
     historical_averages,
 )
 from app.domain.models import Destination, DestinationAlias, GroupMember, ReportGroup
-from app.domain.validation import ValidationResult
-from app.reporting.pptx_report import PptReport
+from app.domain.validation import ValidationContext, ValidationResult, validate_report
+from app.reporting.pptx_report import PptReport, validate_ppt_report
 
 
 SHEET_NAMES = ("월간 종합", "운행실적", "검증 결과", "마스터 기준")
@@ -56,6 +56,13 @@ ERROR_TOKENS = {
     "#CALC!",
 }
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_WINDOWS_PATH = re.compile(
+    r"(?i)(?:[A-Z]:[\\/](?:[^\\/\s'\"]+[\\/])*)([^\\/\s'\"]+)"
+)
+_UNC_PATH = re.compile(
+    r"(?:\\\\|//)[^\\/\s'\"]+[\\/][^\\/\s'\"]+(?:[\\/][^\\/\s'\"]+)*"
+)
+_POSIX_PATH = re.compile(r"(?<![\w:])/(?:[^/\s'\"]+/)+([^/\s'\"]+)")
 
 _NAVY = "17365D"
 _BLUE = "D9EAF7"
@@ -105,18 +112,26 @@ class ImportBatchEvidence:
 class OperationEvidence:
     """One imported or manually entered value supporting the report."""
 
+    record_kind: Literal["destination", "nonregular"]
+    value_role: Literal["plan", "actual"]
     input_kind: Literal["imported", "manual"]
     batch_id: int | None
     provenance_id: str
     report_month: str
     raw_destination: str | None
-    destination_id: int
+    destination_id: int | None
     normalized_destination: str
     quantity_ea: Decimal | None
     cost_won: int | None
     source_locator: str
 
     def __post_init__(self) -> None:
+        if self.record_kind not in {"destination", "nonregular"}:
+            raise ValueError("record_kind must be destination or nonregular")
+        if self.value_role not in {"plan", "actual"}:
+            raise ValueError("value_role must be plan or actual")
+        if self.record_kind == "destination" and self.value_role != "actual":
+            raise ValueError("destination operation evidence must be actual")
         if self.input_kind not in {"imported", "manual"}:
             raise ValueError("input_kind must be imported or manual")
         if self.input_kind == "imported":
@@ -126,7 +141,10 @@ class OperationEvidence:
             raise ValueError("manual evidence cannot have a batch_id")
         _text(self.provenance_id, "provenance_id")
         _month(self.report_month, "report_month")
-        _positive_int(self.destination_id, "destination_id")
+        if self.record_kind == "destination":
+            _positive_int(self.destination_id, "destination_id")
+        elif self.destination_id is not None:
+            raise ValueError("nonregular evidence cannot have a destination_id")
         _text(self.normalized_destination, "normalized_destination")
         if self.quantity_ea is not None:
             if not isinstance(self.quantity_ea, Decimal) or not self.quantity_ea.is_finite():
@@ -139,23 +157,28 @@ class OperationEvidence:
 
 
 @dataclass(frozen=True, slots=True)
-class ReviewWorkbookReport:
+class ReviewWorkbookData:
     """Canonical report plus review-only evidence and master snapshots."""
 
     report: PptReport
-    validation: ValidationResult
+    validation_context: ValidationContext
     destinations: tuple[Destination, ...]
     aliases: tuple[DestinationAlias, ...]
     groups: tuple[ReportGroup, ...]
     group_members: tuple[GroupMember, ...]
     import_batches: tuple[ImportBatchEvidence, ...]
     operations: tuple[OperationEvidence, ...]
+    validation_result: ValidationResult | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.report, PptReport):
             raise TypeError("report must be a PptReport")
-        if not isinstance(self.validation, ValidationResult):
-            raise TypeError("validation must be a ValidationResult")
+        if not isinstance(self.validation_context, ValidationContext):
+            raise TypeError("validation_context must be a ValidationContext")
+        if self.validation_result is not None and not isinstance(
+            self.validation_result, ValidationResult
+        ):
+            raise TypeError("validation_result must be a ValidationResult or None")
         _tuple_of(self.destinations, Destination, "destinations")
         _tuple_of(self.aliases, DestinationAlias, "aliases")
         _tuple_of(self.groups, ReportGroup, "groups")
@@ -163,9 +186,22 @@ class ReviewWorkbookReport:
         _tuple_of(self.import_batches, ImportBatchEvidence, "import_batches")
         _tuple_of(self.operations, OperationEvidence, "operations")
 
+    @property
+    def validation(self) -> ValidationResult:
+        """Return Task7 validation recomputed from the immutable input snapshot."""
+        result = validate_report(self.validation_context)
+        if self.validation_result is not None and self.validation_result != result:
+            raise ValueError("supplied validation result conflicts with recomputed result")
+        return result
+
+
+# Backward-compatible type name; the constructor now requires authoritative
+# Task7 inputs instead of accepting a free-standing ValidationResult.
+ReviewWorkbookReport = ReviewWorkbookData
+
 
 def export_review_workbook(
-    report: ReviewWorkbookReport, output: str | Path
+    report: ReviewWorkbookData, output: str | Path
 ) -> None:
     """Write four review sheets atomically and validate the saved XLSX.
 
@@ -174,8 +210,8 @@ def export_review_workbook(
     pre-existing output untouched.
     """
 
-    if not isinstance(report, ReviewWorkbookReport):
-        raise TypeError("report must be a ReviewWorkbookReport")
+    if not isinstance(report, ReviewWorkbookData):
+        raise TypeError("report must be a ReviewWorkbookData")
     output = Path(output)
     if output.suffix.lower() != ".xlsx":
         raise ValueError("output must use the .xlsx extension")
@@ -366,13 +402,15 @@ def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
     )
     for row, (label, value, number_format) in enumerate(metadata, start=3):
         sheet.cell(row, 1, label)
-        sheet.cell(row, 2, value)
+        sheet.cell(row, 2, _safe_display_text(value) if isinstance(value, str) else value)
         if number_format:
             sheet.cell(row, 2).number_format = number_format
         sheet.cell(row, 1).font = Font(name=FONT_NAME, bold=True, color=_DARK_TEXT)
 
     headers = (
         "입력 구분",
+        "증거 구분",
+        "값 구분",
         "배치 ID",
         "프로비넌스 ID",
         "보고 월",
@@ -386,6 +424,8 @@ def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
     for row_number, item in enumerate(bundle.operations, start=10):
         values = (
             "가져오기" if item.input_kind == "imported" else "수기 입력",
+            "납품처" if item.record_kind == "destination" else "비정규",
+            "계획" if item.value_role == "plan" else "실적",
             item.batch_id,
             item.provenance_id,
             _month_date(item.report_month),
@@ -396,21 +436,21 @@ def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
             _safe_locator(item.source_locator),
         )
         _write_values(sheet, row_number, values)
-        sheet.cell(row_number, 4).number_format = DATE_FORMAT
-        sheet.cell(row_number, 7).number_format = NUMBER_FORMAT
-        sheet.cell(row_number, 8).number_format = MONEY_FORMAT
-        for column in (1, 2, 4):
+        sheet.cell(row_number, 6).number_format = DATE_FORMAT
+        sheet.cell(row_number, 9).number_format = NUMBER_FORMAT
+        sheet.cell(row_number, 10).number_format = MONEY_FORMAT
+        for column in (1, 2, 3, 4, 6):
             sheet.cell(row_number, column).alignment = Alignment(
                 horizontal="center", vertical="center"
             )
         fill = _BLUE if item.input_kind == "imported" else _YELLOW
-        _fill_range(sheet, row_number, 1, 9, fill)
+        _fill_range(sheet, row_number, 1, 11, fill)
     last_row = 9 + len(bundle.operations)
-    sheet.auto_filter.ref = f"A9:I{last_row}"
+    sheet.auto_filter.ref = f"A9:K{last_row}"
     sheet.freeze_panes = "A10"
     _set_widths(
         sheet,
-        {"A": 13, "B": 24, "C": 28, "D": 13, "E": 20, "F": 20, "G": 14, "H": 16, "I": 38},
+        {"A": 13, "B": 22, "C": 10, "D": 18, "E": 28, "F": 13, "G": 20, "H": 20, "I": 14, "J": 16, "K": 38},
     )
 
 
@@ -527,19 +567,18 @@ def _write_masters(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
         "운반비 포함",
     )
     _write_header(sheet, group_header, group_headers)
-    groups = {item.id: item for item in bundle.groups}
-    for row_number, member in enumerate(
-        sorted(
-            bundle.group_members,
-            key=lambda item: (
-                groups[item.group_id].display_order,
-                item.display_order,
-                item.destination_id,
-            ),
-        ),
-        start=group_header + 1,
-    ):
-        group = groups[member.group_id]
+    destination_by_id = {item.id: item for item in bundle.destinations}
+    members_by_group: dict[int, list[GroupMember]] = {}
+    for member in bundle.group_members:
+        members_by_group.setdefault(member.group_id, []).append(member)
+    group_rows: list[tuple[ReportGroup, GroupMember | None]] = []
+    for group in sorted(bundle.groups, key=lambda item: (item.display_order, item.id)):
+        members = sorted(
+            members_by_group.get(group.id, ()),
+            key=lambda item: (item.display_order, item.destination_id),
+        )
+        group_rows.extend((group, member) for member in members or (None,))
+    for row_number, (group, member) in enumerate(group_rows, start=group_header + 1):
         _write_values(
             sheet,
             row_number,
@@ -547,10 +586,10 @@ def _write_masters(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
                 group.name,
                 group.display_order,
                 _yes_no(group.active),
-                member.name,
-                member.display_order,
-                _yes_no(member.include_quantity),
-                _yes_no(member.include_cost),
+                None if member is None else destination_by_id[member.destination_id].name,
+                None if member is None else member.display_order,
+                None if member is None else _yes_no(member.include_quantity),
+                None if member is None else _yes_no(member.include_cost),
             ),
         )
         _fill_range(sheet, row_number, 1, 7, _CALCULATED)
@@ -568,6 +607,9 @@ def _write_masters(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
 
 def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     report = bundle.report
+    validate_ppt_report(report)
+    # Force authoritative Task7 recomputation before any workbook/temp file exists.
+    bundle.validation
     if report.report_month != "2026-08":
         raise ValueError("review workbook supports only report month 2026-08")
     if len(bundle.import_batches) != 1:
@@ -575,6 +617,10 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
 
     _unique((item.id for item in bundle.destinations), "destination identity")
     _unique((item.name for item in bundle.destinations), "destination name identity")
+    _unique(
+        (item.display_order for item in bundle.destinations),
+        "destination display order",
+    )
     _unique((item.id for item in bundle.aliases), "alias identity")
     _unique(
         ((item.source_type, item.raw_name) for item in bundle.aliases),
@@ -582,6 +628,7 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     )
     _unique((item.id for item in bundle.groups), "group identity")
     _unique((item.name for item in bundle.groups), "group name identity")
+    _unique((item.display_order for item in bundle.groups), "group display order")
     _unique((item.batch_id for item in bundle.import_batches), "batch identity")
     _unique((item.provenance_id for item in bundle.import_batches), "batch provenance identity")
 
@@ -595,6 +642,7 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
         if alias.destination_id not in destination_by_id:
             raise ValueError("alias has a missing destination identity")
     seen_members: set[tuple[int, int]] = set()
+    seen_member_orders: set[tuple[int, int]] = set()
     for member in bundle.group_members:
         identity = (member.group_id, member.destination_id)
         if identity in seen_members:
@@ -602,6 +650,12 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
         seen_members.add(identity)
         if member.group_id not in group_by_id or member.destination_id not in destination_by_id:
             raise ValueError("group member has a missing identity")
+        if member.name != destination_by_id[member.destination_id].name:
+            raise ValueError("group member name does not match canonical destination")
+        order_identity = (member.group_id, member.display_order)
+        if order_identity in seen_member_orders:
+            raise ValueError("group member display order contains a duplicate")
+        seen_member_orders.add(order_identity)
 
     displayed = [row for row in report.rows if row is not None]
     keys = [row.key for row in displayed] + [report.nonregular.key, report.total.key]
@@ -679,6 +733,8 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     if report.total.calculation != expected_total:
         raise ValueError("total calculation does not match master provenance")
 
+    _validate_validation_snapshot(bundle, direct_calculations)
+
     batch_by_id = {item.batch_id: item for item in bundle.import_batches}
     for batch in bundle.import_batches:
         if batch.report_month != report.report_month:
@@ -687,6 +743,8 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
         (
             (
                 item.input_kind,
+                item.record_kind,
+                item.value_role,
                 item.batch_id,
                 item.provenance_id,
                 item.destination_id,
@@ -700,14 +758,34 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     quantity_seen: set[int] = set()
     cost_totals: dict[int, int] = {}
     cost_seen: set[int] = set()
+    nonregular_quantity_totals = {"plan": Decimal(0), "actual": Decimal(0)}
+    nonregular_quantity_seen: set[str] = set()
+    nonregular_cost_totals = {"plan": 0, "actual": 0}
+    nonregular_cost_seen: set[str] = set()
+    nonregular_records = {"plan": 0, "actual": 0}
     for item in bundle.operations:
+        if item.report_month != report.report_month:
+            raise ValueError("operation report month does not match canonical report")
+        if item.record_kind == "nonregular":
+            nonregular_records[item.value_role] += 1
+            if item.normalized_destination != report.nonregular.label:
+                raise ValueError("nonregular evidence label does not match canonical report")
+            if item.input_kind == "imported":
+                batch = batch_by_id.get(item.batch_id)
+                if batch is None or batch.provenance_id != item.provenance_id:
+                    raise ValueError("nonregular evidence has a missing batch identity")
+            if item.quantity_ea is not None:
+                nonregular_quantity_seen.add(item.value_role)
+                nonregular_quantity_totals[item.value_role] += item.quantity_ea
+            if item.cost_won is not None:
+                nonregular_cost_seen.add(item.value_role)
+                nonregular_cost_totals[item.value_role] += item.cost_won
+            continue
         destination = destination_by_id.get(item.destination_id)
         if destination is None or item.normalized_destination != destination.name:
             raise ValueError("operation has a missing destination identity")
         if item.destination_id not in direct_calculations:
             raise ValueError("operation has a missing report destination identity")
-        if item.report_month != report.report_month:
-            raise ValueError("operation report month does not match canonical report")
         if item.input_kind == "imported":
             batch = batch_by_id.get(item.batch_id)
             if batch is None or batch.provenance_id != item.provenance_id:
@@ -737,6 +815,93 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
             raise ValueError(
                 "operation evidence does not reconcile to canonical actuals"
             )
+    nonregular = report.nonregular.calculation
+    for role, quantity, cost in (
+        ("plan", nonregular.planned_quantity, nonregular.planned_cost_won),
+        ("actual", nonregular.actual_quantity, nonregular.actual_cost_won),
+    ):
+        if nonregular_records[role] == 0 or not _metric_evidence_matches(
+            role in nonregular_quantity_seen,
+            nonregular_quantity_totals[role],
+            quantity,
+        ) or not _metric_evidence_matches(
+            role in nonregular_cost_seen,
+            nonregular_cost_totals[role],
+            cost,
+        ):
+            raise ValueError(
+                f"nonregular evidence does not reconcile to canonical {role} values"
+            )
+
+
+def _metric_evidence_matches(seen: bool, total: object, expected: object) -> bool:
+    if expected is None:
+        return not seen
+    return seen and total == expected
+
+
+def _validate_validation_snapshot(
+    bundle: ReviewWorkbookReport,
+    direct_calculations: dict[int, DestinationCalculation],
+) -> None:
+    """Reconcile Task7 inputs with the canonical report rather than trusting flags."""
+    report = bundle.report
+    context = bundle.validation_context
+    if context.report_month != report.report_month:
+        raise ValueError("validation snapshot report month conflicts with canonical report")
+    if (
+        context.sales is None
+        or context.sales.amount_won != report.sales.actual_won
+        or context.sales.confirmed_at is None
+    ):
+        raise ValueError("validation snapshot sales conflicts with canonical report")
+    expected_history = historical_averages(
+        report.report_month, report.total.quantity_by_month
+    ).comparison_year
+    if context.prior_year_history != expected_history:
+        raise ValueError("validation snapshot history conflicts with canonical report")
+
+    destination_by_id = {item.id: item for item in bundle.destinations}
+    validation_by_id = {item.destination_id: item for item in context.destinations}
+    if set(validation_by_id) != set(direct_calculations):
+        raise ValueError("validation snapshot destinations conflict with canonical report")
+    next_by_id = {
+        row.calculation.provenance.destination_id: row.calculation
+        for row in report.next_month.rows
+        if row is not None
+        and row.calculation.provenance.destination_id is not None
+    }
+    for destination_id, calculation in direct_calculations.items():
+        master = destination_by_id[destination_id]
+        item = validation_by_id[destination_id]
+        next_plan = item.next_month_plan
+        if (
+            item.name != master.name
+            or item.display_order != master.display_order
+            or item.required_for_report != master.required_for_report
+            or item.actual_quantity != calculation.actual_quantity
+            or next_plan is None
+            or next_plan.report_month != report.next_month.month
+            or destination_id not in next_by_id
+            or next_plan.quantity != next_by_id[destination_id].planned_quantity
+        ):
+            raise ValueError(
+                "validation snapshot destination values conflict with canonical report"
+            )
+
+    if len(context.current_import_batches) != len(bundle.import_batches):
+        raise ValueError("validation snapshot import provenance conflicts with evidence")
+    evidence_by_id = {item.batch_id: item for item in bundle.import_batches}
+    for item in context.current_import_batches:
+        evidence = evidence_by_id.get(item.batch_id)
+        if (
+            evidence is None
+            or not item.is_current
+            or item.report_month != evidence.report_month
+            or item.source_type != evidence.source_type
+            or item.file_sha256 != evidence.file_sha256
+        ):
+            raise ValueError("validation snapshot import provenance conflicts with evidence")
 
 
 def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
@@ -855,6 +1020,8 @@ def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
         for row_number, item in enumerate(bundle.operations, start=10):
             values = (
                 "가져오기" if item.input_kind == "imported" else "수기 입력",
+                "납품처" if item.record_kind == "destination" else "비정규",
+                "계획" if item.value_role == "plan" else "실적",
                 item.batch_id,
                 item.provenance_id,
                 _month_date(item.report_month),
@@ -894,6 +1061,10 @@ def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
                             f"{sheet.title}!{cell.coordinate} contains an Excel error"
                         )
                     if isinstance(cell.value, str):
+                        if _safe_display_text(cell.value) != cell.value:
+                            raise ValueError(
+                                f"{sheet.title}!{cell.coordinate} exposes an absolute path"
+                            )
                         if cell.value in ERROR_TOKENS:
                             raise ValueError(
                                 f"{sheet.title}!{cell.coordinate} contains a formula error"
@@ -1018,6 +1189,8 @@ def _write_header(sheet: Worksheet, row: int, headers: tuple[str, ...]) -> None:
 
 def _write_values(sheet: Worksheet, row: int, values: tuple[object, ...]) -> None:
     for column, value in enumerate(values, start=1):
+        if isinstance(value, str):
+            value = _safe_display_text(value)
         cell = sheet.cell(row, column, value)
         cell.alignment = Alignment(
             horizontal=_default_horizontal(value), vertical="center"
@@ -1072,10 +1245,14 @@ def _safe_filename(value: str) -> str:
 
 
 def _safe_locator(value: str) -> str:
-    normalized = value.replace("\\", "/")
-    if normalized.startswith("/") or re.match(r"^[A-Za-z]:/", normalized):
-        return normalized.rsplit("/", 1)[-1]
-    return value
+    return _safe_display_text(value)
+
+
+def _safe_display_text(value: str) -> str:
+    """Remove absolute directory components from any user-visible text."""
+    value = _UNC_PATH.sub(lambda match: _safe_filename(match.group(0)), value)
+    value = _WINDOWS_PATH.sub(lambda match: match.group(1), value)
+    return _POSIX_PATH.sub(lambda match: match.group(1), value)
 
 
 def _yes_no(value: bool) -> str:
@@ -1132,6 +1309,8 @@ def _month_date(value: str) -> date:
 
 
 def _assert_saved_value(cell: Cell, expected: object) -> None:
+    if isinstance(expected, str):
+        expected = _safe_display_text(expected)
     if isinstance(expected, datetime):
         if cell.value != expected or not cell.is_date:
             raise ValueError(f"{cell.coordinate} datetime changed after save")
