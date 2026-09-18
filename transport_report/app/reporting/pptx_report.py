@@ -24,7 +24,6 @@ from zipfile import ZipFile
 from PIL import Image, PngImagePlugin
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.util import Pt
 
 from app.domain.calculations import (
     DestinationCalculation, GrandTotalResult, HistoricalValueKind,
@@ -503,8 +502,8 @@ def _write_paragraph(paragraph, text, *, source=None):
         if not text:
             return
         run = paragraph.add_run()
-        # Deterministic empty-cell source: its own endParaRPr, then defRPr,
-        # then a supplied destination paragraph, finally a fixed fallback.
+        # Copy direct formatting only when it exists. Otherwise leave the
+        # new run unformatted so its destination's master/table style applies.
         properties = paragraph._p.find('{http://schemas.openxmlformats.org/drawingml/2006/main}endParaRPr')
         if properties is None and paragraph._p.pPr is not None:
             properties = paragraph._p.pPr.find('{http://schemas.openxmlformats.org/drawingml/2006/main}defRPr')
@@ -514,8 +513,6 @@ def _write_paragraph(paragraph, text, *, source=None):
             copied = deepcopy(properties)
             copied.tag = '{http://schemas.openxmlformats.org/drawingml/2006/main}rPr'
             run._r.insert(0, copied)
-        else:
-            run.font.name, run.font.size = 'Malgun Gothic', Pt(9)
         runs = [run]
     if not text and runs:
         # PowerPoint 2007 ignores the font on an empty run and falls back to

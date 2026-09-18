@@ -474,3 +474,27 @@ def test_empty_review_retains_existing_paragraphs_that_set_native_row_height(tem
     frame = named(Presentation(output), 2, 'report.review_table').table.cell(4, 7).text_frame
     assert len(frame.paragraphs) == 2
     assert all(not p.text for p in frame.paragraphs)
+
+
+def test_empty_cell_preserves_inherited_font_without_direct_overrides(template, report, tmp_path):
+    from app.reporting.pptx_report import generate_pptx
+    p = Presentation(template)
+    cell = named(p, 2, 'report.monthly_table').table.cell(2, 6)
+    paragraph = cell.text_frame.paragraphs[0]
+    for element in paragraph._p.xpath('./a:r | ./a:endParaRPr | ./a:pPr/a:defRPr'):
+        element.getparent().remove(element)
+    # The synthetic deck's default/minor theme supplies Calibri at 18pt.
+    inherited = p._element.xpath('./p:defaultTextStyle/a:lvl1pPr/a:defRPr')[0]
+    assert inherited.get('sz') == '1800'
+    assert inherited.xpath('./a:latin')[0].get('typeface') == '+mn-lt'
+    assert not paragraph._p.xpath('./a:rPr | ./a:pPr/a:defRPr | ./a:endParaRPr')
+    paragraph_style, cell_style = paragraph._p.pPr.xml, cell._tc.tcPr.xml
+    p.save(template)
+    output = tmp_path / 'inherited-font.pptx'
+    generate_pptx(template, report, output)
+    after = named(Presentation(output), 2, 'report.monthly_table').table.cell(2, 6)
+    assert after.text == '2,280'
+    assert len(after.text_frame.paragraphs) == 1
+    assert not after._tc.xpath('.//a:rPr | .//a:defRPr | .//a:endParaRPr')
+    assert after.text_frame.paragraphs[0]._p.pPr.xml == paragraph_style
+    assert after._tc.tcPr.xml == cell_style
