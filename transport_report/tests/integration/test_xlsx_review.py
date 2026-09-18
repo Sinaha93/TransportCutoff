@@ -293,6 +293,119 @@ def _as_date(value):
     return value.date() if isinstance(value, datetime) else value
 
 
+def _with_missing_first_actual(bundle):
+    """Return a canonical report/context whose first required actual is missing."""
+    from app.domain.calculations import calculate_destination, calculate_group, calculate_total
+
+    first = bundle.report.rows[0]
+    missing_calculation = calculate_destination(
+        first.calculation.planned_quantity,
+        first.calculation.planned_cost_won,
+        None,
+        None,
+        destination_id=1,
+    )
+    first = replace(
+        first,
+        calculation=missing_calculation,
+        quantity_by_month={**first.quantity_by_month, "2026-08": None},
+        cost_won_by_month={**first.cost_won_by_month, "2026-08": None},
+    )
+    direct_rows = (first, *bundle.report.rows[1:12])
+    calculations = {
+        row.calculation.provenance.destination_id: row.calculation
+        for row in direct_rows
+    }
+    group_calculation = calculate_group(
+        calculations, bundle.group_members, group_id=10
+    )
+    group = replace(
+        bundle.report.rows[12],
+        calculation=group_calculation,
+        quantity_by_month={
+            **bundle.report.rows[12].quantity_by_month,
+            "2026-08": group_calculation.actual_quantity,
+        },
+        cost_won_by_month={
+            **bundle.report.rows[12].cost_won_by_month,
+            "2026-08": group_calculation.actual_cost_won,
+        },
+    )
+    total_calculation = calculate_total(calculations, bundle.destinations)
+    total = replace(
+        bundle.report.total,
+        calculation=total_calculation,
+        quantity_by_month={
+            **bundle.report.total.quantity_by_month,
+            "2026-08": total_calculation.actual_quantity,
+        },
+        cost_won_by_month={
+            **bundle.report.total.cost_won_by_month,
+            "2026-08": total_calculation.actual_cost_won,
+        },
+    )
+    next_first = replace(
+        bundle.report.next_month.rows[0],
+        quantity_by_month={
+            **bundle.report.next_month.rows[0].quantity_by_month,
+            "2026-08": None,
+        },
+        cost_won_by_month={
+            **bundle.report.next_month.rows[0].cost_won_by_month,
+            "2026-08": None,
+        },
+    )
+    next_total = replace(
+        bundle.report.next_month.total,
+        quantity_by_month={
+            **bundle.report.next_month.total.quantity_by_month,
+            "2026-08": None,
+        },
+        cost_won_by_month={
+            **bundle.report.next_month.total.cost_won_by_month,
+            "2026-08": None,
+        },
+    )
+    report = replace(
+        bundle.report,
+        rows=(*direct_rows, group, bundle.report.rows[13]),
+        total=total,
+        next_month=replace(
+            bundle.report.next_month,
+            rows=(next_first, *bundle.report.next_month.rows[1:]),
+            total=next_total,
+        ),
+        charts=replace(
+            bundle.report.charts,
+            actual_quantity_by_month={
+                **bundle.report.charts.actual_quantity_by_month,
+                "2026-08": None,
+            },
+            actual_cost_won_by_month={
+                **bundle.report.charts.actual_cost_won_by_month,
+                "2026-08": None,
+            },
+        ),
+    )
+    context = replace(
+        bundle.validation_context,
+        destinations=(
+            replace(bundle.validation_context.destinations[0], actual_quantity=None),
+            *bundle.validation_context.destinations[1:],
+        ),
+    )
+    operations = (
+        replace(bundle.operations[0], quantity_ea=None, cost_won=None),
+        *bundle.operations[1:],
+    )
+    return replace(
+        bundle,
+        report=report,
+        validation_context=context,
+        operations=operations,
+    )
+
+
 def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_path):
     from app.reporting.xlsx_review import export_review_workbook
 
@@ -483,6 +596,52 @@ def test_export_review_workbook_rejects_validation_snapshot_conflicting_with_rep
         export_review_workbook(replace(bundle, validation_context=context), output)
 
     assert output.read_bytes() == b"preserve"
+
+
+def test_export_review_workbook_exports_missing_actual_as_blocking_blank(tmp_path):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _with_missing_first_actual(_report_bundle())
+    output = tmp_path / "missing-actual.xlsx"
+
+    export_review_workbook(bundle, output)
+
+    workbook = load_workbook(output, data_only=False)
+    summary = workbook["월간 종합"]
+    row = _find_row(summary, "가상납품처01")
+    assert summary.cell(row, 4).value is None
+    assert summary.cell(row, 8).value is None
+    evidence = workbook["운행실적"]
+    assert evidence["I10"].value is None
+    assert evidence["J10"].value is None
+    checks = workbook["검증 결과"]
+    assert checks["B3"].value == "불가"
+    assert checks["B4"].value == 1
+    assert checks["A8"].value == "MISSING_ACTUAL_QUANTITY"
+
+
+@pytest.mark.parametrize("case", ["fabricated-zero", "missing-zero-evidence"])
+def test_export_review_workbook_requires_exact_evidence_for_zero(tmp_path, case):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    if case == "fabricated-zero":
+        bundle = _with_missing_first_actual(_report_bundle())
+        operations = (
+            replace(bundle.operations[0], quantity_ea=Decimal("0"), cost_won=0),
+            *bundle.operations[1:],
+        )
+    else:
+        bundle = _report_bundle()
+        operations = (
+            bundle.operations[0],
+            replace(bundle.operations[1], quantity_ea=None, cost_won=None),
+            *bundle.operations[2:],
+        )
+
+    with pytest.raises(ValueError, match="operation evidence does not reconcile"):
+        export_review_workbook(
+            replace(bundle, operations=operations), tmp_path / f"{case}.xlsx"
+        )
 
 
 @pytest.mark.parametrize("case", ["duplicate", "missing"])
@@ -721,17 +880,34 @@ def test_export_review_workbook_preserves_missing_nonregular_as_blank(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "locator",
-    [r"D:\secret\source.xlsx!A2", r"\\server\share\secret\source.xlsx!A2", "/home/user/secret/source.xlsx!A2"],
+    ("locator", "secret_fragments"),
+    [
+        (
+            r'D:\secret folder\private data\source file.xlsx!A2',
+            (r"D:\secret folder", "private data"),
+        ),
+        (
+            r"\\server\share name\secret folder\source file.xlsx!A2",
+            (r"\\server\share name", "secret folder"),
+        ),
+        (
+            "/home/user folder/private data/source file.xlsx!A2",
+            ("/home/user folder", "private data"),
+        ),
+    ],
 )
-def test_export_review_workbook_sanitizes_paths_in_all_visible_text(tmp_path, locator):
+def test_export_review_workbook_sanitizes_paths_in_all_visible_text(
+    tmp_path, locator, secret_fragments
+):
     from app.domain.validation import UnresolvedDestinationAlias
     from app.reporting.xlsx_review import export_review_workbook
 
     bundle = _report_bundle()
     context = replace(
         bundle.validation_context,
-        unresolved_aliases=(UnresolvedDestinationAlias(locator, locator),),
+        unresolved_aliases=(
+            UnresolvedDestinationAlias(f'"{locator}"', f"({locator}), 원본"),
+        ),
     )
     output = tmp_path / "safe.xlsx"
     export_review_workbook(replace(bundle, validation_context=context), output)
@@ -743,10 +919,9 @@ def test_export_review_workbook_sanitizes_paths_in_all_visible_text(tmp_path, lo
         for cell in row
         if isinstance(cell.value, str)
     )
-    assert "D:\\secret" not in text
-    assert "\\\\server\\share" not in text
-    assert "/home/user" not in text
-    assert "source.xlsx" in text
+    for fragment in secret_fragments:
+        assert fragment not in text
+    assert "source file.xlsx!A2" in text
 
 
 @pytest.mark.parametrize(

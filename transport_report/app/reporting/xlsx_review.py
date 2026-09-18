@@ -12,7 +12,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import tempfile
 from typing import Literal
@@ -56,13 +56,13 @@ ERROR_TOKENS = {
     "#CALC!",
 }
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
-_WINDOWS_PATH = re.compile(
-    r"(?i)(?:[A-Z]:[\\/](?:[^\\/\s'\"]+[\\/])*)([^\\/\s'\"]+)"
+_ABSOLUTE_PATH_START = re.compile(
+    r"(?i)(?<![\w:/])(?:[A-Z]:[\\/]|\\\\|//|/)"
 )
-_UNC_PATH = re.compile(
-    r"(?:\\\\|//)[^\\/\s'\"]+[\\/][^\\/\s'\"]+(?:[\\/][^\\/\s'\"]+)*"
+_PATH_FILE_END = re.compile(
+    r"(?i)\.(?:xlsx?|xlsm|csv|tsv|pptx?|docx?|pdf|txt|json|db|sqlite)"
+    r"(?:![A-Za-z0-9_$:.\-]+)?"
 )
-_POSIX_PATH = re.compile(r"(?<![\w:])/(?:[^/\s'\"]+/)+([^/\s'\"]+)")
 
 _NAVY = "17365D"
 _BLUE = "D9EAF7"
@@ -806,11 +806,14 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
                 cost_totals.get(item.destination_id, 0) + item.cost_won
             )
     for destination_id, calculation in direct_calculations.items():
-        if (
-            destination_id not in quantity_seen
-            or quantity_totals[destination_id] != calculation.actual_quantity
-            or destination_id not in cost_seen
-            or cost_totals[destination_id] != calculation.actual_cost_won
+        if not _metric_evidence_matches(
+            destination_id in quantity_seen,
+            quantity_totals.get(destination_id, Decimal(0)),
+            calculation.actual_quantity,
+        ) or not _metric_evidence_matches(
+            destination_id in cost_seen,
+            cost_totals.get(destination_id, 0),
+            calculation.actual_cost_won,
         ):
             raise ValueError(
                 "operation evidence does not reconcile to canonical actuals"
@@ -1249,10 +1252,41 @@ def _safe_locator(value: str) -> str:
 
 
 def _safe_display_text(value: str) -> str:
-    """Remove absolute directory components from any user-visible text."""
-    value = _UNC_PATH.sub(lambda match: _safe_filename(match.group(0)), value)
-    value = _WINDOWS_PATH.sub(lambda match: match.group(1), value)
-    return _POSIX_PATH.sub(lambda match: match.group(1), value)
+    """Remove absolute directory components from embedded user-visible paths."""
+    output: list[str] = []
+    cursor = 0
+    while match := _ABSOLUTE_PATH_START.search(value, cursor):
+        start = match.start()
+        end = _absolute_path_end(value, start)
+        if end is None:
+            output.append(value[cursor : match.end()])
+            cursor = match.end()
+            continue
+        path_text = value[start:end]
+        if re.match(r"(?i)^[A-Z]:[\\/]", path_text) or path_text.startswith(
+            ("\\\\", "//")
+        ):
+            basename = PureWindowsPath(path_text.replace("/", "\\")).name
+        else:
+            basename = PurePosixPath(path_text).name
+        output.extend((value[cursor:start], basename))
+        cursor = end
+    output.append(value[cursor:])
+    return "".join(output)
+
+
+def _absolute_path_end(value: str, start: int) -> int | None:
+    """Find an embedded path boundary without treating spaces as separators."""
+    if start > 0 and value[start - 1] in {'"', "'"}:
+        quote = value[start - 1]
+        closing = value.find(quote, start)
+        if closing >= 0:
+            return closing
+    file_end = _PATH_FILE_END.search(value, start)
+    if file_end is not None:
+        return file_end.end()
+    fallback = re.search(r"[\s,;\)\]\}<>]", value[start:])
+    return len(value) if fallback is None else start + fallback.start()
 
 
 def _yes_no(value: bool) -> str:
