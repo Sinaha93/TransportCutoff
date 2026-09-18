@@ -13,17 +13,17 @@ from app.domain.calculations import AverageResult
 
 Severity = Literal["error", "warning"]
 ReconciliationKind = Literal["quantity", "money"]
-MonthSource = Literal["plan", "actual", "import", "title", "graph_last_month"]
 
 _MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_SQLITE_INTEGER = 2**63 - 1
-_MONTH_SOURCE_LABELS: dict[str, str] = {
-    "plan": "계획",
-    "actual": "실적",
-    "import": "가져오기 자료",
-    "title": "보고서 제목",
-    "graph_last_month": "그래프 마지막 월",
-}
+_MONTH_SOURCE_FIELDS = (
+    ("plan_month", "당월 계획", "당월 계획 입력"),
+    ("actual_month", "당월 실적", "당월 실적 입력"),
+    ("transport_import_month", "운반비 가져오기 자료", "운반비 가져오기"),
+    ("ppt_title_month", "PPT 표지 제목", "PPT 표지 제목"),
+    ("graph_last_month", "그래프 마지막 월", "그래프 마지막 월"),
+)
 _BLOCKING_CODES = frozenset(
     {
         "MISSING_DESTINATION_ALIAS",
@@ -86,13 +86,24 @@ class SalesInput:
 
 
 @dataclass(frozen=True, slots=True)
+class NextMonthPlanInput:
+    report_month: str | None
+    quantity: Decimal | None
+
+    def __post_init__(self) -> None:
+        if self.report_month is not None:
+            _require_month(self.report_month, "next_month_plan.report_month")
+        _require_optional_quantity(self.quantity, "next_month_plan.quantity")
+
+
+@dataclass(frozen=True, slots=True)
 class DestinationValidationInput:
     destination_id: int
     name: str
     display_order: int
     required_for_report: bool
     actual_quantity: Decimal | None
-    next_month_plan_quantity: Decimal | None
+    next_month_plan: NextMonthPlanInput | None
     required_vehicle_types: tuple[str, ...] = ()
     rated_vehicle_types: tuple[str, ...] = ()
 
@@ -103,9 +114,10 @@ class DestinationValidationInput:
         if not isinstance(self.required_for_report, bool):
             raise TypeError("required_for_report must be bool")
         _require_optional_quantity(self.actual_quantity, "actual_quantity")
-        _require_optional_quantity(
-            self.next_month_plan_quantity, "next_month_plan_quantity"
-        )
+        if self.next_month_plan is not None and not isinstance(
+            self.next_month_plan, NextMonthPlanInput
+        ):
+            raise TypeError("next_month_plan must be NextMonthPlanInput or None")
         _require_text_tuple(self.required_vehicle_types, "required_vehicle_types")
         _require_text_tuple(self.rated_vehicle_types, "rated_vehicle_types")
 
@@ -117,13 +129,19 @@ class ImportBatchInput:
     source_type: str
     file_sha256: str
     source_locator: str
+    is_current: bool
 
     def __post_init__(self) -> None:
         _require_positive_id(self.batch_id, "batch_id")
         _require_month(self.report_month, "report_month")
         _require_text(self.source_type, "source_type")
-        _require_text(self.file_sha256, "file_sha256")
+        if not isinstance(self.file_sha256, str) or _SHA256.fullmatch(
+            self.file_sha256
+        ) is None:
+            raise ValueError("file_sha256 must be 64 lowercase hexadecimal characters")
         _require_text(self.source_locator, "source_locator")
+        if not isinstance(self.is_current, bool):
+            raise TypeError("is_current must be bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,16 +184,18 @@ class TotalReconciliationInput:
 
 
 @dataclass(frozen=True, slots=True)
-class ReportMonthInput:
-    source_name: MonthSource
-    report_month: str
-    source_locator: str
+class ReportMonthSources:
+    plan_month: str | None
+    actual_month: str | None
+    transport_import_month: str | None
+    ppt_title_month: str | None
+    graph_last_month: str | None
 
     def __post_init__(self) -> None:
-        if self.source_name not in _MONTH_SOURCE_LABELS:
-            raise ValueError("source_name is not a supported report month source")
-        _require_month(self.report_month, "report_month")
-        _require_text(self.source_locator, "source_locator")
+        for field, _, _ in _MONTH_SOURCE_FIELDS:
+            value = getattr(self, field)
+            if value is not None:
+                _require_month(value, field)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,18 +203,20 @@ class ValidationContext:
     report_month: str
     sales: SalesInput | None
     prior_year_history: AverageResult | None
+    month_sources: ReportMonthSources
     unresolved_aliases: tuple[UnresolvedDestinationAlias, ...] = ()
     destinations: tuple[DestinationValidationInput, ...] = ()
     current_import_batches: tuple[ImportBatchInput, ...] = ()
     transport_subtotals: tuple[TransportSubtotalInput, ...] = ()
     total_reconciliations: tuple[TotalReconciliationInput, ...] = ()
-    month_inputs: tuple[ReportMonthInput, ...] = ()
 
     def __post_init__(self) -> None:
         _require_month(self.report_month, "report_month")
         if self.sales is not None and not isinstance(self.sales, SalesInput):
             raise TypeError("sales must be SalesInput or None")
         _require_history(self.prior_year_history, self.report_month)
+        if not isinstance(self.month_sources, ReportMonthSources):
+            raise TypeError("month_sources must be ReportMonthSources")
         _require_tuple_items(
             self.unresolved_aliases,
             UnresolvedDestinationAlias,
@@ -218,7 +240,6 @@ class ValidationContext:
             TotalReconciliationInput,
             "total_reconciliations",
         )
-        _require_tuple_items(self.month_inputs, ReportMonthInput, "month_inputs")
         destination_ids = [item.destination_id for item in self.destinations]
         if len(destination_ids) != len(set(destination_ids)):
             raise ValueError("destinations contain a duplicate destination_id")
@@ -237,7 +258,12 @@ class ValidationResult:
 
 
 def validate_report(context: ValidationContext) -> ValidationResult:
-    """Return ordered, de-duplicated preflight issues for one report month."""
+    """Return ordered, de-duplicated preflight issues for one report month.
+
+    Import-batch checks validate which batch is selected for the report. The
+    importer's unique source identity and reconciliation continue to prevent
+    row duplication; this validator does not duplicate those responsibilities.
+    """
     if not isinstance(context, ValidationContext):
         raise TypeError("context must be ValidationContext")
 
@@ -275,25 +301,15 @@ def validate_report(context: ValidationContext) -> ValidationResult:
             )
         )
 
-    for month_input in context.month_inputs:
-        if month_input.report_month != context.report_month:
+    for field, source_label, source_locator in _MONTH_SOURCE_FIELDS:
+        source_month = getattr(context.month_sources, field)
+        if source_month != context.report_month:
             issues.append(
                 _month_mismatch_issue(
-                    source_label=_MONTH_SOURCE_LABELS[month_input.source_name],
-                    source_month=month_input.report_month,
+                    source_label=source_label,
+                    source_month=source_month,
                     report_month=context.report_month,
-                    source_locator=month_input.source_locator,
-                )
-            )
-
-    for batch in context.current_import_batches:
-        if batch.report_month != context.report_month:
-            issues.append(
-                _month_mismatch_issue(
-                    source_label="가져오기 배치",
-                    source_month=batch.report_month,
-                    report_month=context.report_month,
-                    source_locator=batch.source_locator,
+                    source_locator=source_locator,
                 )
             )
 
@@ -319,11 +335,10 @@ def validate_report(context: ValidationContext) -> ValidationResult:
 
     batches_by_source: dict[str, list[ImportBatchInput]] = {}
     for batch in context.current_import_batches:
-        batches_by_source.setdefault(batch.source_type, []).append(batch)
-    for batches in batches_by_source.values():
-        signatures = {
-            (batch.report_month, batch.file_sha256) for batch in batches
-        }
+        if batch.is_current and batch.report_month == context.report_month:
+            batches_by_source.setdefault(batch.source_type, []).append(batch)
+    for source_type, batches in batches_by_source.items():
+        signatures = {batch.file_sha256 for batch in batches}
         if len(signatures) > 1:
             locators = ", ".join(
                 dict.fromkeys(
@@ -343,7 +358,8 @@ def validate_report(context: ValidationContext) -> ValidationResult:
                     code="DUPLICATE_IMPORT",
                     severity="error",
                     message=(
-                        "같은 보고 월에 서로 다른 현재 운반비 가져오기 배치가 있습니다. "
+                        f"원천 '{source_type}'에 서로 다른 현재 운반비 가져오기 배치"
+                        f"({locators})가 있습니다. "
                         "사용할 배치 하나만 남기고 다시 생성하세요."
                     ),
                     source_locator=locators,
@@ -397,10 +413,14 @@ def validate_report(context: ValidationContext) -> ValidationResult:
                     source_locator="당월 실적 입력",
                 )
             )
-        if (
-            destination.required_for_report
-            and destination.next_month_plan_quantity is None
-        ):
+        expected_plan_month = _next_month(context.report_month)
+        next_plan = destination.next_month_plan
+        has_expected_plan = (
+            next_plan is not None
+            and next_plan.report_month == expected_plan_month
+            and next_plan.quantity is not None
+        )
+        if destination.required_for_report and not has_expected_plan:
             issues.append(
                 ValidationIssue(
                     code="MISSING_NEXT_MONTH_PLAN",
@@ -411,6 +431,21 @@ def validate_report(context: ValidationContext) -> ValidationResult:
                     ),
                     destination_id=destination.destination_id,
                     source_locator="다음 달 계획 입력",
+                )
+            )
+        if (
+            destination.required_for_report
+            and next_plan is not None
+            and next_plan.report_month is not None
+            and next_plan.report_month != expected_plan_month
+        ):
+            issues.append(
+                _month_mismatch_issue(
+                    source_label=f"{destination.name} 다음 달 계획",
+                    source_month=next_plan.report_month,
+                    report_month=expected_plan_month,
+                    source_locator="다음 달 계획 입력",
+                    expected_label="예상 계획 월",
                 )
             )
         for vehicle_type in sorted(
@@ -439,17 +474,25 @@ def validate_report(context: ValidationContext) -> ValidationResult:
 def _month_mismatch_issue(
     *,
     source_label: str,
-    source_month: str,
+    source_month: str | None,
     report_month: str,
     source_locator: str,
+    expected_label: str = "설정된 보고 월",
 ) -> ValidationIssue:
+    if source_month is None:
+        message = (
+            f"{source_label}의 기준 월이 없습니다. {source_locator}에서 "
+            f"{expected_label} {report_month}을 입력하세요."
+        )
+    else:
+        message = (
+            f"{source_label}의 기준 월 {source_month}이 {expected_label} "
+            f"{report_month}과 다릅니다. {source_locator}의 월을 수정하세요."
+        )
     return ValidationIssue(
         code="REPORT_MONTH_MISMATCH",
         severity="error",
-        message=(
-            f"{source_label}의 기준 월 {source_month}이 설정된 보고 월 "
-            f"{report_month}과 다릅니다. 해당 위치의 월을 수정하세요."
-        ),
+        message=message,
         source_locator=source_locator,
     )
 

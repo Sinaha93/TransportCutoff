@@ -3,6 +3,10 @@ from decimal import Decimal
 import pytest
 
 
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+
+
 def _complete_prior_year(report_month: str = "2026-08"):
     from app.domain.calculations import AverageResult
 
@@ -17,7 +21,11 @@ def _complete_prior_year(report_month: str = "2026-08"):
 
 
 def _context(**changes):
-    from app.domain.validation import SalesInput, ValidationContext
+    from app.domain.validation import (
+        ReportMonthSources,
+        SalesInput,
+        ValidationContext,
+    )
 
     values = {
         "report_month": "2026-08",
@@ -27,9 +35,22 @@ def _context(**changes):
             source_locator="월 매출 입력",
         ),
         "prior_year_history": _complete_prior_year(),
+        "month_sources": ReportMonthSources(
+            plan_month="2026-08",
+            actual_month="2026-08",
+            transport_import_month="2026-08",
+            ppt_title_month="2026-08",
+            graph_last_month="2026-08",
+        ),
     }
     values.update(changes)
     return ValidationContext(**values)
+
+
+def _next_plan(quantity: Decimal | None, month: str | None = "2026-09"):
+    from app.domain.validation import NextMonthPlanInput
+
+    return NextMonthPlanInput(month, quantity)
 
 
 def test_unknown_destination_alias_reports_each_source_row_as_blocking_error():
@@ -69,7 +90,7 @@ def test_missing_required_vehicle_rate_is_blocking_and_names_the_vehicle():
                 display_order=2,
                 required_for_report=True,
                 actual_quantity=Decimal("10"),
-                next_month_plan_quantity=Decimal("11"),
+                next_month_plan=_next_plan(Decimal("11")),
                 required_vehicle_types=("5톤", "11톤"),
                 rated_vehicle_types=("5톤",),
             ),
@@ -100,7 +121,7 @@ def test_required_destination_missing_actual_quantity_is_blocking():
                 display_order=1,
                 required_for_report=True,
                 actual_quantity=None,
-                next_month_plan_quantity=Decimal("1"),
+                next_month_plan=_next_plan(Decimal("1")),
             ),
         )
     )
@@ -128,7 +149,7 @@ def test_explicit_zero_actual_quantity_is_present():
                 display_order=1,
                 required_for_report=True,
                 actual_quantity=Decimal("0"),
-                next_month_plan_quantity=Decimal("0"),
+                next_month_plan=_next_plan(Decimal("0")),
             ),
         )
     )
@@ -185,8 +206,8 @@ def test_conflicting_current_import_batches_are_blocking_duplicates():
     result = validate_report(
         _context(
             current_import_batches=(
-                ImportBatchInput(21, "2026-08", "transport", "sha-a", "배치 #21"),
-                ImportBatchInput(22, "2026-08", "transport", "sha-b", "배치 #22"),
+                ImportBatchInput(21, "2026-08", "transport", SHA_A, "배치 #21", True),
+                ImportBatchInput(22, "2026-08", "transport", SHA_B, "배치 #22", True),
             )
         )
     )
@@ -196,7 +217,7 @@ def test_conflicting_current_import_batches_are_blocking_duplicates():
     assert issue.source_locator == "배치 #21, 배치 #22"
     assert "서로 다른" in issue.message
     assert "하나만" in issue.message
-    assert "transport" not in issue.message
+    assert "transport" in issue.message
 
 
 def test_same_file_import_retry_is_idempotent_not_a_duplicate_conflict():
@@ -205,8 +226,23 @@ def test_same_file_import_retry_is_idempotent_not_a_duplicate_conflict():
     result = validate_report(
         _context(
             current_import_batches=(
-                ImportBatchInput(21, "2026-08", "transport", "same-sha", "배치 #21"),
-                ImportBatchInput(21, "2026-08", "transport", "same-sha", "재시도"),
+                ImportBatchInput(21, "2026-08", "transport", SHA_A, "배치 #21", True),
+                ImportBatchInput(22, "2026-08", "transport", SHA_A, "재시도", True),
+            )
+        )
+    )
+
+    assert "DUPLICATE_IMPORT" not in {issue.code for issue in result.issues}
+
+
+def test_current_batches_from_another_report_month_are_not_duplicate_candidates():
+    from app.domain.validation import ImportBatchInput, validate_report
+
+    result = validate_report(
+        _context(
+            current_import_batches=(
+                ImportBatchInput(31, "2026-07", "transport", SHA_A, "배치 #31", True),
+                ImportBatchInput(32, "2026-07", "transport", SHA_B, "배치 #32", True),
             )
         )
     )
@@ -218,8 +254,8 @@ def test_duplicate_batch_locator_order_is_stable_when_batch_ids_tie():
     from app.domain.validation import ImportBatchInput, validate_report
 
     batches = (
-        ImportBatchInput(21, "2026-08", "transport", "sha-z", "배치 Z"),
-        ImportBatchInput(21, "2026-08", "transport", "sha-a", "배치 A"),
+        ImportBatchInput(21, "2026-08", "transport", SHA_B, "배치 Z", True),
+        ImportBatchInput(21, "2026-08", "transport", SHA_A, "배치 A", True),
     )
 
     forward = validate_report(_context(current_import_batches=batches))
@@ -309,7 +345,7 @@ def test_missing_next_month_plan_is_blocking():
                     display_order=4,
                     required_for_report=True,
                     actual_quantity=Decimal("0"),
-                    next_month_plan_quantity=None,
+                    next_month_plan=None,
                 ),
             )
         )
@@ -392,27 +428,23 @@ def test_required_blocking_codes_cannot_be_downgraded_to_warning(code):
 
 
 @pytest.mark.parametrize(
-    ("source_name", "source_locator"),
+    ("field", "source_locator"),
     [
-        ("plan", "계획 입력"),
-        ("actual", "실적 입력"),
-        ("import", "배치 #21"),
-        ("title", "표지 제목"),
-        ("graph_last_month", "그래프 마지막 열"),
+        ("plan_month", "당월 계획 입력"),
+        ("actual_month", "당월 실적 입력"),
+        ("transport_import_month", "운반비 가져오기"),
+        ("ppt_title_month", "PPT 표지 제목"),
+        ("graph_last_month", "그래프 마지막 월"),
     ],
 )
-def test_every_report_month_source_must_match_configured_month(
-    source_name, source_locator
-):
-    from app.domain.validation import ReportMonthInput, validate_report
+def test_every_report_month_source_must_match_configured_month(field, source_locator):
+    from dataclasses import replace
 
-    result = validate_report(
-        _context(
-            month_inputs=(
-                ReportMonthInput(source_name, "2026-07", source_locator),
-            )
-        )
-    )
+    from app.domain.validation import validate_report
+
+    context = _context()
+    wrong_sources = replace(context.month_sources, **{field: "2026-07"})
+    result = validate_report(replace(context, month_sources=wrong_sources))
 
     issue = next(
         issue for issue in result.issues if issue.code == "REPORT_MONTH_MISMATCH"
@@ -422,23 +454,6 @@ def test_every_report_month_source_must_match_configured_month(
     assert "2026-07" in issue.message
     assert "2026-08" in issue.message
     assert "수정" in issue.message
-
-
-def test_month_mismatch_does_not_hide_conflicting_current_batches():
-    from app.domain.validation import ImportBatchInput, validate_report
-
-    result = validate_report(
-        _context(
-            current_import_batches=(
-                ImportBatchInput(31, "2026-07", "transport", "sha-a", "배치 #31"),
-                ImportBatchInput(32, "2026-07", "transport", "sha-b", "배치 #32"),
-            )
-        )
-    )
-
-    codes = [issue.code for issue in result.issues]
-    assert codes.count("REPORT_MONTH_MISMATCH") == 2
-    assert codes.count("DUPLICATE_IMPORT") == 1
 
 
 def test_issues_are_deduplicated_only_when_every_identifying_field_matches():
@@ -482,7 +497,7 @@ def test_issue_sorting_is_deterministic_by_severity_destination_code_and_source(
                 5,
                 True,
                 None,
-                Decimal("1"),
+                _next_plan(Decimal("1")),
             ),
             DestinationValidationInput(
                 20,
@@ -552,7 +567,7 @@ def test_output_models_are_immutable_and_issues_are_a_tuple():
         lambda: _invalid_destination(destination_id=True),
         lambda: _invalid_destination(destination_id=0),
         lambda: _invalid_destination(actual_quantity=1),
-        lambda: _invalid_destination(next_month_plan_quantity=0),
+        lambda: _invalid_next_plan_quantity(0),
         lambda: _invalid_sales(amount_won=True),
         lambda: _invalid_batch(batch_id=False),
         lambda: _invalid_reconciliation(
@@ -579,7 +594,7 @@ def _invalid_destination(**changes):
         "display_order": 1,
         "required_for_report": True,
         "actual_quantity": Decimal("1"),
-        "next_month_plan_quantity": Decimal("1"),
+        "next_month_plan": _next_plan(Decimal("1")),
     }
     values.update(changes)
     destination = DestinationValidationInput(**values)
@@ -605,8 +620,9 @@ def _invalid_batch(**changes):
         "batch_id": 1,
         "report_month": "2026-08",
         "source_type": "transport",
-        "file_sha256": "sha",
+        "file_sha256": SHA_A,
         "source_locator": "배치 #1",
+        "is_current": True,
     }
     values.update(changes)
     return _context(current_import_batches=(ImportBatchInput(**values),))
@@ -627,15 +643,24 @@ def _invalid_reconciliation(**changes):
 
 
 def _bare_context(**changes):
-    from app.domain.validation import ValidationContext
+    from app.domain.validation import ReportMonthSources, ValidationContext
 
     values = {
         "report_month": "2026-08",
         "sales": None,
         "prior_year_history": None,
+        "month_sources": ReportMonthSources(None, None, None, None, None),
     }
     values.update(changes)
     return ValidationContext(**values)
+
+
+def _invalid_next_plan_quantity(value):
+    from app.domain.validation import NextMonthPlanInput
+
+    return _invalid_destination(
+        next_month_plan=NextMonthPlanInput("2026-09", value)
+    )
 
 
 def _invalid_history_complete_type():
@@ -650,3 +675,234 @@ def _invalid_history_complete_type():
             complete=1,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("report_month", "plan_month"),
+    [("2026-11", "2026-12"), ("2026-12", "2027-01")],
+)
+def test_zero_next_month_plan_is_present_across_year_rollover(
+    report_month, plan_month
+):
+    from app.domain.validation import (
+        DestinationValidationInput,
+        NextMonthPlanInput,
+        validate_report,
+    )
+
+    destination = DestinationValidationInput(
+        destination_id=1,
+        name="울산공장",
+        display_order=1,
+        required_for_report=True,
+        actual_quantity=Decimal("0"),
+        next_month_plan=NextMonthPlanInput(plan_month, Decimal("0")),
+    )
+
+    result = validate_report(
+        _provenance_context(report_month=report_month, destinations=(destination,))
+    )
+
+    assert "MISSING_NEXT_MONTH_PLAN" not in {issue.code for issue in result.issues}
+    assert "REPORT_MONTH_MISMATCH" not in {issue.code for issue in result.issues}
+
+
+@pytest.mark.parametrize(
+    "next_month_plan",
+    [
+        None,
+        pytest.param((None, Decimal("0")), id="missing-month"),
+        pytest.param(("2027-01", None), id="missing-quantity"),
+    ],
+)
+def test_missing_next_month_plan_month_or_quantity_is_blocking(next_month_plan):
+    from app.domain.validation import (
+        DestinationValidationInput,
+        NextMonthPlanInput,
+        validate_report,
+    )
+
+    snapshot = (
+        None
+        if next_month_plan is None
+        else NextMonthPlanInput(*next_month_plan)
+    )
+    destination = DestinationValidationInput(
+        1,
+        "울산공장",
+        1,
+        True,
+        Decimal("1"),
+        snapshot,
+    )
+
+    result = validate_report(
+        _provenance_context(report_month="2026-12", destinations=(destination,))
+    )
+
+    assert "MISSING_NEXT_MONTH_PLAN" in {issue.code for issue in result.issues}
+
+
+def test_wrong_next_month_plan_month_reports_both_month_and_missing_plan_errors():
+    from app.domain.validation import (
+        DestinationValidationInput,
+        NextMonthPlanInput,
+        validate_report,
+    )
+
+    destination = DestinationValidationInput(
+        1,
+        "울산공장",
+        1,
+        True,
+        Decimal("1"),
+        NextMonthPlanInput("2026-12", Decimal("0")),
+    )
+
+    result = validate_report(
+        _provenance_context(report_month="2026-12", destinations=(destination,))
+    )
+
+    codes = {issue.code for issue in result.issues}
+    assert {"MISSING_NEXT_MONTH_PLAN", "REPORT_MONTH_MISMATCH"} <= codes
+    month_issue = next(
+        issue for issue in result.issues if issue.code == "REPORT_MONTH_MISMATCH"
+    )
+    assert month_issue.source_locator == "다음 달 계획 입력"
+    assert "2026-12" in month_issue.message
+    assert "2027-01" in month_issue.message
+
+
+def test_all_five_report_month_sources_matching_produces_no_month_issue():
+    from app.domain.validation import validate_report
+
+    result = validate_report(_provenance_context())
+
+    assert "REPORT_MONTH_MISMATCH" not in {issue.code for issue in result.issues}
+
+
+def test_report_month_source_rejects_malformed_nonmissing_month():
+    from app.domain.validation import ReportMonthSources
+
+    with pytest.raises(ValueError, match="ASCII YYYY-MM"):
+        ReportMonthSources(
+            plan_month="2026-13",
+            actual_month="2026-08",
+            transport_import_month="2026-08",
+            ppt_title_month="2026-08",
+            graph_last_month="2026-08",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "locator"),
+    [
+        ("plan_month", "당월 계획 입력"),
+        ("actual_month", "당월 실적 입력"),
+        ("transport_import_month", "운반비 가져오기"),
+        ("ppt_title_month", "PPT 표지 제목"),
+        ("graph_last_month", "그래프 마지막 월"),
+    ],
+)
+def test_each_missing_report_month_source_is_reported(field, locator):
+    from dataclasses import replace
+
+    from app.domain.validation import validate_report
+
+    context = _provenance_context()
+    missing = replace(context.month_sources, **{field: None})
+    result = validate_report(replace(context, month_sources=missing))
+
+    issue = next(
+        issue for issue in result.issues if issue.code == "REPORT_MONTH_MISMATCH"
+    )
+    assert issue.source_locator == locator
+    assert "없습니다" in issue.message
+    assert "2026-08" in issue.message
+
+
+def test_superseded_import_batch_does_not_conflict_with_corrected_current_batch():
+    from app.domain.validation import ImportBatchInput, validate_report
+
+    result = validate_report(
+        _provenance_context(
+            current_import_batches=(
+                ImportBatchInput(
+                    1, "2026-08", "transport", SHA_A, "배치 #1", False
+                ),
+                ImportBatchInput(
+                    2, "2026-08", "transport", SHA_B, "배치 #2", True
+                ),
+            )
+        )
+    )
+
+    assert "DUPLICATE_IMPORT" not in {issue.code for issue in result.issues}
+
+
+def test_two_distinct_current_import_batches_block_and_identify_the_source():
+    from app.domain.validation import ImportBatchInput, validate_report
+
+    result = validate_report(
+        _provenance_context(
+            current_import_batches=(
+                ImportBatchInput(
+                    1, "2026-08", "transport", SHA_A, "배치 #1", True
+                ),
+                ImportBatchInput(
+                    2, "2026-08", "transport", SHA_B, "배치 #2", True
+                ),
+            )
+        )
+    )
+
+    issue = next(issue for issue in result.issues if issue.code == "DUPLICATE_IMPORT")
+    assert issue.source_locator == "배치 #1, 배치 #2"
+    assert "transport" in issue.message
+    assert "배치 #1" in issue.message
+    assert "배치 #2" in issue.message
+
+
+@pytest.mark.parametrize(
+    "file_sha256",
+    ["a" * 63, "g" * 64, "A" * 64],
+    ids=("short", "non-hex", "uppercase"),
+)
+def test_import_batch_requires_lowercase_64_character_sha256(file_sha256):
+    from app.domain.validation import ImportBatchInput
+
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        ImportBatchInput(
+            1, "2026-08", "transport", file_sha256, "배치 #1", True
+        )
+
+
+def test_import_batch_current_state_is_strict_bool():
+    from app.domain.validation import ImportBatchInput
+
+    with pytest.raises(TypeError, match="is_current"):
+        ImportBatchInput(1, "2026-08", "transport", SHA_A, "배치 #1", 1)
+
+
+def _provenance_context(**changes):
+    from app.domain.validation import (
+        ReportMonthSources,
+        SalesInput,
+        ValidationContext,
+    )
+
+    report_month = changes.get("report_month", "2026-08")
+    values = {
+        "report_month": report_month,
+        "sales": SalesInput(1_000_000, f"{report_month}-28", "월 매출 입력"),
+        "prior_year_history": _complete_prior_year(report_month),
+        "month_sources": ReportMonthSources(
+            plan_month=report_month,
+            actual_month=report_month,
+            transport_import_month=report_month,
+            ppt_title_month=report_month,
+            graph_last_month=report_month,
+        ),
+    }
+    values.update(changes)
+    return ValidationContext(**values)
