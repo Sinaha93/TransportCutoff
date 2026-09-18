@@ -638,7 +638,7 @@ git commit -m "feat: migrate historical transport data"
 - Create: `transport_report/app/web/static/app.css`
 - Create: `transport_report/tests/integration/test_web_routes.py`
 
-- [ ] **Step 1: Write failing browser-route tests**
+- [x] **Step 1: Write failing browser-route tests**
 
 ```python
 def test_monthly_input_page_distinguishes_blank_and_zero(client):
@@ -655,13 +655,13 @@ def test_unknown_aliases_are_actionable(client, seeded_unknown_alias):
     assert "새 납품처 등록" in response.text
 ```
 
-- [ ] **Step 2: Run route tests and verify failure**
+- [x] **Step 2: Run route tests and verify failure**
 
 Run: `python -m pytest tests/integration/test_web_routes.py -v`
 
 Expected: FAIL because routes and templates are missing.
 
-- [ ] **Step 3: Implement the dashboard workflow**
+- [x] **Step 3: Implement the dashboard workflow**
 
 The first screen must show, in order:
 
@@ -673,21 +673,21 @@ The first screen must show, in order:
 
 Disable generation buttons server-side and visually when `can_generate` is false.
 
-- [ ] **Step 4: Implement master-management screens**
+- [x] **Step 4: Implement master-management screens**
 
 Destination screen supports name, aliases, display order, active state, representative item, and total inclusion flags. Group screen supports group name, ordered members, and per-member quantity/cost inclusion. Changes redirect to a recalculated report preview.
 
-- [ ] **Step 5: Implement monthly manual-entry screens**
+- [x] **Step 5: Implement monthly manual-entry screens**
 
 Use one row per required destination with plan quantity, plan cost, representative item, actual quantity, and a source note. Put report-month sales and confirmation date above the table. Save all rows in one transaction.
 
-- [ ] **Step 6: Run web tests**
+- [x] **Step 6: Run web tests**
 
 Run: `python -m pytest tests/integration/test_web_routes.py -v`
 
 Expected: PASS for form validation, alias resolution, group edits, missing inputs, explicit zero, and generation-button state.
 
-- [ ] **Step 7: Commit the UI**
+- [x] **Step 7: Commit the UI**
 
 ```powershell
 git add transport_report/app/web transport_report/tests/integration/test_web_routes.py
