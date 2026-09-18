@@ -106,6 +106,28 @@ class MigrationSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class MonthLockSnapshot:
+    report_month: str
+    is_locked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TargetRowSnapshot:
+    table: str
+    report_month: str
+    destination_id: int
+    existing_value: tuple[str, ...] | None
+    incoming_value: tuple[str, ...]
+    action: str
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseSnapshot:
+    month_locks: tuple[MonthLockSnapshot, ...]
+    targets: tuple[TargetRowSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciledMetrics:
     planned_quantity: Decimal | None
     planned_cost_won: int | None
@@ -143,6 +165,8 @@ class MigrationDryRun:
     source_path: Path
     source_sha256: str
     master_revision: str
+    database_snapshot: DatabaseSnapshot
+    database_revision: str
     revision: str
     report_month: str
     plans: tuple[StagedPlanRecord, ...]
@@ -209,7 +233,7 @@ class LegacyMigrationService:
                 aliases=aliases,
                 initial_issues=resolution_issues,
             )
-            database_issues, database_state, insert_count, unchanged_count = (
+            database_issues, database_snapshot, insert_count, unchanged_count = (
                 _inspect_database_state(
                     connection,
                     parsed.plans,
@@ -256,13 +280,14 @@ class LegacyMigrationService:
             rows_to_insert=insert_count,
             rows_unchanged=unchanged_count,
         )
+        database_revision = _database_revision(database_snapshot)
         revision = _dry_run_revision(
             source_sha256=source_sha256,
             master_revision=master_revision,
             report_month=report_month,
             plans=parsed.plans,
             actuals=parsed.actuals,
-            database_state=database_state,
+            database_revision=database_revision,
             unknown_aliases=parsed.unknown_aliases,
             issues=issues,
         )
@@ -270,6 +295,8 @@ class LegacyMigrationService:
             source_path=source,
             source_sha256=source_sha256,
             master_revision=master_revision,
+            database_snapshot=database_snapshot,
+            database_revision=database_revision,
             revision=revision,
             report_month=report_month,
             plans=parsed.plans,
@@ -288,6 +315,7 @@ class LegacyMigrationService:
         confirmed: bool,
         expected_source_sha256: str,
         expected_master_revision: str,
+        expected_database_revision: str,
         expected_revision: str,
     ) -> MigrationCommitResult:
         if confirmed is not True:
@@ -303,6 +331,11 @@ class LegacyMigrationService:
         if current.master_revision != expected_master_revision:
             raise LegacyMigrationRevisionError(
                 "드라이런 이후 납품처/별칭/그룹 기준정보가 변경되었습니다. "
+                "다시 드라이런하세요."
+            )
+        if current.database_revision != expected_database_revision:
+            raise LegacyMigrationRevisionError(
+                "드라이런 이후 대상 DB 값 또는 월 잠금 상태가 변경되었습니다. "
                 "다시 드라이런하세요."
             )
         if current.revision != expected_revision:
@@ -332,16 +365,22 @@ class LegacyMigrationService:
                 raise LegacyMigrationRevisionError(
                     "커밋 직전에 기준정보가 변경되었습니다. 다시 드라이런하세요."
                 )
-            database_issues, database_state, _, _ = _inspect_database_state(
+            database_issues, database_snapshot, _, _ = _inspect_database_state(
                 connection, current.plans, current.actuals
             )
+            database_revision = _database_revision(database_snapshot)
+            if database_revision != current.database_revision:
+                raise LegacyMigrationRevisionError(
+                    "커밋 직전에 대상 DB 값 또는 월 잠금 상태가 변경되었습니다. "
+                    "다시 드라이런하세요."
+                )
             revision = _dry_run_revision(
                 source_sha256=current.source_sha256,
                 master_revision=current.master_revision,
                 report_month=current.report_month,
                 plans=current.plans,
                 actuals=current.actuals,
-                database_state=database_state,
+                database_revision=database_revision,
                 unknown_aliases=current.unknown_aliases,
                 issues=tuple(
                     sorted(
@@ -537,17 +576,23 @@ def _parse_history(formula_sheet, cached_sheet, aliases: dict[str, int]) -> _Par
                 )
             )
 
-    occupied_rows = [
-        row
-        for row in range(2, cached_sheet.max_row + 1)
+    for row in range(282, cached_sheet.max_row + 1):
         if any(
             cached_sheet.cell(row, column).value is not None
             for column in range(1, 7)
-        )
-    ]
-    last_data_row = max(occupied_rows, default=1)
+        ):
+            issues.append(
+                MigrationIssue(
+                    code="HISTORY_ROW_OUT_OF_RANGE",
+                    message=(
+                        "누적 데이터의 업무 영역은 A2:F281(280행)입니다. "
+                        "범위 밖 값을 삭제하거나 올바른 행으로 이동하세요."
+                    ),
+                    source_locator=f"{_HISTORY_SHEET}!A{row}:F{row}",
+                )
+            )
     seen: set[tuple[str, int]] = set()
-    for row in range(2, last_data_row + 1):
+    for row in range(2, 282):
         values = tuple(cached_sheet.cell(row, column).value for column in range(1, 7))
         if all(value is None for value in values):
             issues.append(
@@ -667,49 +712,21 @@ def _parse_plans(
                     )
                 )
 
-    total_rows = [
-        row
-        for row in range(6, cached_sheet.max_row + 1)
-        if _as_text(cached_sheet.cell(row, 2).value) == "합계"
-    ]
-    if not total_rows:
+    total_row = 20
+    total_label = _as_text(cached_sheet.cell(total_row, 2).value)
+    if total_label != "합계":
         issues.append(
             MigrationIssue(
-                code="MISSING_PLAN_TOTAL",
-                message="계획 데이터 끝을 표시하는 '합계' 행을 찾을 수 없습니다.",
-                source_locator=f"{_PLAN_SHEET}!B6:B{cached_sheet.max_row}",
+                code="PLAN_TOTAL_ROW_MISMATCH",
+                message=(
+                    "계획 데이터는 B6:B19 납품처 행과 B20 합계 행 구조여야 "
+                    "합니다. B20의 '합계'를 복원하세요."
+                ),
+                source_locator=f"{_PLAN_SHEET}!B20",
+                expected="합계",
+                actual=total_label,
             )
         )
-        total_row = 6
-    else:
-        total_row = total_rows[0]
-        if len(total_rows) > 1:
-            issues.append(
-                MigrationIssue(
-                    code="MULTIPLE_PLAN_TOTALS",
-                    message=(
-                        "계획 데이터의 '합계' 행이 둘 이상입니다. 원본 표의 "
-                        "종료 행을 하나만 남기세요."
-                    ),
-                    source_locator=(
-                        f"{_PLAN_SHEET}!"
-                        + ",".join(f"B{row}" for row in total_rows)
-                    ),
-                )
-            )
-        if total_row != 20:
-            issues.append(
-                MigrationIssue(
-                    code="PLAN_TOTAL_ROW_MISMATCH",
-                    message=(
-                        "계획 데이터는 B6:B19 납품처 행과 B20 합계 행 구조여야 "
-                        "합니다. 원본 표 범위를 확인하세요."
-                    ),
-                    source_locator=f"{_PLAN_SHEET}!B{total_row}",
-                    expected="B20",
-                    actual=f"B{total_row}",
-                )
-            )
 
     seen: set[tuple[str, int]] = set()
     for row in range(6, total_row):
@@ -726,7 +743,7 @@ def _parse_plans(
                 UnknownAlias(alias, LEGACY_SOURCE_TYPE, f"{_PLAN_SHEET}!B{row}")
             )
             continue
-        for month in range(1, report_month_number + 1):
+        for month in (report_month_number,):
             quantity_column = 3 + (month - 1) * 2
             cost_column = quantity_column + 1
             quantity_value = _cached_value(
@@ -1318,8 +1335,8 @@ def _reconcile(
 
 
 def _inspect_database_state(connection, plans, actuals):
-    issues = []
-    state = []
+    issues: list[MigrationIssue] = []
+    targets: list[TargetRowSnapshot] = []
     insert_count = 0
     unchanged_count = 0
     months = sorted(
@@ -1338,26 +1355,27 @@ def _inspect_database_state(connection, plans, actuals):
     existing_plans, existing_quantities, existing_costs = (
         _load_existing_monthly_values(connection, months)
     )
-    for month in months:
-        is_locked = month in locked
-        state.append(("lock", month, is_locked))
-        if is_locked:
-            issues.append(
-                MigrationIssue(
-                    code="MONTH_LOCKED",
-                    message=f"{month}은 마감 잠금 상태이므로 마이그레이션할 수 없습니다.",
-                    source_locator=f"DB month_locks:{month}",
-                )
-            )
-
     for record in plans:
         key = (record.report_month, record.destination_id)
         existing = existing_plans.get(key)
-        incoming = (_quantity_text(record.quantity_ea), record.cost_won)
-        state.append(("plan", record.report_month, record.destination_id, existing))
-        if existing is None:
+        existing_text = (
+            None if existing is None else (str(existing[0]), str(existing[1]))
+        )
+        incoming = (_quantity_text(record.quantity_ea), str(record.cost_won))
+        action = _target_action(existing_text, incoming)
+        targets.append(
+            TargetRowSnapshot(
+                table="monthly_plans",
+                report_month=record.report_month,
+                destination_id=record.destination_id,
+                existing_value=existing_text,
+                incoming_value=incoming,
+                action=action,
+            )
+        )
+        if action == "insert":
             insert_count += 1
-        elif existing == incoming:
+        elif action == "unchanged":
             unchanged_count += 1
         else:
             issues.append(
@@ -1365,7 +1383,7 @@ def _inspect_database_state(connection, plans, actuals):
                     "monthly_plans",
                     record.report_month,
                     record.destination_id,
-                    existing,
+                    existing_text,
                     incoming,
                 )
             )
@@ -1373,18 +1391,24 @@ def _inspect_database_state(connection, plans, actuals):
         if record.quantity_ea is not None:
             key = (record.report_month, record.destination_id)
             existing_quantity = existing_quantities.get(key)
-            incoming_quantity = _quantity_text(record.quantity_ea)
-            state.append(
-                (
-                    "actual_quantity",
-                    record.report_month,
-                    record.destination_id,
-                    existing_quantity,
+            existing_text = (
+                None if existing_quantity is None else (existing_quantity,)
+            )
+            incoming = (_quantity_text(record.quantity_ea),)
+            action = _target_action(existing_text, incoming)
+            targets.append(
+                TargetRowSnapshot(
+                    table="monthly_actual_quantities",
+                    report_month=record.report_month,
+                    destination_id=record.destination_id,
+                    existing_value=existing_text,
+                    incoming_value=incoming,
+                    action=action,
                 )
             )
-            if existing_quantity is None:
+            if action == "insert":
                 insert_count += 1
-            elif existing_quantity == incoming_quantity:
+            elif action == "unchanged":
                 unchanged_count += 1
             else:
                 issues.append(
@@ -1392,24 +1416,29 @@ def _inspect_database_state(connection, plans, actuals):
                         "monthly_actual_quantities",
                         record.report_month,
                         record.destination_id,
-                        existing_quantity,
-                        incoming_quantity,
+                        existing_text,
+                        incoming,
                     )
                 )
         if record.cost_won is not None:
             key = (record.report_month, record.destination_id)
             existing_cost = existing_costs.get(key)
-            state.append(
-                (
-                    "actual_cost",
-                    record.report_month,
-                    record.destination_id,
-                    existing_cost,
+            existing_text = None if existing_cost is None else (str(existing_cost),)
+            incoming = (str(record.cost_won),)
+            action = _target_action(existing_text, incoming)
+            targets.append(
+                TargetRowSnapshot(
+                    table="monthly_actual_costs",
+                    report_month=record.report_month,
+                    destination_id=record.destination_id,
+                    existing_value=existing_text,
+                    incoming_value=incoming,
+                    action=action,
                 )
             )
-            if existing_cost is None:
+            if action == "insert":
                 insert_count += 1
-            elif existing_cost == record.cost_won:
+            elif action == "unchanged":
                 unchanged_count += 1
             else:
                 issues.append(
@@ -1417,11 +1446,38 @@ def _inspect_database_state(connection, plans, actuals):
                         "monthly_actual_costs",
                         record.report_month,
                         record.destination_id,
-                        existing_cost,
-                        record.cost_won,
+                        existing_text,
+                        incoming,
                     )
                 )
-    return tuple(issues), tuple(state), insert_count, unchanged_count
+    lock_snapshots = tuple(
+        MonthLockSnapshot(report_month=month, is_locked=month in locked)
+        for month in months
+    )
+    for lock in lock_snapshots:
+        if lock.is_locked and any(
+            target.report_month == lock.report_month
+            and target.action != "unchanged"
+            for target in targets
+        ):
+            issues.append(
+                MigrationIssue(
+                    code="MONTH_LOCKED",
+                    message=(
+                        f"{lock.report_month}은 마감 잠금 상태이며 새로 저장하거나 "
+                        "변경할 값이 있어 마이그레이션할 수 없습니다."
+                    ),
+                    source_locator=f"DB month_locks:{lock.report_month}",
+                )
+            )
+    snapshot = DatabaseSnapshot(lock_snapshots, tuple(targets))
+    return tuple(issues), snapshot, insert_count, unchanged_count
+
+
+def _target_action(existing, incoming) -> str:
+    if existing is None:
+        return "insert"
+    return "unchanged" if existing == incoming else "conflict"
 
 
 def _load_existing_monthly_values(connection, months):
@@ -1505,6 +1561,26 @@ def _master_revision(connection):
     return _json_hash(payload)
 
 
+def _database_revision(snapshot: DatabaseSnapshot) -> str:
+    return _json_hash(
+        {
+            "month_locks": [
+                (item.report_month, item.is_locked)
+                for item in snapshot.month_locks
+            ],
+            "targets": [
+                (
+                    item.table,
+                    item.report_month,
+                    item.destination_id,
+                    item.existing_value,
+                )
+                for item in snapshot.targets
+            ],
+        }
+    )
+
+
 def _dry_run_revision(
     *,
     source_sha256,
@@ -1512,7 +1588,7 @@ def _dry_run_revision(
     report_month,
     plans,
     actuals,
-    database_state,
+    database_revision,
     unknown_aliases,
     issues,
 ):
@@ -1544,7 +1620,7 @@ def _dry_run_revision(
             )
             for item in actuals
         ],
-        "database_state": database_state,
+        "database_revision": database_revision,
         "unknown_aliases": [
             (item.alias, item.source_type, item.source_locator)
             for item in unknown_aliases

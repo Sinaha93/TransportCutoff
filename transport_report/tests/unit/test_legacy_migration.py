@@ -76,6 +76,7 @@ def _commit(service, dry_run, source: Path):
         confirmed=True,
         expected_source_sha256=dry_run.source_sha256,
         expected_master_revision=dry_run.master_revision,
+        expected_database_revision=dry_run.database_revision,
         expected_revision=dry_run.revision,
     )
 
@@ -100,7 +101,7 @@ def test_parses_exact_regions_cached_formulas_and_ignores_chart_helpers(
     result = service.dry_run(source, report_month="2026-08")
 
     assert result.can_commit
-    assert result.summary.plan_records == 112
+    assert result.summary.plan_records == 14
     assert result.summary.actual_records == 280
     assert result.summary.current_plan_records == 14
     assert result.summary.current_actual_records == 14
@@ -220,6 +221,7 @@ def test_commit_requires_confirmation_and_exact_dry_run_tokens(
             confirmed=False,
             expected_source_sha256=dry_run.source_sha256,
             expected_master_revision=dry_run.master_revision,
+            expected_database_revision=dry_run.database_revision,
             expected_revision=dry_run.revision,
         )
     with pytest.raises(migration_api["revision"], match="해시"):
@@ -229,6 +231,7 @@ def test_commit_requires_confirmation_and_exact_dry_run_tokens(
             confirmed=True,
             expected_source_sha256="0" * 64,
             expected_master_revision=dry_run.master_revision,
+            expected_database_revision=dry_run.database_revision,
             expected_revision=dry_run.revision,
         )
 
@@ -261,11 +264,11 @@ def test_confirmed_commit_is_atomic_and_repeated_import_is_idempotent(
     second_dry_run = service.dry_run(source, report_month="2026-08")
     second = _commit(service, second_dry_run, source)
 
-    assert first.inserted == sum(first_counts) == 672
+    assert first.inserted == sum(first_counts) == 574
     assert first.unchanged == 0
     assert second.inserted == 0
-    assert second.unchanged == 672
-    assert _table_counts(database) == first_counts == (112, 280, 280)
+    assert second.unchanged == 574
+    assert _table_counts(database) == first_counts == (14, 280, 280)
 
 
 def test_conflicting_existing_value_blocks_without_overwrite(
@@ -483,7 +486,7 @@ def test_wrong_headers_are_blocking_and_actionable(tmp_path, service):
     assert not result.can_commit
 
 
-def test_internal_history_gap_and_multiple_plan_totals_are_structure_blockers(
+def test_internal_history_gap_is_a_structure_blocker_but_helper_total_is_ignored(
     tmp_path, service
 ):
     source = build_legacy_fixture(tmp_path / "structure.xlsx")
@@ -493,7 +496,7 @@ def test_internal_history_gap_and_multiple_plan_totals_are_structure_blockers(
     history = workbook["누적 데이터"]
     for column in range(1, 7):
         history.cell(10, column).value = None
-    workbook["26년 월계획"]["B26"] = "합계"
+    workbook["26년 월계획"]["B21"] = "합계"
     workbook.save(source)
     workbook.close()
 
@@ -501,7 +504,7 @@ def test_internal_history_gap_and_multiple_plan_totals_are_structure_blockers(
 
     codes = {item.code for item in result.issues}
     assert "UNEXPECTED_BLANK_HISTORY_ROW" in codes
-    assert "MULTIPLE_PLAN_TOTALS" in codes
+    assert "MULTIPLE_PLAN_TOTALS" not in codes
     assert not result.can_commit
 
 
@@ -519,5 +522,74 @@ def test_moved_sole_plan_total_is_a_structure_blocker(tmp_path, service):
     result = service.dry_run(source, report_month="2026-08")
 
     issue = next(item for item in result.issues if item.code == "PLAN_TOTAL_ROW_MISMATCH")
-    assert issue.source_locator == "26년 월계획!B26"
+    assert issue.source_locator == "26년 월계획!B20"
     assert not result.can_commit
+
+
+def test_extra_populated_history_row_is_blocked_and_not_staged(tmp_path, service):
+    source = build_legacy_fixture(tmp_path / "extra-history.xlsx")
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(source)
+    history = workbook["누적 데이터"]
+    history["A282"] = "26년"
+    history["B282"] = "8월"
+    history["D282"] = "Alpha"
+    history["E282"] = 1
+    history["F282"] = 100
+    workbook.save(source)
+    workbook.close()
+
+    result = service.dry_run(source, report_month="2026-08")
+
+    issue = next(item for item in result.issues if item.code == "HISTORY_ROW_OUT_OF_RANGE")
+    assert issue.source_locator == "누적 데이터!A282:F282"
+    assert len(result.actuals) == 280
+    assert not result.can_commit
+
+
+def test_identical_repeat_is_no_write_even_when_month_is_locked(
+    tmp_path, database, service
+):
+    source = build_legacy_fixture(tmp_path / "locked-repeat.xlsx")
+    first = service.dry_run(source, report_month="2026-08")
+    _commit(service, first, source)
+    with database.connection() as connection:
+        connection.execute(
+            "INSERT INTO month_locks"
+            "(report_month, is_locked, locked_at, input_revision) "
+            "VALUES ('2026-08', 1, '2026-09-18T00:00:00Z', 'locked-repeat')"
+        )
+        connection.commit()
+    after_lock = database.path.read_bytes()
+
+    repeat = service.dry_run(source, report_month="2026-08")
+
+    assert repeat.can_commit
+    assert not any(item.code == "MONTH_LOCKED" for item in repeat.issues)
+    result = _commit(service, repeat, source)
+    assert result.inserted == 0
+    assert result.unchanged == 574
+    assert _table_counts(database) == (14, 280, 280)
+    assert database.path.read_bytes() == after_lock
+
+
+def test_dry_run_exposes_frozen_database_snapshot_and_revision(tmp_path, service):
+    source = build_legacy_fixture(tmp_path / "snapshot-fields.xlsx")
+    changed_source = build_legacy_fixture(
+        tmp_path / "snapshot-other-source.xlsx", zero_current=True
+    )
+
+    result = service.dry_run(source, report_month="2026-08")
+    changed = service.dry_run(changed_source, report_month="2026-08")
+
+    assert len(result.database_revision) == 64
+    assert result.database_snapshot.month_locks[0].report_month == "2025-01"
+    assert result.database_snapshot.month_locks[0].is_locked is False
+    actions = {target.action for target in result.database_snapshot.targets}
+    assert actions == {"insert"}
+    assert len(result.database_snapshot.targets) == 574
+    assert changed.database_revision == result.database_revision
+    assert changed.revision != result.revision
+    with pytest.raises(FrozenInstanceError):
+        result.database_snapshot.month_locks[0].is_locked = True
