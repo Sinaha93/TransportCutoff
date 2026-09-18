@@ -446,6 +446,7 @@ def validate_report(context: ValidationContext) -> ValidationResult:
                     report_month=expected_plan_month,
                     source_locator="다음 달 계획 입력",
                     expected_label="예상 계획 월",
+                    destination_id=destination.destination_id,
                 )
             )
         for vehicle_type in sorted(
@@ -478,6 +479,7 @@ def _month_mismatch_issue(
     report_month: str,
     source_locator: str,
     expected_label: str = "설정된 보고 월",
+    destination_id: int | None = None,
 ) -> ValidationIssue:
     if source_month is None:
         message = (
@@ -493,6 +495,7 @@ def _month_mismatch_issue(
         code="REPORT_MONTH_MISMATCH",
         severity="error",
         message=message,
+        destination_id=destination_id,
         source_locator=source_locator,
     )
 

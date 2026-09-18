@@ -773,6 +773,50 @@ def test_wrong_next_month_plan_month_reports_both_month_and_missing_plan_errors(
     assert "2027-01" in month_issue.message
 
 
+def test_plan_month_mismatches_keep_destination_identity_order_and_dedup():
+    from dataclasses import replace
+
+    from app.domain.validation import (
+        DestinationValidationInput,
+        NextMonthPlanInput,
+        validate_report,
+    )
+
+    wrong_plan = NextMonthPlanInput("2026-08", Decimal("1"))
+    destinations = (
+        DestinationValidationInput(
+            10, "동일 공장명", 2, True, Decimal("1"), wrong_plan
+        ),
+        DestinationValidationInput(
+            20, "동일 공장명", 1, True, Decimal("1"), wrong_plan
+        ),
+    )
+    context = _provenance_context(destinations=destinations)
+    global_mismatch = replace(context.month_sources, plan_month="2026-07")
+
+    result = validate_report(replace(context, month_sources=global_mismatch))
+
+    destination_issues = [
+        (issue.destination_id, issue.code)
+        for issue in result.issues
+        if issue.destination_id is not None
+        and issue.code in {"MISSING_NEXT_MONTH_PLAN", "REPORT_MONTH_MISMATCH"}
+    ]
+    assert destination_issues == [
+        (20, "MISSING_NEXT_MONTH_PLAN"),
+        (20, "REPORT_MONTH_MISMATCH"),
+        (10, "MISSING_NEXT_MONTH_PLAN"),
+        (10, "REPORT_MONTH_MISMATCH"),
+    ]
+    global_issue = next(
+        issue
+        for issue in result.issues
+        if issue.code == "REPORT_MONTH_MISMATCH"
+        and issue.source_locator == "당월 계획 입력"
+    )
+    assert global_issue.destination_id is None
+
+
 def test_all_five_report_month_sources_matching_produces_no_month_issue():
     from app.domain.validation import validate_report
 
