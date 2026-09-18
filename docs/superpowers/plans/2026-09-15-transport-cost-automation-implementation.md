@@ -453,7 +453,7 @@ git commit -m "feat: import and normalize transport workbooks"
 - Create: `transport_report/app/domain/calculations.py`
 - Create: `transport_report/tests/unit/test_calculations.py`
 
-- [ ] **Step 1: Write failing destination calculations**
+- [x] **Step 1: Write failing destination calculations**
 
 ```python
 def test_unit_transport_cost_is_cost_divided_by_quantity():
@@ -473,17 +473,17 @@ def test_zero_quantity_produces_no_unit_cost_instead_of_division_error():
     assert result.actual_unit_cost_variance_pct is None
 ```
 
-- [ ] **Step 2: Write failing total and group tests**
+- [x] **Step 2: Write failing total and group tests**
 
 Test that 당진 is excluded from quantity totals but included in cost totals. Test that 영남권 sums 현대 울산, 포레시아 영천, and 세종공업 without being added again to the grand total.
 
-- [ ] **Step 3: Run the tests and verify failure**
+- [x] **Step 3: Run the tests and verify failure**
 
 Run: `python -m pytest tests/unit/test_calculations.py -v`
 
 Expected: FAIL because the calculation functions are missing.
 
-- [ ] **Step 4: Implement calculation functions**
+- [x] **Step 4: Implement calculation functions**
 
 Use `Decimal` throughout and centralize rounding:
 
@@ -504,17 +504,17 @@ def variance_pct(actual: Decimal, plan: Decimal) -> Decimal | None:
 
 Calculate 3-, 6-, and 12-month averages from complete calendar months ending one month before the configured report month. For a 2026-08 report, use 2026-05 through 2026-07 for the 3-month average, 2026-02 through 2026-07 for the 6-month average, and 2025-08 through 2026-07 for the 12-month average. Calculate the comparison-year average from the full year immediately preceding the report year.
 
-- [ ] **Step 5: Add the ±15% review selector**
+- [x] **Step 5: Add the ±15% review selector**
 
 Select destinations where unit-cost variance percent is less than or equal to `-0.15` or greater than or equal to `0.15`. A missing unit cost becomes a validation item, not an automatic narrative.
 
-- [ ] **Step 6: Run calculation tests**
+- [x] **Step 6: Run calculation tests**
 
 Run: `python -m pytest tests/unit/test_calculations.py -v`
 
 Expected: PASS for destination, total, group, average, zero, and threshold cases.
 
-- [ ] **Step 7: Commit calculations**
+- [x] **Step 7: Commit calculations**
 
 ```powershell
 git add transport_report/app/domain/calculations.py transport_report/tests/unit/test_calculations.py
