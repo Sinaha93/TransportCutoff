@@ -155,21 +155,50 @@ def make_report():
         next_calc = calculate_destination(Decimal(6000), 2400000, None, None, destination_id=index)
         destinations.append(dest)
         calculations[index], next_calculations[index] = calculation, next_calc
-        rows.append(ReportRow(str(index), dest.name, calculation, quantities, costs))
-        next_rows.append(ReportRow(str(index), dest.name, next_calc, quantities, costs))
+        row_quantities = {**quantities, '2026-08': calculation.actual_quantity}
+        row_costs = {**costs, '2026-08': calculation.actual_cost_won}
+        rows.append(ReportRow(str(index), dest.name, calculation, row_quantities, row_costs))
+        next_rows.append(ReportRow(str(index), dest.name, next_calc, row_quantities, row_costs))
     total = calculate_total(calculations, destinations)
     next_total = calculate_total(next_calculations, destinations)
-    total_row = ReportRow('total', '합계', total, quantities, costs)
-    nonregular = ReportRow('extra', '비정규 운반비', calculate_destination(Decimal(0), 0, Decimal(0), 0), quantities, costs)
+    actual_quantities = {**quantities, '2026-08': total.actual_quantity}
+    actual_costs = {**costs, '2026-08': total.actual_cost_won}
+    total_row = ReportRow('total', '합계', total, actual_quantities, actual_costs)
+    nonregular = ReportRow('extra', '비정규 운반비', calculate_destination(Decimal(0), 0, Decimal(0), 0), {**quantities, '2026-08': Decimal(0)}, {**costs, '2026-08': 0})
     chart = ChartReport('2026-08', {**quantities, '2026-08': total.planned_quantity}, {**quantities, '2026-08': total.actual_quantity}, {**costs, '2026-08': total.planned_cost_won}, {**costs, '2026-08': total.actual_cost_won})
     sales = SalesReport(300000000, 310000000, {m: 300000000 for m in months})
     return PptReport('2026-08', date(2026, 9, 1), tuple(rows) + (None, None), nonregular, total_row, sales,
-        PlanReport('2026-09', tuple(next_rows), replace(nonregular, calculation=calculate_destination(Decimal(0), 0, None, None)), ReportRow('total', '합계', next_total, quantities, costs), SalesReport(400000000, None, sales.actual_won_by_month)), chart, ())
+        PlanReport('2026-09', tuple(next_rows), replace(nonregular, calculation=calculate_destination(Decimal(0), 0, None, None)), ReportRow('total', '합계', next_total, actual_quantities, actual_costs), SalesReport(400000000, None, sales.actual_won_by_month)), chart, ())
+
+
+def with_actual_rows(report, *rows):
+    """Update fictional actuals and the same identity's shared history together."""
+    updates = {row.key: replace(row, quantity_by_month={**row.quantity_by_month, '2026-08': row.calculation.actual_quantity}, cost_won_by_month={**row.cost_won_by_month, '2026-08': row.calculation.actual_cost_won}) for row in rows}
+    current = tuple(updates.get(row.key, row) if row else None for row in report.rows)
+    next_rows = tuple(replace(row, quantity_by_month=updates[row.key].quantity_by_month, cost_won_by_month=updates[row.key].cost_won_by_month) if row and row.key in updates else row for row in report.next_month.rows)
+    return replace(report, rows=current, next_month=replace(report.next_month, rows=next_rows))
+
+
+def reviewed_report(report, reason='가상 원인'):
+    from app.domain.calculations import calculate_destination
+    from app.reporting.pptx_report import ReviewDetail
+    first = replace(report.rows[0], calculation=calculate_destination(Decimal(5000), 2000000, Decimal(4000), 2400000, destination_id=1))
+    return replace(with_actual_rows(report, first), reviews=(ReviewDetail('1', 5, 4, Decimal(1200), reason),))
 
 
 @pytest.fixture
 def report():
     return make_report()
+
+
+@pytest.fixture
+def fast_charts(monkeypatch):
+    """Validation regressions do not need to exercise Task10 rendering again."""
+    from app.reporting import pptx_report
+    def render(report, path):
+        Image.new('RGB', (80, 50), 'white').save(path)
+    for name in ('render_quantity_chart', 'render_cost_chart', 'render_combined_chart'):
+        monkeypatch.setattr(pptx_report, name, render)
 
 
 def named(p, slide, role):
@@ -266,7 +295,7 @@ def test_missing_zero_and_selected_reviews(template, report, tmp_path):
     from app.reporting.pptx_report import generate_pptx, ReviewDetail
     first = replace(report.rows[0], calculation=calculate_destination(Decimal(5000), 2000000, Decimal(0), 0, destination_id=1))
     second = replace(report.rows[1], calculation=calculate_destination(Decimal(5000), 2000000, Decimal(4000), 2400000, destination_id=2))
-    report = replace(report, rows=(first, second, *report.rows[2:]), reviews=(ReviewDetail('2', 5, 4, Decimal(1200), '가상 원인'),))
+    report = replace(with_actual_rows(report, first, second), reviews=(ReviewDetail('2', 5, 4, Decimal(1200), '가상 원인'),))
     output = tmp_path / 'review.pptx'
     generate_pptx(template, report, output)
     t = named(Presentation(output), 2, 'report.monthly_table').table
@@ -396,13 +425,11 @@ def test_render_failure_preserves_existing_output(template, report, tmp_path, mo
 
 def test_next_month_averages_include_august_while_report_excludes_it(template, report, tmp_path):
     from app.reporting.pptx_report import generate_pptx
-    history = {**report.rows[0].cost_won_by_month, '2026-08': 16000000}
-    report = replace(report, rows=(replace(report.rows[0], cost_won_by_month=history), *report.rows[1:]), next_month=replace(report.next_month, rows=(replace(report.next_month.rows[0], cost_won_by_month=history), *report.next_month.rows[1:])))
     output = tmp_path / 'averages.pptx'
     generate_pptx(template, report, output)
     p = Presentation(output)
     assert named(p, 2, 'report.monthly_table').table.cell(2, 14).text == '10,000'
-    assert named(p, 6, 'report.plan_table').table.cell(2, 4).text == '12,000'
+    assert named(p, 6, 'report.plan_table').table.cell(2, 4).text == '7,427'
 
 
 def test_mixed_run_formatting_keeps_visible_run_boundaries(template, report, tmp_path):
@@ -498,3 +525,112 @@ def test_empty_cell_preserves_inherited_font_without_direct_overrides(template, 
     assert not after._tc.xpath('.//a:rPr | .//a:defRPr | .//a:endParaRPr')
     assert after.text_frame.paragraphs[0]._p.pPr.xml == paragraph_style
     assert after._tc.tcPr.xml == cell_style
+
+
+@pytest.mark.parametrize('reason', [
+    'SP3 납품 수량 증가로 적재율 개선\nNQ5 합짐 운영 확대\n배차 조정 및 운행 횟수 감소',
+    '납품 수량 증가와 합짐 운영 확대로 적재율을 개선하고 배차 조정 및 운행 횟수를 감소함 ' * 8,
+])
+def test_review_overflow_rejected_before_mutation(template, report, tmp_path, monkeypatch, reason):
+    from app.reporting import pptx_report
+    output = tmp_path / 'previous.pptx'
+    output.write_bytes(b'previous')
+    def unexpected(*args, **kwargs):
+        pytest.fail('preflight must finish before any text mutation or rendering')
+    monkeypatch.setattr(pptx_report, '_write', unexpected)
+    with pytest.raises(ValueError, match='2번 슬라이드.*검토표.*3행.*8열'):
+        pptx_report.generate_pptx(template, reviewed_report(report, reason), output)
+    assert output.read_bytes() == b'previous'
+    assert not list(tmp_path.glob('.previous.pptx.*'))
+
+
+@pytest.mark.parametrize('case', ['margins', 'font', 'spacing', 'line_height', 'inherited'])
+def test_review_fit_uses_destination_metrics(template, report, tmp_path, case, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    p = Presentation(template)
+    cell = named(p, 2, 'report.review_table').table.cell(2, 7)
+    paragraph = cell.text_frame.paragraphs[0]
+    if case == 'margins':
+        cell.margin_left = Inches(2.95)
+    elif case == 'font':
+        paragraph.runs[0].font.size = Pt(30)
+    elif case == 'spacing':
+        paragraph.space_after = Pt(20)
+    elif case == 'line_height':
+        paragraph.line_spacing = Pt(30)
+    else:
+        for element in paragraph._p.xpath('./a:r | ./a:endParaRPr | ./a:pPr/a:defRPr'):
+            element.getparent().remove(element)
+    p.save(template)
+    with pytest.raises(ValueError, match='검토표.*3행.*8열'):
+        generate_pptx(template, reviewed_report(report), tmp_path / 'rejected.pptx')
+    assert not (tmp_path / 'rejected.pptx').exists()
+
+
+@pytest.mark.parametrize('measure', ['quantity_by_month', 'cost_won_by_month'])
+@pytest.mark.parametrize('location', ['chart', 'next_total', 'next_row', 'current_row', 'historical_row'])
+def test_conflicting_actual_lineages_rejected_atomically(template, report, tmp_path, measure, location, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    month = '2026-07' if location in ('chart', 'historical_row') else '2026-08'
+    value = Decimal(33333) if measure == 'quantity_by_month' else 20000000
+    def changed(row):
+        return replace(row, **{measure: {**getattr(row, measure), month: value}})
+    if location == 'chart':
+        report = replace(report, total=changed(report.total))
+    elif location == 'next_total':
+        report = replace(report, next_month=replace(report.next_month, total=changed(report.next_month.total)))
+    elif location in ('next_row', 'historical_row'):
+        report = replace(report, next_month=replace(report.next_month, rows=(changed(report.next_month.rows[0]), *report.next_month.rows[1:])))
+    else:
+        report = replace(report, rows=(changed(report.rows[0]), *report.rows[1:]))
+    output = tmp_path / 'existing.pptx'
+    output.write_bytes(b'previous')
+    with pytest.raises(ValueError, match='actual history conflict'):
+        generate_pptx(template, report, output)
+    assert output.read_bytes() == b'previous'
+
+
+@pytest.mark.parametrize('actual', [None, -1, True, 1.5, '1', 2**63])
+def test_required_current_sales_rejected_atomically(template, report, tmp_path, actual, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    output = tmp_path / 'existing.pptx'
+    output.write_bytes(b'previous')
+    with pytest.raises(ValueError, match='actual sales'):
+        generate_pptx(template, replace(report, sales=replace(report.sales, actual_won=actual)), output)
+    assert output.read_bytes() == b'previous'
+
+
+def test_zero_sales_is_present_but_ratio_is_unavailable(template, report, tmp_path, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    output = tmp_path / 'zero-sales.pptx'
+    generate_pptx(template, replace(report, sales=replace(report.sales, actual_won=0)), output)
+    table = named(Presentation(output), 2, 'report.monthly_table').table
+    assert table.cell(19, 5).text == '0'
+    assert table.cell(20, 5).text == ''
+
+
+def test_review_one_line_boundary_preserves_layout(template, report, tmp_path, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    from tools.verify_ppt_layout import verify_ppt_layout
+    output = tmp_path / 'accepted-review.pptx'
+    generate_pptx(template, reviewed_report(report, '납품 수량 증가로 적재율 개선'), output)
+    assert verify_ppt_layout(template, output) == []
+    assert named(Presentation(output), 2, 'report.review_table').table.cell(2, 7).text == '납품 수량 증가로 적재율 개선'
+
+
+def test_distinct_shared_history_drives_table_and_both_callouts(template, report, tmp_path, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    quantities = {**report.total.quantity_by_month, '2025-01': Decimal(25000)}
+    costs = {**report.total.cost_won_by_month, '2025-01': 20000000}
+    report = replace(report,
+        total=replace(report.total, quantity_by_month=quantities, cost_won_by_month=costs),
+        next_month=replace(report.next_month, total=replace(report.next_month.total, quantity_by_month=quantities, cost_won_by_month=costs)),
+        charts=replace(report.charts, actual_quantity_by_month=quantities, actual_cost_won_by_month=costs))
+    output = tmp_path / 'shared-history.pptx'
+    generate_pptx(template, report, output)
+    p = Presentation(output)
+    assert named(p, 2, 'report.monthly_table').table.cell(17, 17).text == '10,833'
+    for slide in (3, 5):
+        assert named(p, slide, 'report.quantity_average').text == '20,417'
+    for slide in (4, 5):
+        assert named(p, slide, 'report.cost_average').text == '10,833'

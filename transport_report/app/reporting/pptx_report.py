@@ -18,15 +18,17 @@ from io import BytesIO
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from zipfile import ZipFile
 
-from PIL import Image, PngImagePlugin
+from PIL import Image, ImageFont, PngImagePlugin
+from matplotlib import font_manager
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from app.domain.calculations import (
-    DestinationCalculation, GrandTotalResult, HistoricalValueKind,
+    DestinationCalculation, GrandTotalResult, HistoricalValueKind, MAX_SQLITE_INTEGER,
     ReviewCandidate, historical_averages, select_unit_cost_reviews,
 )
 from app.reporting.charts import (
@@ -115,6 +117,7 @@ def generate_pptx(template: str | Path, report: PptReport, output: str | Path) -
     presentation = load_template(template)
     targets = validate_template(presentation)
     _validate_report(report)
+    _validate_review_fit(presentation, targets[2, 'report.review_table'], report)
     _write(targets[1, 'report.title'].text_frame, '26년 8월 화성공장 운반비 보고')
     _write(targets[2, 'report.title'].text_frame, '▣ 26년 8월 운반비 종합')
     _write(targets[6, 'report.title'].text_frame, '▣ 26년 9월 운반비 계획')
@@ -300,12 +303,55 @@ def _validate_report(report):
             raise ValueError('next-month plan values are missing')
     if report.next_month.sales.planned_won is None:
         raise ValueError('next-month sales plan is missing')
+    if type(report.sales.actual_won) is not int or not 0 <= report.sales.actual_won <= MAX_SQLITE_INTEGER:
+        raise ValueError('current actual sales must be present nonnegative integer won within the supported range')
     if report.charts.report_month != report.report_month:
         raise ValueError('chart month conflicts with report')
     for mapping, field in ((report.charts.planned_quantity_by_month, 'planned_quantity'), (report.charts.actual_quantity_by_month, 'actual_quantity'), (report.charts.planned_cost_won_by_month, 'planned_cost_won'), (report.charts.actual_cost_won_by_month, 'actual_cost_won')):
         if mapping.get(report.report_month) != getattr(report.total.calculation, field):
             raise ValueError(f'chart current total conflicts with {field}')
+    _validate_actual_history(report)
     _selected_reviews(report)
+
+
+def _validate_actual_history(report):
+    """All consumers must agree on each identity/measure/month, including None.
+
+    Current canonical Task6 actuals anchor August. History maps may be sparse,
+    but an overlapping observation cannot be silently replaced or preferred.
+    Totals have one report-wide identity even if next-month membership changes.
+    """
+    observations = {}
+    def accept(identity, measure, mapping, source):
+        for month, value in mapping.items():
+            key = identity, measure, month
+            if key in observations and observations[key][0] != value:
+                raise ValueError(f'actual history conflict: {identity}, {measure}, {month}: {observations[key][1]} / {source}')
+            observations[key] = value, source
+
+    for period in (report, report.next_month):
+        for row in (*period.rows, period.nonregular, period.total):
+            if row is None:
+                continue
+            if row is period.total:
+                identity = ('total',)
+            elif row is period.nonregular:
+                identity = ('nonregular',)
+            elif getattr(row.calculation, 'destination_id', None) is not None:
+                identity = ('destination', row.calculation.destination_id)
+            elif getattr(row.calculation, 'group_id', None) is not None:
+                identity = ('group', row.calculation.group_id)
+            else:
+                identity = ('row', row.key)
+            for measure, mapping, actual in (
+                ('quantity', row.quantity_by_month, row.calculation.actual_quantity),
+                ('cost_won', row.cost_won_by_month, row.calculation.actual_cost_won),
+            ):
+                accept(identity, measure, mapping, f'{type(period).__name__}.{row.key}')
+                if period is report:
+                    accept(identity, measure, {report.report_month: actual}, 'Task6 current actual')
+    accept(('total',), 'quantity', report.charts.actual_quantity_by_month, 'Task10 chart/callout')
+    accept(('total',), 'cost_won', report.charts.actual_cost_won_by_month, 'Task10 chart/callout')
 
 
 def _averages(month, values, *, money=False):
@@ -468,12 +514,97 @@ def _selected_reviews(report):
 def _review_table(table, report):
     table = _TableUpdate(table)
     for index, (row, detail) in enumerate(_selected_reviews(report), 2):
-        quantity = row.calculation.actual_quantity
-        load = _ratio(quantity, detail.actual_trips)
-        values = (row.label, _number(detail.planned_trips), _number(detail.actual_trips), _number(quantity), _number(load), _number(detail.standard_load), _number(_ratio(load, detail.standard_load), percent=True, places=1), detail.reason)
-        for column, value in enumerate(values):
+        for column, value in enumerate(_review_values(row, detail)):
             _put(table, index, column, value)
     table.apply()
+
+
+def _review_values(row, detail):
+    quantity = row.calculation.actual_quantity
+    load = _ratio(quantity, detail.actual_trips)
+    return (row.label, _number(detail.planned_trips), _number(detail.actual_trips), _number(quantity), _number(load), _number(detail.standard_load), _number(_ratio(load, detail.standard_load), percent=True, places=1), detail.reason)
+
+
+def _validate_review_fit(presentation, shape, report):
+    """Conservative fixed-row preflight; never resize or alter text formatting.
+
+    Font metrics are measured at 4 pixels/point. Unknown/theme fonts use a
+    conservative em bound instead of assuming a narrower substitute. Existing
+    empty paragraphs also occupy height, just as they do in native PowerPoint.
+    """
+    table = shape.table
+    defaults = presentation._element.xpath('./p:defaultTextStyle/a:lvl1pPr')
+    defaults += presentation.slides[1].slide_layout.slide_master._element.xpath('./p:txStyles/p:otherStyle/a:lvl1pPr')
+    for row_index, (row, detail) in enumerate(_selected_reviews(report), 2):
+        for column, text in enumerate(_review_values(row, detail)):
+            if not text:
+                continue
+            cell = table.cell(row_index, column)
+            width = (table.columns[column].width - cell.margin_left - cell.margin_right) / 12700
+            available = (table.rows[row_index].height - cell.margin_top - cell.margin_bottom) / 12700
+            paragraphs = cell.text_frame.paragraphs
+            lines = text.split('\n')
+            height = 0.0
+            fits = width > 0 and available > 0 and '\t' not in text and '\v' not in text
+            for index in range(max(len(lines), len(paragraphs))):
+                paragraph = paragraphs[index] if index < len(paragraphs) else paragraphs[0]
+                line = lines[index] if index < len(lines) else ''
+                props = list(defaults) + cell._tc.xpath('./a:txBody/a:lstStyle/a:lvl1pPr')
+                if paragraph._p.pPr is not None:
+                    props.append(paragraph._p.pPr)
+                attrs, fonts = {}, {}
+                for prop in props:
+                    for child in prop.findall('{http://schemas.openxmlformats.org/drawingml/2006/main}defRPr'):
+                        attrs.update(child.attrib)
+                        fonts.update({el.tag.rsplit('}', 1)[-1]: el.get('typeface') for el in child})
+                direct = paragraph._p.xpath('./a:endParaRPr | ./a:r/a:rPr')
+                sizes = [float(attrs.get('sz', 1800)) / 100]
+                for prop in direct:
+                    attrs.update(prop.attrib)
+                    sizes.append(float(attrs.get('sz', 1800)) / 100)
+                    fonts.update({el.tag.rsplit('}', 1)[-1]: el.get('typeface') for el in prop})
+                # Direct run sizes override inherited defaults, not vice versa.
+                size = max(sizes[1:] or sizes)
+                family = (fonts.get('ea') or fonts.get('latin')) if any(ord(char) >= 0x2E80 for char in line) else fonts.get('latin')
+                font = None
+                if family and not family.startswith('+'):
+                    try:
+                        path = font_manager.findfont(font_manager.FontProperties(family=family, weight='bold' if attrs.get('b') == '1' else 'normal'), fallback_to_default=False)
+                        font = ImageFont.truetype(path, max(1, math.ceil(size * 4)))
+                    except (ValueError, OSError):
+                        pass
+                def advance(token):
+                    if font:
+                        # Leave headroom for native shaping, and do not trust
+                        # missing-glyph boxes to measure Korean text narrowly.
+                        bound = sum(size if ord(char) >= 0x2E80 else 0 for char in token)
+                        return max(bound, font.getlength(token) / 4) * 1.15
+                    return sum(.5 if char.isspace() else 1.2 for char in token) * size
+                indent = max((float(prop.get('marL', 0)) / 12700 for prop in props), default=0)
+                usable = width - max(0, indent)
+                count, used = 1, 0.0
+                for token in re.findall(r'[A-Za-z0-9]+|.', line):
+                    extent = advance(token)
+                    if usable <= 0 or extent > usable:
+                        fits = False
+                        break
+                    if used + extent > usable:
+                        count += 1
+                        used = 0
+                    used += extent
+                if count > 1 and cell.text_frame.word_wrap is False:
+                    fits = False
+                def spacing(name, fallback):
+                    result = fallback
+                    for prop in props:
+                        children = prop.findall('{http://schemas.openxmlformats.org/drawingml/2006/main}' + name)
+                        if children and len(children[0]):
+                            spec = children[0][0]
+                            result = float(spec.get('val')) / (100 if spec.tag.endswith('spcPts') else 100000) * (1 if spec.tag.endswith('spcPts') else size * 1.2)
+                    return result
+                height += max(size * 1.2, spacing('lnSpc', size * 1.2)) * count + spacing('spcBef', 0) + spacing('spcAft', 0)
+            if not fits or height > available + .01:
+                raise ValueError(f'REPORT_TEXT_DOES_NOT_FIT: 2번 슬라이드 검토표 {row_index + 1}행 {column + 1}열의 문구가 고정 셀 크기를 초과합니다. 문구를 줄여 주세요.')
 
 
 def _write(frame, text):
