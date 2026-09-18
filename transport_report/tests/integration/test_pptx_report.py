@@ -166,7 +166,7 @@ def make_report():
     total_row = ReportRow('total', '합계', total, actual_quantities, actual_costs)
     nonregular = ReportRow('extra', '비정규 운반비', calculate_destination(Decimal(0), 0, Decimal(0), 0), {**quantities, '2026-08': Decimal(0)}, {**costs, '2026-08': 0})
     chart = ChartReport('2026-08', {**quantities, '2026-08': total.planned_quantity}, {**quantities, '2026-08': total.actual_quantity}, {**costs, '2026-08': total.planned_cost_won}, {**costs, '2026-08': total.actual_cost_won})
-    sales = SalesReport(300000000, 310000000, {m: 300000000 for m in months})
+    sales = SalesReport(300000000, 310000000, {**{m: 300000000 for m in months}, '2026-08': 310000000})
     return PptReport('2026-08', date(2026, 9, 1), tuple(rows) + (None, None), nonregular, total_row, sales,
         PlanReport('2026-09', tuple(next_rows), replace(nonregular, calculation=calculate_destination(Decimal(0), 0, None, None)), ReportRow('total', '합계', next_total, actual_quantities, actual_costs), SalesReport(400000000, None, sales.actual_won_by_month)), chart, ())
 
@@ -603,10 +603,51 @@ def test_required_current_sales_rejected_atomically(template, report, tmp_path, 
 def test_zero_sales_is_present_but_ratio_is_unavailable(template, report, tmp_path, fast_charts):
     from app.reporting.pptx_report import generate_pptx
     output = tmp_path / 'zero-sales.pptx'
-    generate_pptx(template, replace(report, sales=replace(report.sales, actual_won=0)), output)
+    history = {**report.sales.actual_won_by_month, '2026-08': 0}
+    report = replace(report, sales=replace(report.sales, actual_won=0, actual_won_by_month=history), next_month=replace(report.next_month, sales=replace(report.next_month.sales, actual_won_by_month=history)))
+    generate_pptx(template, report, output)
     table = named(Presentation(output), 2, 'report.monthly_table').table
     assert table.cell(19, 5).text == '0'
     assert table.cell(20, 5).text == ''
+
+
+@pytest.mark.parametrize('case', ['prior_overlap', 'current_august', 'next_august', 'next_missing_august', 'zero_conflict'])
+def test_sales_history_conflict_rejected_before_mutation(template, report, tmp_path, monkeypatch, case):
+    from app.reporting import pptx_report
+    current = dict(report.sales.actual_won_by_month)
+    following = dict(report.next_month.sales.actual_won_by_month)
+    actual = report.sales.actual_won
+    if case == 'prior_overlap':
+        current['2025-01'], following['2025-01'] = 300000, 600000
+    elif case == 'current_august':
+        current['2026-08'] = 300000000
+    elif case == 'next_august':
+        following['2026-08'] = 300000000
+    elif case == 'next_missing_august':
+        following.pop('2026-08')
+    else:
+        actual, current['2026-08'] = 0, 0
+    report = replace(report, sales=replace(report.sales, actual_won=actual, actual_won_by_month=current), next_month=replace(report.next_month, sales=replace(report.next_month.sales, actual_won_by_month=following)))
+    output = tmp_path / 'previous.pptx'
+    output.write_bytes(b'previous report')
+    def unexpected(*args, **kwargs):
+        pytest.fail('sales history validation must precede text mutation')
+    monkeypatch.setattr(pptx_report, '_write', unexpected)
+    with pytest.raises(ValueError, match='actual history conflict.*sales'):
+        pptx_report.generate_pptx(template, report, output)
+    assert output.read_bytes() == b'previous report'
+    assert not list(tmp_path.glob('.previous.pptx.*'))
+
+
+def test_current_sales_history_may_omit_august_when_next_history_matches(template, report, tmp_path, fast_charts):
+    from app.reporting.pptx_report import generate_pptx
+    history = dict(report.sales.actual_won_by_month)
+    history.pop('2026-08')
+    report = replace(report, sales=replace(report.sales, actual_won_by_month=history))
+    output = tmp_path / 'sparse-current-sales.pptx'
+    generate_pptx(template, report, output)
+    table = named(Presentation(output), 6, 'report.plan_table').table
+    assert table.cell(17, 4).text == '303,333'
 
 
 def test_review_one_line_boundary_preserves_layout(template, report, tmp_path, fast_charts):

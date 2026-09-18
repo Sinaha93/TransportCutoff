@@ -352,6 +352,11 @@ def _validate_actual_history(report):
                     accept(identity, measure, {report.report_month: actual}, 'Task6 current actual')
     accept(('total',), 'quantity', report.charts.actual_quantity_by_month, 'Task10 chart/callout')
     accept(('total',), 'cost_won', report.charts.actual_cost_won_by_month, 'Task10 chart/callout')
+    accept(('sales',), 'sales_won', {report.report_month: report.sales.actual_won}, 'current actual sales')
+    accept(('sales',), 'sales_won', report.sales.actual_won_by_month, 'report sales history')
+    accept(('sales',), 'sales_won', report.next_month.sales.actual_won_by_month, 'next-month sales history')
+    # September averages must carry August's actual sales, including explicit 0.
+    accept(('sales',), 'sales_won', {report.report_month: report.next_month.sales.actual_won_by_month.get(report.report_month)}, 'required August sales in next-month history')
 
 
 def _averages(month, values, *, money=False):
