@@ -747,11 +747,11 @@ git commit -m "feat: render report charts"
 - Create: `transport_report/tests/integration/test_pptx_report.py`
 - Copy during implementation: `26년 8월 운반비 보고.pptx` to `transport_report/assets/report_template.pptx`
 
-- [ ] **Step 1: Create a sanitized test template**
+- [x] **Step 1: Create a sanitized test template**
 
 Build a six-slide synthetic PPTX with the same shape roles and stable internal shape names but fictional values. Do not commit the business report as a test fixture.
 
-- [ ] **Step 2: Write the failing generation test**
+- [x] **Step 2: Write the failing generation test**
 
 ```python
 def test_ppt_generation_updates_values_and_preserves_layout(template, report, tmp_path):
@@ -763,17 +763,17 @@ def test_ppt_generation_updates_values_and_preserves_layout(template, report, tm
     assert_same_shape_geometry(template, output)
 ```
 
-- [ ] **Step 3: Run the test and verify failure**
+- [x] **Step 3: Run the test and verify failure**
 
 Run: `python -m pytest tests/integration/test_pptx_report.py -v`
 
 Expected: FAIL because `generate_pptx()` is missing.
 
-- [ ] **Step 4: Implement style-preserving text replacement**
+- [x] **Step 4: Implement style-preserving text replacement**
 
 Locate slides and shapes by slide number plus validated shape name. For text and table cells, replace run text while retaining the first run's font, size, bold, color, alignment, margins, and fill. Fail with `TEMPLATE_STRUCTURE_CHANGED` if a required shape is absent.
 
-- [ ] **Step 5: Implement slide mappings**
+- [x] **Step 5: Implement slide mappings**
 
 - Slide 1: report title and creation date.
 - Slide 2: monthly destination table, totals, averages, and selected ±15% review rows.
@@ -783,17 +783,17 @@ Locate slides and shapes by slide number plus validated shape name. For text and
 - Slide 5: both callouts.
 - Slide 6: next-month plan table and title derived from the next-month data, never copied from the report-month title.
 
-- [ ] **Step 6: Verify layout programmatically**
+- [x] **Step 6: Verify layout programmatically**
 
 `verify_ppt_layout.py` must compare slide count, required shape names, x/y/width/height, table row/column counts, and picture count against the template. Allow text values and image bytes to differ.
 
-- [ ] **Step 7: Run PowerPoint tests**
+- [x] **Step 7: Run PowerPoint tests**
 
 Run: `python -m pytest tests/integration/test_pptx_report.py -v`
 
 Expected: PASS, including report-month/next-month title checks and template-change failure.
 
-- [ ] **Step 8: Commit PowerPoint generation**
+- [x] **Step 8: Commit PowerPoint generation**
 
 ```powershell
 git add transport_report/app/reporting/pptx_report.py transport_report/tools/verify_ppt_layout.py transport_report/tests/integration/test_pptx_report.py
