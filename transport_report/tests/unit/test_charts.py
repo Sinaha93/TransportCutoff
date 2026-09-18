@@ -232,6 +232,92 @@ def test_combined_chart_does_not_require_unused_plan_history(report):
     assert data.series[2].values[12] == Decimal("4190")
 
 
+def test_task6_total_and_histories_adapt_into_chart_data():
+    from app.domain.calculations import (
+        HistoricalValueKind,
+        calculate_destination,
+        calculate_total,
+        historical_averages,
+    )
+    from app.domain.models import Destination
+    from app.reporting.charts import (
+        build_cost_chart_data,
+        build_quantity_chart_data,
+        chart_report_from_calculation,
+    )
+
+    destination = Destination(1, "Synthetic", 1, True, True, None, True, True, False)
+    current = calculate_destination(
+        Decimal("1234"),
+        3_456_000,
+        Decimal("2345"),
+        4_567_000,
+        destination_id=1,
+    )
+    total = calculate_total({1: current}, [destination])
+    plan_quantity_history_values = _month_values(1_000)
+    actual_quantity_history_values = _month_values(2_000)
+    plan_cost_history_values = {
+        month: int(value * 1_000) for month, value in _month_values(3_000).items()
+    }
+    actual_cost_history_values = {
+        month: int(value * 1_000) for month, value in _month_values(4_000).items()
+    }
+    for values in (
+        plan_quantity_history_values,
+        actual_quantity_history_values,
+        plan_cost_history_values,
+        actual_cost_history_values,
+    ):
+        values.pop("2026-08")
+    displayed = {
+        *(f"2025-{month:02d}" for month in range(8, 13)),
+        *(f"2026-{month:02d}" for month in range(1, 8)),
+    }
+    plan_quantity = {month: value for month, value in plan_quantity_history_values.items() if month in displayed}
+    actual_quantity = {month: value for month, value in actual_quantity_history_values.items() if month in displayed}
+    plan_cost = {month: value for month, value in plan_cost_history_values.items() if month in displayed}
+    actual_cost = {month: value for month, value in actual_cost_history_values.items() if month in displayed}
+
+    chart_report = chart_report_from_calculation(
+        report_month="2026-08",
+        current_total=total,
+        planned_quantity_by_month=plan_quantity,
+        actual_quantity_by_month=actual_quantity,
+        planned_cost_won_by_month=plan_cost,
+        actual_cost_won_by_month=actual_cost,
+        planned_quantity_history=historical_averages(
+            "2026-08", plan_quantity_history_values
+        ),
+        actual_quantity_history=historical_averages(
+            "2026-08", actual_quantity_history_values
+        ),
+        planned_cost_history=historical_averages(
+            "2026-08",
+            plan_cost_history_values,
+            value_kind=HistoricalValueKind.MONEY,
+        ),
+        actual_cost_history=historical_averages(
+            "2026-08",
+            actual_cost_history_values,
+            value_kind=HistoricalValueKind.MONEY,
+        ),
+    )
+
+    quantity = build_quantity_chart_data(chart_report)
+    cost = build_cost_chart_data(chart_report)
+    assert total.destination_ids == (1,)
+    assert quantity.series[0].values[12] == Decimal("1234")
+    assert quantity.series[1].values[12] == Decimal("2345")
+    assert quantity.series[1].values[-3:] == (
+        Decimal("2170"),
+        Decimal("2155"),
+        Decimal("2125"),
+    )
+    assert cost.series[0].values[12] == Decimal("3456")
+    assert cost.series[1].values[12] == Decimal("4567")
+
+
 def test_scope_is_limited_to_august_2026(report):
     from dataclasses import replace
 
@@ -239,6 +325,18 @@ def test_scope_is_limited_to_august_2026(report):
 
     with pytest.raises(ValueError, match="2026-08"):
         build_cost_chart_data(replace(report, report_month="2026-09"))
+
+
+def test_values_above_fixed_reference_axis_fail_clearly(report):
+    from dataclasses import replace
+
+    from app.reporting.charts import build_quantity_chart_data
+
+    values = dict(report.actual_quantity_by_month)
+    values["2026-08"] = Decimal("120001")
+
+    with pytest.raises(ValueError, match=r"quantity.*120,000"):
+        build_quantity_chart_data(replace(report, actual_quantity_by_month=values))
 
 
 def test_renderer_closes_figure_when_saving_fails(monkeypatch, tmp_path, report):
@@ -279,7 +377,7 @@ def test_renderer_closes_figure_when_saving_fails(monkeypatch, tmp_path, report)
             ["#c0504d"],
             "#f2f2f2",
             "#868686",
-            (2_500, 500),
+            (120_000, 20_000),
             None,
         ),
         (
@@ -290,7 +388,7 @@ def test_renderer_closes_figure_when_saving_fails(monkeypatch, tmp_path, report)
             ["#98b954"],
             "#f2f2f2",
             "#868686",
-            (5_000, 1_000),
+            (60_000, 10_000),
             None,
         ),
         (
@@ -301,8 +399,8 @@ def test_renderer_closes_figure_when_saving_fails(monkeypatch, tmp_path, report)
             ["#0000ff", "#c0504d", "#92d050"],
             "#d9d9d9",
             "#d9d9d9",
-            (2_500, 500),
-            (5_000, 1_000),
+            (120_000, 20_000),
+            (50_000, 5_000),
         ),
     ],
 )
@@ -329,6 +427,7 @@ def test_rendered_artists_match_reference_palette_legend_and_table_keys(
 
     def capture_figure(self, *args, **kwargs):
         captured["figure"] = self
+        captured["renderer"] = self.canvas.get_renderer()
 
     monkeypatch.setattr(Figure, "savefig", capture_figure)
 
@@ -355,7 +454,9 @@ def test_rendered_artists_match_reference_palette_legend_and_table_keys(
         for row in range(1, len(expected_legends) + 1)
     ] == ["#000000"] * len(expected_legends)
     table_keys = [
-        line for line in axis.lines if line.get_gid() == "table-series-key"
+        artist
+        for artist in axis.get_children()
+        if artist.get_gid() == "table-series-key"
     ]
     assert [to_hex(key.get_color()) for key in table_keys] == [
         to_hex(series.color) for series in (
@@ -367,7 +468,18 @@ def test_rendered_artists_match_reference_palette_legend_and_table_keys(
         )
     ]
     assert all(not key.get_clip_on() for key in table_keys)
-    assert figure.subplotpars.left >= 0.12
+    assert figure.subplotpars.left >= 0.16
+    renderer = captured["renderer"]
+    figure_box = figure.bbox
+    for row, key in enumerate(table_keys, start=1):
+        cell_box = table.get_celld()[(row, -1)].get_window_extent(renderer)
+        text_box = table.get_celld()[(row, -1)].get_text().get_window_extent(renderer)
+        key_box = key.get_window_extent(renderer)
+        assert figure_box.contains(cell_box.x0, cell_box.y0)
+        assert figure_box.contains(cell_box.x1, cell_box.y1)
+        assert cell_box.contains(key_box.x0, key_box.y0)
+        assert cell_box.contains(key_box.x1, key_box.y1)
+        assert key_box.x1 < text_box.x0
     assert axis.get_ylim()[1] == left_axis[0]
     assert axis.get_yticks()[1] - axis.get_yticks()[0] == left_axis[1]
     if right_axis is not None:

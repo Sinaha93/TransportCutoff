@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -21,11 +21,14 @@ from matplotlib.container import BarContainer
 from matplotlib.figure import Figure
 from matplotlib.font_manager import FontProperties
 from matplotlib.lines import Line2D
+from matplotlib.transforms import IdentityTransform
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 from app.domain.calculations import (
     HistoricalAverages,
     HistoricalValueKind,
+    DestinationCalculation,
+    GrandTotalResult,
     historical_averages,
 )
 
@@ -35,6 +38,18 @@ AVERAGE_LABELS = ("3개월 평균", "6개월 평균", "12개월 평균")
 QUANTITY_CANVAS_PIXELS = (2125, 1441)
 COST_CANVAS_PIXELS = (2060, 1145)
 COMBINED_CANVAS_PIXELS = (2091, 933)
+
+
+@dataclass(frozen=True, slots=True)
+class PresentationAxis:
+    maximum: Decimal
+    major_interval: Decimal
+    unit: str
+
+
+QUANTITY_AXIS = PresentationAxis(Decimal("120000"), Decimal("20000"), "EA")
+COST_AXIS = PresentationAxis(Decimal("60000"), Decimal("10000"), "천원")
+COMBINED_COST_AXIS = PresentationAxis(Decimal("50000"), Decimal("5000"), "천원")
 
 _QUANTITY_PLAN_BLUE = "#558ED5"
 _COST_PLAN_BLUE = "#4F81BD"
@@ -70,6 +85,10 @@ class ChartReport:
     actual_quantity_by_month: Mapping[str, Decimal | None]
     planned_cost_won_by_month: Mapping[str, int | Decimal | None]
     actual_cost_won_by_month: Mapping[str, int | Decimal | None]
+    planned_quantity_history: HistoricalAverages | None = None
+    actual_quantity_history: HistoricalAverages | None = None
+    planned_cost_history: HistoricalAverages | None = None
+    actual_cost_history: HistoricalAverages | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +116,72 @@ class ChartData:
     table_border_color: str
     axis_color: str
     text_color: str
+    left_axis: PresentationAxis
+    right_axis: PresentationAxis | None = None
+
+
+def chart_report_from_calculation(
+    *,
+    report_month: str,
+    current_total: DestinationCalculation,
+    planned_quantity_by_month: Mapping[str, Decimal | None],
+    actual_quantity_by_month: Mapping[str, Decimal | None],
+    planned_cost_won_by_month: Mapping[str, int | Decimal | None],
+    actual_cost_won_by_month: Mapping[str, int | Decimal | None],
+    planned_quantity_history: HistoricalAverages,
+    actual_quantity_history: HistoricalAverages,
+    planned_cost_history: HistoricalAverages,
+    actual_cost_history: HistoricalAverages,
+) -> ChartReport:
+    """Adapt a Task6 grand-total result and its precomputed histories.
+
+    Historical mappings supply prior months; the canonical calculation result
+    supplies the report-month totals and retains its destination provenance.
+    """
+    if not isinstance(current_total, GrandTotalResult):
+        raise TypeError("current_total must be a Task6 GrandTotalResult")
+    current_values = {
+        "planned_quantity_by_month": current_total.planned_quantity,
+        "actual_quantity_by_month": current_total.actual_quantity,
+        "planned_cost_won_by_month": current_total.planned_cost_won,
+        "actual_cost_won_by_month": current_total.actual_cost_won,
+    }
+    missing = [name for name, value in current_values.items() if value is None]
+    if missing:
+        raise ValueError(
+            "current_total is incomplete for chart rendering: " + ", ".join(missing)
+        )
+    return ChartReport(
+        report_month=report_month,
+        planned_quantity_by_month=_with_current(
+            planned_quantity_by_month,
+            report_month,
+            current_total.planned_quantity,
+            "planned_quantity_by_month",
+        ),
+        actual_quantity_by_month=_with_current(
+            actual_quantity_by_month,
+            report_month,
+            current_total.actual_quantity,
+            "actual_quantity_by_month",
+        ),
+        planned_cost_won_by_month=_with_current(
+            planned_cost_won_by_month,
+            report_month,
+            current_total.planned_cost_won,
+            "planned_cost_won_by_month",
+        ),
+        actual_cost_won_by_month=_with_current(
+            actual_cost_won_by_month,
+            report_month,
+            current_total.actual_cost_won,
+            "actual_cost_won_by_month",
+        ),
+        planned_quantity_history=planned_quantity_history,
+        actual_quantity_history=actual_quantity_history,
+        planned_cost_history=planned_cost_history,
+        actual_cost_history=actual_cost_history,
+    )
 
 
 def build_quantity_chart_data(report: ChartReport) -> ChartData:
@@ -108,12 +193,14 @@ def build_quantity_chart_data(report: ChartReport) -> ChartData:
         "planned_quantity_by_month",
         HistoricalValueKind.QUANTITY,
         require_comparison=False,
+        supplied=report.planned_quantity_history,
     )
     actual_history = _complete_history(
         report.report_month,
         report.actual_quantity_by_month,
         "actual_quantity_by_month",
         HistoricalValueKind.QUANTITY,
+        supplied=report.actual_quantity_history,
     )
     months = _display_months(report.report_month)
     labels = _display_labels(months)
@@ -127,7 +214,7 @@ def build_quantity_chart_data(report: ChartReport) -> ChartData:
     comparison_value = _required_average(
         actual_history.comparison_year, "actual_quantity_by_month"
     )
-    return ChartData(
+    data = ChartData(
         chart_kind="quantity",
         report_month=report.report_month,
         labels=labels,
@@ -167,7 +254,10 @@ def build_quantity_chart_data(report: ChartReport) -> ChartData:
         table_border_color=_STANDARD_BORDER,
         axis_color=_STANDARD_BORDER,
         text_color="#000000",
+        left_axis=QUANTITY_AXIS,
     )
+    _validate_fixed_axes(data)
+    return data
 
 
 def build_cost_chart_data(report: ChartReport) -> ChartData:
@@ -179,12 +269,14 @@ def build_cost_chart_data(report: ChartReport) -> ChartData:
         "planned_cost_won_by_month",
         HistoricalValueKind.MONEY,
         require_comparison=False,
+        supplied=report.planned_cost_history,
     )
     actual_history = _complete_history(
         report.report_month,
         report.actual_cost_won_by_month,
         "actual_cost_won_by_month",
         HistoricalValueKind.MONEY,
+        supplied=report.actual_cost_history,
     )
     months = _display_months(report.report_month)
     labels = _display_labels(months)
@@ -198,7 +290,7 @@ def build_cost_chart_data(report: ChartReport) -> ChartData:
     comparison_value = _required_average(
         actual_history.comparison_year, "actual_cost_won_by_month"
     ) / Decimal(1_000)
-    return ChartData(
+    data = ChartData(
         chart_kind="cost",
         report_month=report.report_month,
         labels=labels,
@@ -237,7 +329,10 @@ def build_cost_chart_data(report: ChartReport) -> ChartData:
         table_border_color=_STANDARD_BORDER,
         axis_color=_STANDARD_BORDER,
         text_color="#000000",
+        left_axis=COST_AXIS,
     )
+    _validate_fixed_axes(data)
+    return data
 
 
 def build_combined_chart_data(report: ChartReport) -> ChartData:
@@ -248,12 +343,14 @@ def build_combined_chart_data(report: ChartReport) -> ChartData:
         report.actual_quantity_by_month,
         "actual_quantity_by_month",
         HistoricalValueKind.QUANTITY,
+        supplied=report.actual_quantity_history,
     )
     cost_history = _complete_history(
         report.report_month,
         report.actual_cost_won_by_month,
         "actual_cost_won_by_month",
         HistoricalValueKind.MONEY,
+        supplied=report.actual_cost_history,
     )
     months = _display_months(report.report_month)
     labels = _display_labels(months)
@@ -270,7 +367,7 @@ def build_combined_chart_data(report: ChartReport) -> ChartData:
     cost_average = _required_average(
         cost_history.comparison_year, "actual_cost_won_by_month"
     ) / Decimal(1_000)
-    return ChartData(
+    data = ChartData(
         chart_kind="combined",
         report_month=report.report_month,
         labels=labels,
@@ -318,7 +415,11 @@ def build_combined_chart_data(report: ChartReport) -> ChartData:
         table_border_color=_COMBINED_BORDER,
         axis_color="#595959",
         text_color="#595959",
+        left_axis=QUANTITY_AXIS,
+        right_axis=COMBINED_COST_AXIS,
     )
+    _validate_fixed_axes(data)
+    return data
 
 
 def render_quantity_chart(
@@ -378,7 +479,7 @@ def _render_grouped_chart(data: ChartData, path: str | Path, dpi: int) -> None:
             zorder=4,
         )[0]
         _style_axis(axis, data, font)
-        _set_axis_limit(axis, (*first.values, *second.values, *comparison.values))
+        _set_axis_limit(axis, data.left_axis)
         _label_bars(
             axis, first_bars, first.values, first.unit, bold_font, data.text_color
         )
@@ -394,8 +495,8 @@ def _render_grouped_chart(data: ChartData, path: str | Path, dpi: int) -> None:
             frameon=False,
             prop=bold_font,
         )
+        figure.subplots_adjust(left=0.16, right=0.99, top=0.90, bottom=0.20)
         _add_table(axis, data, font, bold_font, y=-0.205, height=0.19)
-        figure.subplots_adjust(left=0.12, right=0.99, top=0.90, bottom=0.20)
         _save(figure, data, path, dpi)
     finally:
         plt.close(figure)
@@ -458,8 +559,10 @@ def _render_combined_chart(data: ChartData, path: str | Path, dpi: int) -> None:
             label.set_fontproperties(font)
         for spine in right_axis.spines.values():
             spine.set_visible(False)
-        _set_axis_limit(left_axis, (*quantity.values, *quantity_average.values))
-        _set_axis_limit(right_axis, (*cost.values, *cost_average.values))
+        _set_axis_limit(left_axis, data.left_axis)
+        if data.right_axis is None:
+            raise ValueError("combined chart requires a fixed right axis")
+        _set_axis_limit(right_axis, data.right_axis)
         left_axis.legend(
             [quantity_bars, quantity_line, cost_line, cost_average_line],
             [
@@ -474,8 +577,8 @@ def _render_combined_chart(data: ChartData, path: str | Path, dpi: int) -> None:
             frameon=False,
             prop=bold_font,
         )
+        figure.subplots_adjust(left=0.16, right=0.93, top=0.88, bottom=0.25)
         _add_table(left_axis, data, font, bold_font, y=-0.275, height=0.255)
-        figure.subplots_adjust(left=0.12, right=0.93, top=0.88, bottom=0.25)
         _save(figure, data, path, dpi)
     finally:
         plt.close(figure)
@@ -508,24 +611,9 @@ def _style_axis(axis: Axes, data: ChartData, font: FontProperties) -> None:
     axis.spines["bottom"].set_color(data.axis_color)
 
 
-def _set_axis_limit(axis: Axes, values: tuple[Decimal, ...]) -> None:
-    maximum = max(values, default=Decimal(1))
-    if maximum == 0:
-        step = Decimal(1)
-    else:
-        rough_step = maximum / Decimal(6)
-        magnitude = Decimal(10) ** rough_step.adjusted()
-        fraction = rough_step / magnitude
-        nice_fraction = Decimal(1) if fraction <= 1 else Decimal(2) if fraction <= 2 else Decimal(5) if fraction <= 5 else Decimal(10)
-        step = nice_fraction * magnitude
-    upper = (
-        (maximum * Decimal("1.08") / step).to_integral_value(
-            rounding=ROUND_CEILING
-        )
-        * step
-    )
-    axis.set_ylim(0, float(upper or step))
-    axis.yaxis.set_major_locator(MultipleLocator(float(step)))
+def _set_axis_limit(axis: Axes, presentation: PresentationAxis) -> None:
+    axis.set_ylim(0, float(presentation.maximum))
+    axis.yaxis.set_major_locator(MultipleLocator(float(presentation.major_interval)))
 
 
 def _label_bars(
@@ -565,7 +653,7 @@ def _add_table(
             [_format_value(value, series.unit) for value in series.values]
             for series in data.series
         ],
-        rowLabels=[f"      {series.label}" for series in data.series],
+        rowLabels=[series.label for series in data.series],
         colLabels=data.labels,
         cellLoc="center",
         rowLoc="left",
@@ -577,37 +665,47 @@ def _add_table(
         cell.set_facecolor("white")
         cell.set_edgecolor(data.table_border_color)
         cell.set_linewidth(0.6)
-        cell.PAD = 0.02
+        cell.PAD = 0.25 if column == -1 else 0.02
         cell.get_text().set_fontproperties(
             bold_font if row == 0 or column == -1 else font
         )
         cell.get_text().set_color("#000000" if column == -1 else data.text_color)
-    _add_table_keys(axis, data, y=y, height=height)
+    axis.figure.canvas.draw()
+    _add_table_keys(axis, data, table)
+    axis.figure.canvas.draw()
 
 
-def _add_table_keys(axis: Axes, data: ChartData, *, y: float, height: float) -> None:
-    row_height = height / (len(data.series) + 1)
+def _add_table_keys(axis: Axes, data: ChartData, table) -> None:
+    renderer = axis.figure.canvas.get_renderer()
     for index, series in enumerate(data.series, start=1):
-        center = y + height - (index + 0.5) * row_height
+        cell = table.get_celld()[(index, -1)]
+        cell_box = cell.get_window_extent(renderer)
+        text_box = cell.get_text().get_window_extent(renderer)
+        left = cell_box.x0 + 4
+        right = text_box.x0 - 4
+        if right <= left:
+            raise RuntimeError(f"table key space is unavailable for {series.label}")
+        center_y = (cell_box.y0 + cell_box.y1) / 2
         if series.presentation == "bar":
+            marker_points = min(5.0, (right - left) * 72 / axis.figure.dpi)
             key = Line2D(
-                [-0.095],
-                [float(center)],
+                [(left + right) / 2],
+                [center_y],
                 marker="s",
-                markersize=6,
+                markersize=marker_points,
                 linestyle="none",
                 color=series.color,
-                transform=axis.transAxes,
+                transform=IdentityTransform(),
                 clip_on=False,
             )
         else:
             key = Line2D(
-                [-0.105, -0.080],
-                [float(center), float(center)],
+                [left, right],
+                [center_y, center_y],
                 color=series.color,
                 linestyle=series.line_style,
                 linewidth=2,
-                transform=axis.transAxes,
+                transform=IdentityTransform(),
                 clip_on=False,
             )
         key.set_gid("table-series-key")
@@ -654,15 +752,21 @@ def _complete_history(
     value_kind: HistoricalValueKind,
     *,
     require_comparison: bool = True,
+    supplied: HistoricalAverages | None = None,
 ) -> HistoricalAverages:
-    try:
-        averages = historical_averages(
-            report_month,
-            values,
-            value_kind=value_kind,
-        )
-    except ValueError as error:
-        raise ValueError(f"{field_name} is invalid: {error}") from error
+    if supplied is not None:
+        if not isinstance(supplied, HistoricalAverages):
+            raise TypeError(f"{field_name} history must be HistoricalAverages")
+        averages = supplied
+    else:
+        try:
+            averages = historical_averages(
+                report_month,
+                values,
+                value_kind=value_kind,
+            )
+        except ValueError as error:
+            raise ValueError(f"{field_name} is invalid: {error}") from error
     required_results = [
         averages.three_month,
         averages.six_month,
@@ -683,6 +787,38 @@ def _complete_history(
             + ", ".join(sorted(missing))
         )
     return averages
+
+
+def _with_current(
+    values: Mapping[str, Decimal | int | None],
+    report_month: str,
+    current: Decimal | int | None,
+    field_name: str,
+) -> dict[str, Decimal | int | None]:
+    if current is None:
+        raise ValueError(f"current_total {field_name} is missing")
+    result = dict(values)
+    existing = result.get(report_month)
+    if existing is not None and existing != current:
+        raise ValueError(
+            f"{field_name} {report_month} conflicts with current_total"
+        )
+    result[report_month] = current
+    return result
+
+
+def _validate_fixed_axes(data: ChartData) -> None:
+    for series in data.series:
+        presentation = data.left_axis if series.axis == "left" else data.right_axis
+        if presentation is None:
+            raise ValueError(f"{data.chart_kind} chart is missing its {series.axis} axis")
+        maximum = max(series.values, default=Decimal(0))
+        if maximum > presentation.maximum:
+            raise ValueError(
+                f"{data.chart_kind} chart {series.label} value {maximum} exceeds "
+                f"fixed {presentation.unit} axis maximum "
+                f"{presentation.maximum:,.0f}"
+            )
 
 
 def _metric_values(
