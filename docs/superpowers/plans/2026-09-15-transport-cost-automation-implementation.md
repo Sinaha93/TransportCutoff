@@ -585,19 +585,19 @@ git commit -m "feat: block invalid report generation"
 - Create: `transport_report/app/importers/legacy_migration.py`
 - Create: `transport_report/tests/unit/test_legacy_migration.py`
 
-- [ ] **Step 1: Write a synthetic legacy fixture and failing migration test**
+- [x] **Step 1: Write a synthetic legacy fixture and failing migration test**
 
 The fixture must include `누적 데이터` columns `A:F` for year, month, destination, actual quantity, and actual cost; `26년 월계획` month-pair columns; and the current 8월 destination values.
 
 Assert migration produces historical monthly rows, current plans, actual quantities, and costs without importing chart helper ranges.
 
-- [ ] **Step 2: Run the test and verify failure**
+- [x] **Step 2: Run the test and verify failure**
 
 Run: `python -m pytest tests/unit/test_legacy_migration.py -v`
 
 Expected: FAIL because the importer is missing.
 
-- [ ] **Step 3: Implement migration from current files**
+- [x] **Step 3: Implement migration from current files**
 
 Read `누적 데이터!A:F` as historical destination-month actuals and `26년 월계획` as plan pairs. Import only values, not legacy formulas. Produce a reconciliation report comparing:
 
@@ -607,17 +607,17 @@ Read `누적 데이터!A:F` as historical destination-month actuals and `26년 �
 - 3-, 6-, and 12-month averages;
 - prior-year averages.
 
-- [ ] **Step 4: Add dry-run and commit modes**
+- [x] **Step 4: Add dry-run and commit modes**
 
 Dry run returns counts, unknown aliases, and reconciliation differences without changing SQLite. Commit mode writes only after the user confirms the dry-run result in the UI.
 
-- [ ] **Step 5: Run migration tests**
+- [x] **Step 5: Run migration tests**
 
 Run: `python -m pytest tests/unit/test_legacy_migration.py -v`
 
 Expected: PASS for dry run, commit, rollback on mismatch, and repeated migration.
 
-- [ ] **Step 6: Commit migration support**
+- [x] **Step 6: Commit migration support**
 
 ```powershell
 git add transport_report/app/importers/legacy_migration.py transport_report/tests/unit/test_legacy_migration.py
