@@ -700,17 +700,17 @@ git commit -m "feat: add local report management UI"
 - Create: `transport_report/app/reporting/charts.py`
 - Create: `transport_report/tests/unit/test_charts.py`
 
-- [ ] **Step 1: Write failing chart-data tests**
+- [x] **Step 1: Write failing chart-data tests**
 
 Assert that an August 2026 report produces month labels from `25년 8월` through `26년 8월`, followed by `3개월 평균`, `6개월 평균`, and `12개월 평균`, and uses `25년 평균` as the comparison line.
 
-- [ ] **Step 2: Run the test and verify failure**
+- [x] **Step 2: Run the test and verify failure**
 
 Run: `python -m pytest tests/unit/test_charts.py -v`
 
 Expected: FAIL because chart builders are missing.
 
-- [ ] **Step 3: Implement three deterministic PNG renderers**
+- [x] **Step 3: Implement three deterministic PNG renderers**
 
 Create:
 
@@ -722,17 +722,17 @@ render_combined_chart(report, path, dpi=200)
 
 Use fixed fonts, colors, canvas sizes, legend order, axes, data labels, and bottom data tables matching the current presentation. Close every matplotlib figure after saving.
 
-- [ ] **Step 4: Add image assertions**
+- [x] **Step 4: Add image assertions**
 
 Verify exact pixel dimensions, nonblank bounding boxes, expected legend labels, and that the final month values appear in the chart data model. Store no customer data in committed golden images; use synthetic fixtures.
 
-- [ ] **Step 5: Run chart tests**
+- [x] **Step 5: Run chart tests**
 
 Run: `python -m pytest tests/unit/test_charts.py -v`
 
 Expected: PASS and three PNGs generated in pytest temporary directories.
 
-- [ ] **Step 6: Commit chart generation**
+- [x] **Step 6: Commit chart generation**
 
 ```powershell
 git add transport_report/app/reporting/charts.py transport_report/tests/unit/test_charts.py
