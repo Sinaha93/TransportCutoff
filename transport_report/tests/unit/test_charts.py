@@ -471,6 +471,18 @@ def test_rendered_artists_match_reference_palette_legend_and_table_keys(
     assert figure.subplotpars.left >= 0.16
     renderer = captured["renderer"]
     figure_box = figure.bbox
+    for column, expected_label in enumerate(
+        charts.build_quantity_chart_data(report).labels
+    ):
+        header = table.get_celld()[(0, column)]
+        assert header.get_text().get_text() == expected_label
+        assert header.get_text().get_fontsize() >= 6.5
+        cell_box = header.get_window_extent(renderer)
+        text_box = header.get_text().get_window_extent(renderer)
+        assert text_box.x0 >= cell_box.x0 + 0.5
+        assert text_box.x1 <= cell_box.x1 - 0.5
+        assert text_box.y0 >= cell_box.y0
+        assert text_box.y1 <= cell_box.y1
     for row, key in enumerate(table_keys, start=1):
         cell_box = table.get_celld()[(row, -1)].get_window_extent(renderer)
         text_box = table.get_celld()[(row, -1)].get_text().get_window_extent(renderer)

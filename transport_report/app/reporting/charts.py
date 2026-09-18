@@ -648,6 +648,10 @@ def _add_table(
     y: float,
     height: float,
 ) -> None:
+    # The source deck uses a compact header independently of its larger,
+    # bold row labels.  These fixed sizes keep all 16 unabbreviated labels
+    # inside their cells at the respective presentation canvas widths.
+    header_font = _font(6.5 if data.chart_kind == "combined" else 7, bold=True)
     table = axis.table(
         cellText=[
             [_format_value(value, series.unit) for value in series.values]
@@ -667,7 +671,7 @@ def _add_table(
         cell.set_linewidth(0.6)
         cell.PAD = 0.25 if column == -1 else 0.02
         cell.get_text().set_fontproperties(
-            bold_font if row == 0 or column == -1 else font
+            header_font if row == 0 else bold_font if column == -1 else font
         )
         cell.get_text().set_color("#000000" if column == -1 else data.text_color)
     axis.figure.canvas.draw()
