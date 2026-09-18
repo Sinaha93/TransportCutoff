@@ -527,7 +527,7 @@ git commit -m "feat: calculate monthly transport report"
 - Create: `transport_report/app/domain/validation.py`
 - Create: `transport_report/tests/unit/test_validation.py`
 
-- [ ] **Step 1: Write one failing test per blocking rule**
+- [x] **Step 1: Write one failing test per blocking rule**
 
 Cover these exact codes:
 
@@ -546,13 +546,13 @@ REPORT_MONTH_MISMATCH
 
 Assert that explicit quantity zero does not produce `MISSING_ACTUAL_QUANTITY`.
 
-- [ ] **Step 2: Run the tests and verify failure**
+- [x] **Step 2: Run the tests and verify failure**
 
 Run: `python -m pytest tests/unit/test_validation.py -v`
 
 Expected: FAIL because `validate_report()` is missing.
 
-- [ ] **Step 3: Implement structured validation results**
+- [x] **Step 3: Implement structured validation results**
 
 ```python
 @dataclass(frozen=True)
@@ -566,13 +566,13 @@ class ValidationIssue:
 
 `validate_report()` returns issues sorted by severity, destination display order, and code. `can_generate` is true only when no error-severity issues exist.
 
-- [ ] **Step 4: Run validation tests**
+- [x] **Step 4: Run validation tests**
 
 Run: `python -m pytest tests/unit/test_validation.py -v`
 
 Expected: PASS with stable error codes and user-readable Korean messages.
 
-- [ ] **Step 5: Commit validation**
+- [x] **Step 5: Commit validation**
 
 ```powershell
 git add transport_report/app/domain/validation.py transport_report/tests/unit/test_validation.py
