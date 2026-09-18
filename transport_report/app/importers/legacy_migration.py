@@ -691,26 +691,25 @@ def _parse_plans(
                 actual=_as_text(cached_sheet["B4"].value),
             )
         )
-    for month in range(1, 13):
-        quantity_column = 3 + (month - 1) * 2
-        for row, column, expected in (
-            (4, quantity_column, f"{month}월"),
-            (5, quantity_column, _PLAN_QUANTITY_HEADER),
-            (5, quantity_column + 1, _PLAN_COST_HEADER),
-        ):
-            actual = cached_sheet.cell(row, column).value
-            if actual != expected:
-                issues.append(
-                    MigrationIssue(
-                        code="HEADER_MISMATCH",
-                        message=f"계획 시트 헤더는 '{expected}'이어야 합니다.",
-                        source_locator=(
-                            f"{_PLAN_SHEET}!{cached_sheet.cell(row, column).coordinate}"
-                        ),
-                        expected=expected,
-                        actual=_as_text(actual),
-                    )
+    quantity_column = 3 + (report_month_number - 1) * 2
+    for row, column, expected in (
+        (4, quantity_column, f"{report_month_number}월"),
+        (5, quantity_column, _PLAN_QUANTITY_HEADER),
+        (5, quantity_column + 1, _PLAN_COST_HEADER),
+    ):
+        actual = cached_sheet.cell(row, column).value
+        if actual != expected:
+            issues.append(
+                MigrationIssue(
+                    code="HEADER_MISMATCH",
+                    message=f"계획 시트 헤더는 '{expected}'이어야 합니다.",
+                    source_locator=(
+                        f"{_PLAN_SHEET}!{cached_sheet.cell(row, column).coordinate}"
+                    ),
+                    expected=expected,
+                    actual=_as_text(actual),
                 )
+            )
 
     total_row = 20
     total_label = _as_text(cached_sheet.cell(total_row, 2).value)

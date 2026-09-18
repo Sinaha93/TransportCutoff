@@ -25,6 +25,7 @@ def build_legacy_fixture(
     formula_without_cache: bool = False,
     history_formula_without_cache: bool = False,
     total_mismatch: bool = False,
+    january_header: str | None = None,
     malformed: tuple[str, object] | None = None,
     omit_history: tuple[str, int, int] | None = None,
     missing_actual_quantity: tuple[str, int, int] | None = None,
@@ -76,6 +77,8 @@ def build_legacy_fixture(
         plan.cell(4, quantity_column, f"{month}월")
         plan.cell(5, quantity_column, "수량")
         plan.cell(5, quantity_column + 1, "운반비")
+    if january_header is not None:
+        plan["C4"] = january_header
 
     formula_cache: dict[str, str | None] = {}
     for row, destination in enumerate(source_destinations, start=6):

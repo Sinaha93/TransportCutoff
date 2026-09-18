@@ -121,6 +121,26 @@ def test_parses_exact_regions_cached_formulas_and_ignores_chart_helpers(
         alpha_august.quantity_ea = Decimal("1")
 
 
+def test_non_august_headers_have_no_effect_on_august_migration(tmp_path, service):
+    normal_source = build_legacy_fixture(tmp_path / "normal-headers.xlsx")
+    changed_source = build_legacy_fixture(
+        tmp_path / "changed-january-header.xlsx",
+        january_header="사용하지 않는 1월 열",
+    )
+
+    normal = service.dry_run(normal_source, report_month="2026-08")
+    changed = service.dry_run(changed_source, report_month="2026-08")
+
+    assert normal.can_commit
+    assert changed.can_commit
+    assert changed.plans == normal.plans
+    assert len(changed.plans) == 14
+    assert not any(
+        item.code == "HEADER_MISMATCH" and item.source_locator == "26년 월계획!C4"
+        for item in changed.issues
+    )
+
+
 def test_uncached_formula_is_a_blocker_with_exact_locator(tmp_path, service):
     source = build_legacy_fixture(
         tmp_path / "uncached.xlsx", formula_without_cache=True
