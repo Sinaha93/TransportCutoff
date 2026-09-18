@@ -15,7 +15,7 @@ Severity = Literal["error", "warning"]
 ReconciliationKind = Literal["quantity", "money"]
 
 _MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _MONTH_SOURCE_FIELDS = (
     ("plan_month", "당월 계획", "당월 계획 입력"),
@@ -138,7 +138,8 @@ class ImportBatchInput:
         if not isinstance(self.file_sha256, str) or _SHA256.fullmatch(
             self.file_sha256
         ) is None:
-            raise ValueError("file_sha256 must be 64 lowercase hexadecimal characters")
+            raise ValueError("file_sha256 must be 64 hexadecimal characters")
+        object.__setattr__(self, "file_sha256", self.file_sha256.lower())
         _require_text(self.source_locator, "source_locator")
         if not isinstance(self.is_current, bool):
             raise TypeError("is_current must be bool")
@@ -335,6 +336,17 @@ def validate_report(context: ValidationContext) -> ValidationResult:
 
     batches_by_source: dict[str, list[ImportBatchInput]] = {}
     for batch in context.current_import_batches:
+        if batch.is_current and batch.report_month != context.report_month:
+            issues.append(
+                _month_mismatch_issue(
+                    source_label=(
+                        f"{batch.source_type} 운반비 가져오기 배치 #{batch.batch_id}"
+                    ),
+                    source_month=batch.report_month,
+                    report_month=context.report_month,
+                    source_locator=batch.source_locator,
+                )
+            )
         if batch.is_current and batch.report_month == context.report_month:
             batches_by_source.setdefault(batch.source_type, []).append(batch)
     for source_type, batches in batches_by_source.items():

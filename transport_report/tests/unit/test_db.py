@@ -31,6 +31,190 @@ def test_initial_migration_creates_required_tables(tmp_path):
     } <= names
 
 
+def test_import_batch_selection_migration_adds_strict_current_invariant(tmp_path):
+    database = Database(tmp_path / "app.db")
+    database.migrate()
+
+    with database.connection() as connection:
+        columns = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA table_info(import_batches)")
+        }
+        indexes = {
+            row["name"]
+            for row in connection.execute("PRAGMA index_list(import_batches)")
+        }
+        first_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status, "
+            "is_current) VALUES (?, ?, ?, ?, ?, ?)",
+            ("2026-08", "transport", "a.xlsx", "a" * 64, "imported", 1),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-09", "transport", "b.xlsx", "b" * 64, "imported"),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO import_batches"
+                "(report_month, source_type, source_filename, file_sha256, status, "
+                "is_current) VALUES (?, ?, ?, ?, ?, ?)",
+                ("2026-08", "transport", "c.xlsx", "c" * 64, "imported", 1),
+            )
+        for invalid in (2, -1, "true"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE import_batches SET is_current = ? WHERE id = ?",
+                    (invalid, first_id),
+                )
+
+        default_state = connection.execute(
+            "SELECT is_current FROM import_batches WHERE report_month = '2026-09'"
+        ).fetchone()[0]
+
+    assert columns["is_current"]["notnull"] == 1
+    assert columns["is_current"]["dflt_value"] == "0"
+    assert "uq_import_batches_current_month_source" in indexes
+    assert default_state == 0
+
+
+def test_import_batch_selection_upgrade_backfills_latest_eligible_and_preserves_data(
+    tmp_path,
+):
+    bundled = Database(tmp_path / "unused.db").migrations_dir
+    first_four = tmp_path / "first-four"
+    first_four.mkdir()
+    for filename in (
+        "001_initial.sql",
+        "002_month_locks.sql",
+        "003_transport_entry_source_alias.sql",
+        "004_transport_entry_source_date.sql",
+    ):
+        shutil.copyfile(bundled / filename, first_four / filename)
+
+    database_path = tmp_path / "app.db"
+    legacy = Database(database_path, migrations_dir=first_four)
+    legacy.migrate()
+    with legacy.connection() as connection:
+        batch_values = (
+            ("2026-08", "transport", "old.xlsx", "a" * 64, "imported", None),
+            (
+                "2026-08",
+                "transport",
+                "corrected.xlsx",
+                "b" * 64,
+                "imported_with_errors",
+                "Unknown destination alias: 미등록",
+            ),
+            ("2026-08", "transport", "staged.xlsx", "c" * 64, "staged", None),
+            ("2026-08", "erp", "failed.xlsx", "d" * 64, "failed", "failed"),
+            ("2026-09", "transport", "next.xlsx", "e" * 64, "imported", None),
+        )
+        batch_ids = []
+        for values in batch_values:
+            batch_ids.append(
+                connection.execute(
+                    "INSERT INTO import_batches"
+                    "(report_month, source_type, source_filename, file_sha256, "
+                    "status, error_summary) VALUES (?, ?, ?, ?, ?, ?)",
+                    values,
+                ).lastrowid
+            )
+        connection.execute(
+            "INSERT INTO transport_entries"
+            "(import_batch_id, report_month, unresolved_alias, source_alias, "
+            "source_sheet, source_row, source_date, transport_day, "
+            "transport_type, trip_count_text, cost_won) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_ids[1],
+                "2026-08",
+                "미등록",
+                "미등록",
+                "정규운송",
+                7,
+                "2026-08-01",
+                1,
+                "regular",
+                "1",
+                1000,
+            ),
+        )
+        connection.commit()
+
+    upgraded = Database(database_path)
+    upgraded.migrate()
+
+    with upgraded.connection() as connection:
+        batches = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT id, status, error_summary, is_current "
+                "FROM import_batches ORDER BY id"
+            )
+        ]
+        entry = connection.execute(
+            "SELECT import_batch_id, unresolved_alias, cost_won "
+            "FROM transport_entries"
+        ).fetchone()
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+
+    assert [row[3] for row in batches] == [0, 1, 0, 0, 1]
+    assert batches[1][2] == "Unknown destination alias: 미등록"
+    assert tuple(entry) == (batch_ids[1], "미등록", 1000)
+    assert versions == [1, 2, 3, 4, 5]
+
+
+def test_failed_import_batch_selection_migration_rolls_back_column_and_version(
+    tmp_path,
+):
+    bundled = Database(tmp_path / "unused.db").migrations_dir
+    migrations = tmp_path / "failing-migrations"
+    migrations.mkdir()
+    for filename in (
+        "001_initial.sql",
+        "002_month_locks.sql",
+        "003_transport_entry_source_alias.sql",
+        "004_transport_entry_source_date.sql",
+    ):
+        shutil.copyfile(bundled / filename, migrations / filename)
+    migration_005 = (bundled / "005_import_batch_selection.sql").read_text(
+        encoding="utf-8"
+    )
+    (migrations / "005_import_batch_selection.sql").write_text(
+        migration_005
+        + "\nINSERT INTO table_that_does_not_exist(value) VALUES (1);\n",
+        encoding="utf-8",
+    )
+    database = Database(tmp_path / "app.db", migrations_dir=migrations)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        database.migrate()
+
+    with database.connection() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(import_batches)")
+        }
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+
+    assert "is_current" not in columns
+    assert versions == [1, 2, 3, 4]
+
+
 def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp_path):
     migrations_dir = Database(tmp_path / "unused.db").migrations_dir
     first_only = tmp_path / "first-only"
@@ -61,7 +245,7 @@ def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert {
         "report_month",
         "is_locked",
@@ -197,7 +381,7 @@ def test_transport_source_alias_migration_preserves_known_legacy_state(tmp_path)
                 "UPDATE transport_entries SET cost_won = cost_won + 1 "
                 "WHERE source_row = 3"
             )
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert tuple(rows[0]) == (destination_id, None, None, None)
     assert tuple(rows[1]) == (None, "Legacy Unknown", "Legacy Unknown", None)
     assert tuple(rows[2]) == (destination_id, "   ", None, None)
@@ -648,7 +832,7 @@ def test_migrations_are_repeatable(tmp_path):
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
 
 
 def test_migrate_rejects_schema_versions_newer_than_bundled_migrations(tmp_path):
@@ -838,6 +1022,7 @@ def test_schema_includes_required_business_and_audit_fields(tmp_path):
             "file_sha256",
             "status",
             "error_summary",
+            "is_current",
         },
         "transport_entries": {
             "source_sheet",
@@ -1311,7 +1496,7 @@ def test_concurrent_migrate_calls_do_not_reapply_versions(tmp_path, monkeypatch)
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
 
 
 def _schema_objects(db):

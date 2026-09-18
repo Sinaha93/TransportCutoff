@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from app.repositories.monthly_inputs import MonthLockGuard
 
 
 SOURCE_TYPE = "transport"
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_SELECTABLE_STATUSES = frozenset({"imported", "imported_with_errors"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +26,43 @@ class ImportCommitResult:
     status: str
     inserted_count: int
     blocking_errors: tuple[str, ...]
+    is_current: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ImportBatchSnapshot:
+    """Persisted batch-selection state for report validation adapters."""
+
+    batch_id: int
+    report_month: str
+    source_type: str
+    source_filename: str
+    file_sha256: str
+    status: str
+    is_current: bool
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.batch_id, bool)
+            or not isinstance(self.batch_id, int)
+            or self.batch_id < 1
+        ):
+            raise ValueError("batch_id must be a positive integer")
+        _validate_report_month(self.report_month)
+        for field_name in ("source_type", "source_filename"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be nonblank text")
+        object.__setattr__(
+            self, "file_sha256", _canonical_sha256(self.file_sha256)
+        )
+        if (
+            not isinstance(self.status, str)
+            or self.status not in _SELECTABLE_STATUSES
+        ):
+            raise ValueError("status must be imported or imported_with_errors")
+        if not isinstance(self.is_current, bool):
+            raise TypeError("is_current must be bool")
 
 
 class TransportEntryRepository:
@@ -39,12 +79,15 @@ class TransportEntryRepository:
         rows: list[ParsedTransportEntry],
     ) -> ImportCommitResult:
         _validate_import_rows(report_month, rows)
+        file_sha256 = _canonical_sha256(file_sha256)
         connection = self.database.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             duplicate = connection.execute(
-                "SELECT id, error_summary FROM import_batches "
-                "WHERE report_month = ? AND source_type = ? AND file_sha256 = ?",
+                "SELECT id, error_summary, is_current FROM import_batches "
+                "WHERE report_month = ? AND source_type = ? "
+                "AND lower(file_sha256) = ? "
+                "ORDER BY is_current DESC, id DESC LIMIT 1",
                 (report_month, SOURCE_TYPE, file_sha256),
             ).fetchone()
             if duplicate is not None:
@@ -66,6 +109,9 @@ class TransportEntryRepository:
                     blocking_errors=tuple(
                         f"Unknown destination alias: {alias}"
                         for alias in unknown_aliases
+                    ),
+                    is_current=_database_bool(
+                        duplicate["is_current"], "import_batches.is_current"
                     ),
                 )
 
@@ -121,18 +167,60 @@ class TransportEntryRepository:
                 "UPDATE import_batches SET status = ? WHERE id = ?",
                 (status, batch_id),
             )
+            connection.execute(
+                "UPDATE import_batches SET is_current = 0 "
+                "WHERE report_month = ? AND source_type = ? AND is_current = 1",
+                (report_month, SOURCE_TYPE),
+            )
+            connection.execute(
+                "UPDATE import_batches SET is_current = 1 WHERE id = ?",
+                (batch_id,),
+            )
             connection.commit()
             return ImportCommitResult(
                 batch_id=int(batch_id),
                 status=status,
                 inserted_count=len(staged_rows),
                 blocking_errors=blocking_errors,
+                is_current=True,
             )
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    def list_current_batches(
+        self, report_month: str
+    ) -> tuple[ImportBatchSnapshot, ...]:
+        """Return only persisted current batches used by downstream calculations.
+
+        Superseded batches remain audit history and must not be included in report
+        calculations or validation context construction.
+        """
+        _validate_report_month(report_month)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                "SELECT id, report_month, source_type, source_filename, "
+                "file_sha256, status, is_current FROM import_batches "
+                "WHERE report_month = ? AND is_current = 1 "
+                "ORDER BY source_type, id",
+                (report_month,),
+            ).fetchall()
+        return tuple(
+            ImportBatchSnapshot(
+                batch_id=int(row["id"]),
+                report_month=str(row["report_month"]),
+                source_type=str(row["source_type"]),
+                source_filename=str(row["source_filename"]),
+                file_sha256=str(row["file_sha256"]),
+                status=str(row["status"]),
+                is_current=_database_bool(
+                    row["is_current"], "import_batches.is_current"
+                ),
+            )
+            for row in rows
+        )
 
     @staticmethod
     def _resolve_rows(
@@ -164,12 +252,7 @@ class TransportEntryRepository:
 def _validate_import_rows(
     report_month: str, rows: list[ParsedTransportEntry]
 ) -> None:
-    try:
-        report_month_start = date.fromisoformat(f"{report_month}-01")
-    except ValueError as error:
-        raise WorkbookStructureError("report_month must use YYYY-MM") from error
-    if report_month_start.strftime("%Y-%m") != report_month:
-        raise WorkbookStructureError("report_month must use YYYY-MM")
+    report_month_start = _validate_report_month(report_month)
 
     report_year_month = (report_month_start.year, report_month_start.month)
     previous_month_day = report_month_start - timedelta(days=1)
@@ -205,3 +288,25 @@ def _validate_import_rows(
                 f"{label} nonregular source_date must be in report_month "
                 "or the previous calendar month"
             )
+
+
+def _validate_report_month(report_month: str) -> date:
+    try:
+        report_month_start = date.fromisoformat(f"{report_month}-01")
+    except (TypeError, ValueError) as error:
+        raise WorkbookStructureError("report_month must use YYYY-MM") from error
+    if report_month_start.strftime("%Y-%m") != report_month:
+        raise WorkbookStructureError("report_month must use YYYY-MM")
+    return report_month_start
+
+
+def _database_bool(value: object, field: str) -> bool:
+    if type(value) is not int or value not in (0, 1):
+        raise ValueError(f"{field} must be stored as integer 0 or 1")
+    return bool(value)
+
+
+def _canonical_sha256(value: object) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise ValueError("file_sha256 must be 64 hexadecimal characters")
+    return value.lower()

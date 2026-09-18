@@ -250,6 +250,31 @@ def test_current_batches_from_another_report_month_are_not_duplicate_candidates(
     assert "DUPLICATE_IMPORT" not in {issue.code for issue in result.issues}
 
 
+def test_each_wrong_month_current_batch_reports_its_own_blocking_month_issue():
+    from app.domain.validation import ImportBatchInput, validate_report
+
+    result = validate_report(
+        _context(
+            current_import_batches=(
+                ImportBatchInput(31, "2026-07", "transport", SHA_A, "배치 #31", True),
+                ImportBatchInput(32, "2026-09", "transport", SHA_B, "배치 #32", True),
+                ImportBatchInput(33, "2026-07", "transport", "c" * 64, "배치 #33", False),
+            )
+        )
+    )
+
+    issues = [
+        issue
+        for issue in result.issues
+        if issue.code == "REPORT_MONTH_MISMATCH"
+        and issue.source_locator in {"배치 #31", "배치 #32", "배치 #33"}
+    ]
+    assert [issue.source_locator for issue in issues] == ["배치 #31", "배치 #32"]
+    assert all(issue.destination_id is None for issue in issues)
+    assert all("2026-08" in issue.message for issue in issues)
+    assert result.can_generate is False
+
+
 def test_duplicate_batch_locator_order_is_stable_when_batch_ids_tie():
     from app.domain.validation import ImportBatchInput, validate_report
 
@@ -909,16 +934,34 @@ def test_two_distinct_current_import_batches_block_and_identify_the_source():
 
 @pytest.mark.parametrize(
     "file_sha256",
-    ["a" * 63, "g" * 64, "A" * 64],
-    ids=("short", "non-hex", "uppercase"),
+    ["a" * 63, "g" * 64],
+    ids=("short", "non-hex"),
 )
-def test_import_batch_requires_lowercase_64_character_sha256(file_sha256):
+def test_import_batch_requires_64_character_hexadecimal_sha256(file_sha256):
     from app.domain.validation import ImportBatchInput
 
-    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+    with pytest.raises(ValueError, match="64 hexadecimal"):
         ImportBatchInput(
             1, "2026-08", "transport", file_sha256, "배치 #1", True
         )
+
+
+def test_import_batch_canonicalizes_uppercase_sha_for_idempotent_comparison():
+    from app.domain.validation import ImportBatchInput, validate_report
+
+    uppercase = ImportBatchInput(
+        1, "2026-08", "transport", SHA_A.upper(), "배치 #1", True
+    )
+    lowercase = ImportBatchInput(
+        2, "2026-08", "transport", SHA_A, "배치 #2", True
+    )
+
+    result = validate_report(
+        _provenance_context(current_import_batches=(uppercase, lowercase))
+    )
+
+    assert uppercase.file_sha256 == SHA_A
+    assert "DUPLICATE_IMPORT" not in {issue.code for issue in result.issues}
 
 
 def test_import_batch_current_state_is_strict_bool():

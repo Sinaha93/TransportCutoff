@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from decimal import Decimal
@@ -3559,6 +3560,212 @@ def test_import_is_idempotent_and_stores_file_hash(api, database, fixture_path):
     assert batches[0]["file_sha256"] == hashlib.sha256(
         fixture_path.read_bytes()
     ).hexdigest()
+    assert first.is_current is True
+    assert second.is_current is True
+
+
+def test_distinct_successful_import_replaces_current_batch_and_query_returns_selection(
+    api, database
+):
+    parser_module, repository_module, _ = api
+    repository = repository_module.TransportEntryRepository(database)
+    row = _parsed_entry(parser_module)
+
+    first = repository.import_entries(
+        report_month="2026-08",
+        source_filename="original.xlsx",
+        file_sha256="a" * 64,
+        rows=[row],
+    )
+    corrected = repository.import_entries(
+        report_month="2026-08",
+        source_filename="corrected.xlsx",
+        file_sha256="b" * 64,
+        rows=[row],
+    )
+
+    current = repository.list_current_batches("2026-08")
+    with database.connection() as connection:
+        persisted = [
+            tuple(item)
+            for item in connection.execute(
+                "SELECT id, is_current FROM import_batches ORDER BY id"
+            )
+        ]
+
+    assert first.is_current is True
+    assert corrected.is_current is True
+    assert persisted == [(first.batch_id, 0), (corrected.batch_id, 1)]
+    assert len(current) == 1
+    assert current[0].batch_id == corrected.batch_id
+    assert current[0].source_filename == "corrected.xlsx"
+    assert current[0].status == "imported"
+    assert current[0].is_current is True
+
+
+def test_retrying_superseded_hash_does_not_reactivate_old_batch(api, database):
+    parser_module, repository_module, _ = api
+    repository = repository_module.TransportEntryRepository(database)
+    row = _parsed_entry(parser_module)
+
+    first = repository.import_entries(
+        report_month="2026-08",
+        source_filename="original.xlsx",
+        file_sha256="a" * 64,
+        rows=[row],
+    )
+    corrected = repository.import_entries(
+        report_month="2026-08",
+        source_filename="corrected.xlsx",
+        file_sha256="b" * 64,
+        rows=[row],
+    )
+    retry = repository.import_entries(
+        report_month="2026-08",
+        source_filename="original-copy.xlsx",
+        file_sha256="a" * 64,
+        rows=[row],
+    )
+
+    current = repository.list_current_batches("2026-08")
+    assert retry.status == "duplicate"
+    assert retry.batch_id == first.batch_id
+    assert retry.is_current is False
+    assert [batch.batch_id for batch in current] == [corrected.batch_id]
+
+
+def test_lowercase_retry_reuses_uppercase_legacy_current_hash(api, database):
+    parser_module, repository_module, _ = api
+    with database.connection() as connection:
+        legacy_id = connection.execute(
+            "INSERT INTO import_batches"
+            "(report_month, source_type, source_filename, file_sha256, status, "
+            "is_current) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "2026-08",
+                "transport",
+                "legacy.xlsx",
+                "A" * 64,
+                "imported",
+                1,
+            ),
+        ).lastrowid
+        connection.commit()
+
+    result = repository_module.TransportEntryRepository(database).import_entries(
+        report_month="2026-08",
+        source_filename="retry.xlsx",
+        file_sha256="a" * 64,
+        rows=[_parsed_entry(parser_module)],
+    )
+
+    with database.connection() as connection:
+        batches = connection.execute(
+            "SELECT id, file_sha256, is_current FROM import_batches ORDER BY id"
+        ).fetchall()
+    assert result.status == "duplicate"
+    assert result.batch_id == legacy_id
+    assert result.is_current is True
+    assert [tuple(batch) for batch in batches] == [(legacy_id, "A" * 64, 1)]
+
+
+def test_repository_canonicalizes_new_uppercase_hash_before_storage(api, database):
+    parser_module, repository_module, _ = api
+
+    result = repository_module.TransportEntryRepository(database).import_entries(
+        report_month="2026-08",
+        source_filename="source.xlsx",
+        file_sha256="A" * 64,
+        rows=[_parsed_entry(parser_module)],
+    )
+
+    with database.connection() as connection:
+        stored_hash = connection.execute(
+            "SELECT file_sha256 FROM import_batches WHERE id = ?",
+            (result.batch_id,),
+        ).fetchone()[0]
+    assert stored_hash == "a" * 64
+
+
+def test_selection_failure_rolls_back_new_batch_and_keeps_old_current(api, database):
+    parser_module, repository_module, _ = api
+    repository = repository_module.TransportEntryRepository(database)
+    row = _parsed_entry(parser_module)
+    original = repository.import_entries(
+        report_month="2026-08",
+        source_filename="original.xlsx",
+        file_sha256="a" * 64,
+        rows=[row],
+    )
+    with database.connection() as connection:
+        connection.execute(
+            "CREATE TRIGGER force_selection_failure "
+            "BEFORE UPDATE OF is_current ON import_batches "
+            "WHEN NEW.is_current = 1 AND NEW.file_sha256 = '"
+            + "b" * 64
+            + "' BEGIN SELECT RAISE(ABORT, 'forced selection failure'); END"
+        )
+        connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced selection failure"):
+        repository.import_entries(
+            report_month="2026-08",
+            source_filename="corrected.xlsx",
+            file_sha256="b" * 64,
+            rows=[row],
+        )
+
+    with database.connection() as connection:
+        batches = [
+            tuple(item)
+            for item in connection.execute(
+                "SELECT id, file_sha256, is_current FROM import_batches ORDER BY id"
+            )
+        ]
+        entry_count = connection.execute(
+            "SELECT COUNT(*) FROM transport_entries"
+        ).fetchone()[0]
+    assert batches == [(original.batch_id, "a" * 64, 1)]
+    assert entry_count == 1
+
+
+def test_locked_month_replacement_failure_keeps_existing_current_batch(api, database):
+    parser_module, repository_module, _ = api
+    repository = repository_module.TransportEntryRepository(database)
+    row = _parsed_entry(parser_module)
+    original = repository.import_entries(
+        report_month="2026-08",
+        source_filename="original.xlsx",
+        file_sha256="a" * 64,
+        rows=[row],
+    )
+    MonthlyInputRepository(database).finalize_month("2026-08", "revision-1")
+
+    with pytest.raises(MonthLockedError, match="2026-08"):
+        repository.import_entries(
+            report_month="2026-08",
+            source_filename="corrected.xlsx",
+            file_sha256="b" * 64,
+            rows=[row],
+        )
+
+    current = repository.list_current_batches("2026-08")
+    assert [batch.batch_id for batch in current] == [original.batch_id]
+
+
+def test_import_batch_snapshot_rejects_nonboolean_current_state(api):
+    _, repository_module, _ = api
+
+    with pytest.raises(TypeError, match="is_current"):
+        repository_module.ImportBatchSnapshot(
+            batch_id=1,
+            report_month="2026-08",
+            source_type="transport",
+            source_filename="source.xlsx",
+            file_sha256="a" * 64,
+            status="imported",
+            is_current=1,
+        )
 
 
 def test_import_persists_complete_source_dates(api, database, tmp_path):
@@ -3606,7 +3813,7 @@ def test_import_snapshots_once_then_hashes_and_parses_the_same_bytes(
         def import_entries(self, **kwargs):
             self.source_filename = kwargs["source_filename"]
             self.file_sha256 = kwargs["file_sha256"]
-            return repository_module.ImportCommitResult(1, "imported", 0, ())
+            return repository_module.ImportCommitResult(1, "imported", 0, (), True)
 
     parser = MutatingParser()
     repository = RecordingRepository()
@@ -3711,8 +3918,10 @@ def test_unknown_alias_is_imported_as_blocking_unresolved_entry(
     duplicate = service.import_transport(fixture_path, "2026-08")
 
     assert result.status == "imported_with_errors"
+    assert result.is_current is True
     assert result.blocking_errors == ("Unknown destination alias: Unknown Plant",)
     assert duplicate.status == "duplicate"
+    assert duplicate.is_current is True
     assert duplicate.inserted_count == 0
     assert duplicate.blocking_errors == result.blocking_errors
     with database.connection() as connection:

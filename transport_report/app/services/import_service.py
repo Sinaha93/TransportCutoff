@@ -39,6 +39,7 @@ class ImportResult:
     inserted_count: int
     blocking_errors: tuple[str, ...]
     file_sha256: str
+    is_current: bool
 
 
 class TransportImportService:
@@ -70,6 +71,7 @@ class TransportImportService:
             inserted_count=committed.inserted_count,
             blocking_errors=committed.blocking_errors,
             file_sha256=file_sha256,
+            is_current=committed.is_current,
         )
 
 
