@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -7,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.db import Database
+from app.domain.models import Destination
 from app.importers.protocols import QuantityRecord
 
 
@@ -22,6 +25,10 @@ class MonthlyInputError(Exception):
 
 class MonthlyInputValidationError(MonthlyInputError):
     """Raised when a monthly input value is invalid."""
+
+
+class MonthlyInputRevisionError(MonthlyInputError):
+    """Raised before writes when the submitted form no longer matches the DB."""
 
 
 class DestinationNotFoundError(MonthlyInputError):
@@ -62,6 +69,15 @@ class MonthlySales:
 
 
 @dataclass(frozen=True, slots=True)
+class MonthlyFormSnapshot:
+    destinations: tuple[Destination, ...]
+    plans: tuple[MonthlyPlan, ...]
+    actuals: tuple[MonthlyActualQuantity, ...]
+    sales: MonthlySales | None
+    monthly_revision: str
+
+
+@dataclass(frozen=True, slots=True)
 class ReportRun:
     id: int
     report_month: str
@@ -98,8 +114,35 @@ class MonthlyInputRepository:
         self.database = database
         self.lock_guard = MonthLockGuard()
 
+    def get_form_snapshot(self, report_month: str) -> MonthlyFormSnapshot:
+        """Read both displayed values and their revision from one SQLite snapshot."""
+        _validate_month(report_month)
+        with self.database.connection() as connection, connection:
+            connection.execute("BEGIN")
+            state = _monthly_form_state(connection, report_month)
+            destinations = tuple(
+                Destination(
+                    id=row["id"], name=row["name"], display_order=row["display_order"],
+                    active=bool(row["active"]), required_for_report=bool(row["required_for_report"]),
+                    representative_item=row["representative_item"],
+                    include_quantity_total=bool(row["include_quantity_total"]),
+                    include_cost_total=bool(row["include_cost_total"]),
+                    include_sales_total=bool(row["include_sales_total"]),
+                )
+                for row in state["destinations"]
+                if row["active"] and row["required_for_report"]
+            )
+            return MonthlyFormSnapshot(
+                destinations=destinations,
+                plans=tuple(_plan_from_row(row) for row in state["plans"]),
+                actuals=tuple(_actual_quantity_from_row(row) for row in state["actuals"]),
+                sales=_sales_from_row(state["sales"][0]) if state["sales"] else None,
+                monthly_revision=_monthly_form_revision(report_month, state),
+            )
+
     def save_form(
-        self, report_month: str, rows: list[dict], sales: MonthlySales | None
+        self, report_month: str, rows: list[dict], sales: MonthlySales | None,
+        *, expected_revision: str,
     ) -> None:
         """Save the entire required-destination form in one locked transaction.
 
@@ -130,6 +173,14 @@ class MonthlyInputRepository:
         with self.database.connection() as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self.lock_guard.require_unlocked(connection, report_month)
+            current_revision = _monthly_form_revision(
+                report_month, _monthly_form_state(connection, report_month)
+            )
+            if expected_revision != current_revision:
+                raise MonthlyInputRevisionError(
+                    "다른 화면에서 월 입력 또는 납품처 기준정보가 변경되었습니다. "
+                    "저장하지 않았습니다. 월 입력 화면을 다시 열어 최신 값을 검토한 뒤 저장하세요."
+                )
             required = {row[0] for row in connection.execute(
                 "SELECT id FROM destinations WHERE active = 1 AND required_for_report = 1"
             )}
@@ -514,6 +565,48 @@ def _raise_integrity_error(
             f"Destination {destination_id} does not exist"
         ) from error
     raise MonthlyInputError(f"{operation} could not be saved: {error}") from error
+
+
+def _monthly_form_state(
+    connection: sqlite3.Connection, report_month: str
+) -> dict[str, tuple[sqlite3.Row, ...]]:
+    """Only semantic form/master values, with stable ordering and explicit nulls.
+
+    All destination masters participate so adding, activating, or reordering a
+    required row invalidates an open form. Timestamps and audit IDs do not affect
+    form content and are deliberately excluded from the revision.
+    """
+    return {
+        "destinations": tuple(connection.execute(
+            "SELECT id, name, display_order, active, required_for_report, "
+            "representative_item, include_quantity_total, include_cost_total, "
+            "include_sales_total FROM destinations ORDER BY display_order, id"
+        )),
+        "plans": tuple(connection.execute(
+            "SELECT report_month, destination_id, quantity_ea_text, cost_won, "
+            "representative_item FROM monthly_plans WHERE report_month = ? "
+            "ORDER BY destination_id", (report_month,),
+        )),
+        "actuals": tuple(connection.execute(
+            "SELECT report_month, destination_id, quantity_ea_text, source_note "
+            "FROM monthly_actual_quantities WHERE report_month = ? "
+            "ORDER BY destination_id", (report_month,),
+        )),
+        "sales": tuple(connection.execute(
+            "SELECT report_month, amount_won, source_note, confirmed_at "
+            "FROM monthly_sales WHERE report_month = ?", (report_month,),
+        )),
+    }
+
+
+def _monthly_form_revision(
+    report_month: str, state: dict[str, tuple[sqlite3.Row, ...]]
+) -> str:
+    payload = {"report_month": report_month, "values": {
+        name: [tuple(row) for row in rows] for name, rows in state.items()
+    }}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _validate_id(value: object) -> None:

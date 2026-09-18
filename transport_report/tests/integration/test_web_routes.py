@@ -61,8 +61,12 @@ class WebClient:
         return self.request("POST", path, **kwargs)
 
 
-def post(client, path, data, *, csrf=True):
+def post(client, path, data, *, csrf=True, revision=True):
     pairs = list(data.items()) if isinstance(data, dict) else list(data)
+    if revision and path.endswith("/inputs") and not any(key == "monthly_revision" for key, _ in pairs):
+        fields = hidden_fields(client.get(path).text)
+        if "monthly_revision" in fields:
+            pairs.append(("monthly_revision", fields["monthly_revision"]))
     if csrf:
         pairs.append(("csrf_token", client.cookies["csrf_token"]))
     return client.post(path, content=urlencode(pairs), headers={"Content-Type": "application/x-www-form-urlencoded"}, follow_redirects=False)
@@ -327,3 +331,94 @@ def test_preview_current_batch_overrides_legacy_cost_and_uses_delivery_quantity(
     assert result.actual_cost_won == 200
     assert result.actual_unit_cost == Decimal("20.00")
     assert "20.00" in client.get("/months/2026-08/preview").text
+
+
+def monthly_database_state(database):
+    with database.connection() as connection:
+        return tuple(
+            tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id"))
+            for table in ("monthly_plans", "monthly_actual_quantities", "monthly_sales")
+        )
+
+
+def test_two_tabs_cannot_overwrite_newer_monthly_values(client, masters, database):
+    path = "/months/2026-08/inputs"
+    tab_a = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    tab_b = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    assert tab_a == tab_b
+    newer = {"plan_quantity": "4", "plan_cost": "100", "representative_item": "B 품목", "actual_quantity": "7", "source_note": "B 실적 출처", "sales": "1000", "confirmed_at": "2026-08-30", "sales_source_note": "B 매출 출처"}
+    data_b = [(key, newer.get(key, value)) for key, value in monthly_form(masters)]
+    data_b.append(("monthly_revision", tab_b))
+    assert post(client, path, data_b).status_code == 303
+    state_b = monthly_database_state(database)
+    data_a = monthly_form(masters) + [("monthly_revision", tab_a)]
+    response = post(client, path, data_a)
+    assert response.status_code == 409
+    assert "다시" in response.text and "변경" in response.text
+    assert "location" not in response.headers
+    assert monthly_database_state(database) == state_b
+    repo = MonthlyInputRepository(database)
+    assert repo.get_plan("2026-08", 1).representative_item == "B 품목"
+    assert repo.get_actual_quantity("2026-08", 1).source_note == "B 실적 출처"
+    assert repo.get_sales("2026-08").amount_won == 1000
+    assert repo.get_sales("2026-08").confirmed_at.startswith("2026-08-30")
+
+
+def test_stale_last_row_conflict_checks_revision_before_any_write(client, masters, database):
+    path = "/months/2026-08/inputs"
+    assert post(client, path, monthly_form(masters)).status_code == 303
+    stale = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    MonthlyInputRepository(database).save_actual_quantity("2026-08", 14, 23, "새로운 마지막 행")
+    before = monthly_database_state(database)
+    with database.connection() as connection:
+        connection.execute("CREATE TRIGGER forbid_plan_write BEFORE INSERT ON monthly_plans BEGIN SELECT RAISE(ABORT, 'revision check must precede writes'); END")
+        connection.commit()
+    response = post(client, path, monthly_form(masters) + [("monthly_revision", stale)])
+    assert response.status_code == 409
+    assert monthly_database_state(database) == before
+
+
+@pytest.mark.parametrize("table,column,value", [
+    ("monthly_plans", "quantity_ea_text", "8"),
+    ("monthly_plans", "cost_won", 800),
+    ("monthly_plans", "representative_item", "수정 품목"),
+    ("monthly_actual_quantities", "quantity_ea_text", "9"),
+    ("monthly_actual_quantities", "source_note", "수정 출처"),
+    ("monthly_sales", "amount_won", 900),
+    ("monthly_sales", "confirmed_at", "2026-08-30T00:00:00+09:00"),
+    ("monthly_sales", "source_note", "수정 매출 출처"),
+    ("destinations", "name", "수정 납품처"),
+    ("destinations", "display_order", 99),
+    ("destinations", "active", 0),
+    ("destinations", "required_for_report", 0),
+    ("destinations", "representative_item", "새 기본 품목"),
+    ("destinations", "include_quantity_total", 0),
+    ("destinations", "include_cost_total", 0),
+    ("destinations", "include_sales_total", 0),
+])
+def test_monthly_revision_covers_each_editable_value_and_master(client, masters, database, table, column, value):
+    path = "/months/2026-08/inputs"
+    assert post(client, path, monthly_form(masters)).status_code == 303
+    before_revision = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    with database.connection() as connection:
+        connection.execute(f"UPDATE {table} SET {column} = ? WHERE id = 1", (value,))
+        connection.commit()
+    after_revision = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    assert before_revision != after_revision
+    assert re.fullmatch("[0-9a-f]{64}", after_revision)
+    assert hidden_fields(client.get(path).text)["monthly_revision"] == after_revision
+    before = monthly_database_state(database)
+    response = post(client, path, monthly_form(masters) + [("monthly_revision", before_revision)])
+    assert response.status_code == 409
+    assert monthly_database_state(database) == before
+
+
+def test_monthly_revision_distinguishes_blank_and_zero_and_is_required(client, masters, database):
+    path = "/months/2026-08/inputs"
+    blank_revision = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    assert post(client, path, monthly_form(masters)).status_code == 303
+    zero_revision = hidden_fields(client.get(path).text).get("monthly_revision", "missing")
+    assert blank_revision != zero_revision
+    before = monthly_database_state(database)
+    assert post(client, path, monthly_form(masters), revision=False).status_code == 409
+    assert monthly_database_state(database) == before

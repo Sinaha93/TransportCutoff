@@ -3,6 +3,7 @@
 <h1>{{ month }} 월 입력</h1><p>빈칸은 미입력, 0은 실적 없음으로 저장됩니다. 계획 수량·비용은 함께 입력하거나 함께 비우세요. 모든 행과 매출이 한 번에 저장됩니다.</p>
 <form method="post" action="/months/{{ month }}/inputs" data-zero-is-valid="true">
 {{ intent('save_inputs') }}
+<input type="hidden" name="monthly_revision" value="{{ monthly_revision }}">
 <section><h2>보고 월 매출</h2><label>매출액 (원) <input name="sales" inputmode="numeric" value="{{ sales.amount_won if sales else '' }}"></label><label>확정일 <input type="date" name="confirmed_at" value="{{ sales.confirmed_at[:10] if sales else '' }}"></label><label>매출 출처 <input name="sales_source_note" value="{{ (sales.source_note or '') if sales else '' }}"></label></section>
 <div class="table-scroll"><table><caption>활성·보고 필수 납품처</caption><thead><tr><th>납품처</th><th>계획 수량 (EA)</th><th>계획 비용 (원)</th><th>대표 품목</th><th>실적 수량 (EA)</th><th>실적 출처</th></tr></thead><tbody>
 {% for destination in destinations %}{% set plan = plans.get(destination.id) %}{% set actual = actuals.get(destination.id) %}

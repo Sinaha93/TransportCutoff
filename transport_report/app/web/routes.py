@@ -28,7 +28,9 @@ from app.importers.legacy_migration import (
     LegacyMigrationError, LegacyMigrationRevisionError, LegacyMigrationService,
 )
 from app.repositories.masters import MasterDataError, MasterRepository
-from app.repositories.monthly_inputs import MonthlyInputError, MonthlyInputRepository, MonthlySales
+from app.repositories.monthly_inputs import (
+    MonthlyInputError, MonthlyInputRepository, MonthlyInputRevisionError, MonthlySales,
+)
 from app.repositories.transport_entries import TransportEntryRepository
 
 
@@ -269,14 +271,21 @@ async def save_group(request: Request, group_id: int):
 def monthly_inputs(request: Request, month: str):
     require_month(month)
     db = database(request)
-    repo = MonthlyInputRepository(db)
-    return render(request, "monthly_inputs.html", destinations=[d for d in MasterRepository(db).list_destinations() if d.active and d.required_for_report], plans={p.destination_id: p for p in repo.list_plans(month)}, actuals={a.destination_id: a for a in repo.list_actual_quantities(month)}, sales=repo.get_sales(month))
+    snapshot = MonthlyInputRepository(db).get_form_snapshot(month)
+    return render(
+        request, "monthly_inputs.html", destinations=snapshot.destinations,
+        plans={p.destination_id: p for p in snapshot.plans},
+        actuals={a.destination_id: a for a in snapshot.actuals}, sales=snapshot.sales,
+        monthly_revision=snapshot.monthly_revision,
+    )
 
 
 @router.post("/months/{month}/inputs")
 async def save_inputs(request: Request, month: str):
     require_month(month)
     data = await form(request, "save_inputs")
+    if len(data.getlist("monthly_revision")) != 1 or not data.get("monthly_revision"):
+        raise FormError("월 입력 검토 정보가 없습니다. 화면을 다시 열어 검토한 뒤 저장하세요.", 409)
     keys = ("destination_id", "plan_quantity", "plan_cost", "representative_item", "actual_quantity", "source_note")
     columns = [data.getlist(key) for key in keys]
     if len({len(column) for column in columns}) != 1:
@@ -291,7 +300,9 @@ async def save_inputs(request: Request, month: str):
     if (amount is None) != (not confirmed):
         raise FormError("매출액과 확정일을 함께 입력하세요.")
     sales = None if amount is None else MonthlySales(month, amount, data.get("sales_source_note", "").strip() or None, confirmed)
-    MonthlyInputRepository(database(request)).save_form(month, rows, sales)
+    MonthlyInputRepository(database(request)).save_form(
+        month, rows, sales, expected_revision=data["monthly_revision"]
+    )
     return preview_redirect()
 
 
@@ -365,8 +376,8 @@ async def confirm_import(request: Request):
 
 def register_web(app: FastAPI) -> None:
     async def handle_error(request: Request, error: Exception):
-        status = error.status if isinstance(error, FormError) else 409 if isinstance(error, LegacyMigrationRevisionError) else 422
-        message = str(error) if isinstance(error, (FormError, LegacyMigrationError)) else f"입력 내용을 확인하세요. 중복 명칭·납품처·숫자·확정일 또는 월 잠금으로 저장하지 못했습니다. ({error})"
+        status = error.status if isinstance(error, FormError) else 409 if isinstance(error, (LegacyMigrationRevisionError, MonthlyInputRevisionError)) else 422
+        message = str(error) if isinstance(error, (FormError, LegacyMigrationError, MonthlyInputRevisionError)) else f"입력 내용을 확인하세요. 중복 명칭·납품처·숫자·확정일 또는 월 잠금으로 저장하지 못했습니다. ({error})"
         return render(request, "base.html", status=status, error=message)
 
     for error_type in (FormError, MasterDataError, MonthlyInputError, LegacyMigrationError, sqlite3.IntegrityError):
