@@ -18,6 +18,23 @@ def _month_values(start: int, *, multiplier: int = 1):
     }
 
 
+def _grand_total_for_report(report):
+    from app.domain.calculations import calculate_destination, calculate_total
+    from app.domain.models import Destination
+
+    destination = Destination(
+        1, "Synthetic", 1, True, True, None, True, True, False
+    )
+    current = calculate_destination(
+        report.planned_quantity_by_month[report.report_month],
+        report.planned_cost_won_by_month[report.report_month],
+        report.actual_quantity_by_month[report.report_month],
+        report.actual_cost_won_by_month[report.report_month],
+        destination_id=1,
+    )
+    return calculate_total({1: current}, [destination])
+
+
 @pytest.fixture
 def report():
     from app.reporting.charts import ChartReport
@@ -109,25 +126,34 @@ def test_chart_data_uses_august_window_averages_and_comparison_semantics(report)
 
 
 @pytest.mark.parametrize(
-    ("renderer_name", "chart_kind", "expected_size", "expected_legends"),
+    (
+        "renderer_name",
+        "chart_kind",
+        "expected_size",
+        "expected_legends",
+        "expected_perimeter",
+    ),
     [
         (
             "render_quantity_chart",
             "quantity",
             (2125, 1441),
             ["계획 수량", "실적 수량", "25년 평균 수량"],
+            (134, 134, 134),
         ),
         (
             "render_cost_chart",
             "cost",
             (2060, 1145),
             ["계획 운반비", "실적 운반비", "25년 평균 운반비"],
+            (134, 134, 134),
         ),
         (
             "render_combined_chart",
             "combined",
             (2091, 933),
             ["실적 수량", "25년 평균 수량", "실적 운반비", "25년 평균 운반비"],
+            (216, 216, 216),
         ),
     ],
 )
@@ -138,6 +164,7 @@ def test_renderers_write_stable_nonblank_png_with_chart_metadata(
     chart_kind,
     expected_size,
     expected_legends,
+    expected_perimeter,
 ):
     from app.reporting import charts
 
@@ -148,6 +175,17 @@ def test_renderers_write_stable_nonblank_png_with_chart_metadata(
         assert image.size == expected_size
         assert image.format == "PNG"
         rgb = image.convert("RGB")
+        perimeter_points = (
+            (0, 0),
+            (expected_size[0] - 1, 0),
+            (0, expected_size[1] - 1),
+            (expected_size[0] - 1, expected_size[1] - 1),
+            (expected_size[0] // 2, 0),
+            (0, expected_size[1] // 2),
+        )
+        assert {rgb.getpixel(point) for point in perimeter_points} == {
+            expected_perimeter
+        }
         white = Image.new("RGB", image.size, "white")
         assert ImageChops.difference(rgb, white).getbbox() is not None
         metadata = json.loads(image.info["Description"])
@@ -270,22 +308,13 @@ def test_task6_total_and_histories_adapt_into_chart_data():
         actual_cost_history_values,
     ):
         values.pop("2026-08")
-    displayed = {
-        *(f"2025-{month:02d}" for month in range(8, 13)),
-        *(f"2026-{month:02d}" for month in range(1, 8)),
-    }
-    plan_quantity = {month: value for month, value in plan_quantity_history_values.items() if month in displayed}
-    actual_quantity = {month: value for month, value in actual_quantity_history_values.items() if month in displayed}
-    plan_cost = {month: value for month, value in plan_cost_history_values.items() if month in displayed}
-    actual_cost = {month: value for month, value in actual_cost_history_values.items() if month in displayed}
-
     chart_report = chart_report_from_calculation(
         report_month="2026-08",
         current_total=total,
-        planned_quantity_by_month=plan_quantity,
-        actual_quantity_by_month=actual_quantity,
-        planned_cost_won_by_month=plan_cost,
-        actual_cost_won_by_month=actual_cost,
+        planned_quantity_by_month=plan_quantity_history_values,
+        actual_quantity_by_month=actual_quantity_history_values,
+        planned_cost_won_by_month=plan_cost_history_values,
+        actual_cost_won_by_month=actual_cost_history_values,
         planned_quantity_history=historical_averages(
             "2026-08", plan_quantity_history_values
         ),
@@ -318,6 +347,85 @@ def test_task6_total_and_histories_adapt_into_chart_data():
     assert cost.series[1].values[12] == Decimal("4567")
 
 
+def test_task6_adapter_rejects_july_averages_for_august_mappings(report):
+    from app.domain.calculations import HistoricalValueKind, historical_averages
+    from app.reporting.charts import chart_report_from_calculation
+
+    with pytest.raises(
+        ValueError,
+        match=r"planned_quantity_by_month history.*2026-08.*monthly values",
+    ):
+        chart_report_from_calculation(
+            report_month="2026-08",
+            current_total=_grand_total_for_report(report),
+            planned_quantity_by_month=report.planned_quantity_by_month,
+            actual_quantity_by_month=report.actual_quantity_by_month,
+            planned_cost_won_by_month=report.planned_cost_won_by_month,
+            actual_cost_won_by_month=report.actual_cost_won_by_month,
+            planned_quantity_history=historical_averages(
+                "2026-07", report.planned_quantity_by_month
+            ),
+            actual_quantity_history=historical_averages(
+                "2026-08", report.actual_quantity_by_month
+            ),
+            planned_cost_history=historical_averages(
+                "2026-08",
+                report.planned_cost_won_by_month,
+                value_kind=HistoricalValueKind.MONEY,
+            ),
+            actual_cost_history=historical_averages(
+                "2026-08",
+                report.actual_cost_won_by_month,
+                value_kind=HistoricalValueKind.MONEY,
+            ),
+        )
+
+
+def test_task6_adapter_rejects_history_from_wrong_mapping_or_value_domain(report):
+    from app.domain.calculations import HistoricalValueKind, historical_averages
+    from app.reporting.charts import chart_report_from_calculation
+
+    valid = {
+        "report_month": "2026-08",
+        "current_total": _grand_total_for_report(report),
+        "planned_quantity_by_month": report.planned_quantity_by_month,
+        "actual_quantity_by_month": report.actual_quantity_by_month,
+        "planned_cost_won_by_month": report.planned_cost_won_by_month,
+        "actual_cost_won_by_month": report.actual_cost_won_by_month,
+        "planned_quantity_history": historical_averages(
+            "2026-08", report.planned_quantity_by_month
+        ),
+        "actual_quantity_history": historical_averages(
+            "2026-08", report.actual_quantity_by_month
+        ),
+        "planned_cost_history": historical_averages(
+            "2026-08",
+            report.planned_cost_won_by_month,
+            value_kind=HistoricalValueKind.MONEY,
+        ),
+        "actual_cost_history": historical_averages(
+            "2026-08",
+            report.actual_cost_won_by_month,
+            value_kind=HistoricalValueKind.MONEY,
+        ),
+    }
+    wrong_mapping = historical_averages("2026-08", _month_values(9_000))
+    wrong_domain = historical_averages(
+        "2026-08", report.planned_quantity_by_month
+    )
+
+    for field, supplied, expected_field in (
+        ("actual_quantity_history", wrong_mapping, "actual_quantity_by_month"),
+        ("planned_cost_history", wrong_domain, "planned_cost_won_by_month"),
+    ):
+        arguments = {**valid, field: supplied}
+        with pytest.raises(
+            ValueError,
+            match=rf"{expected_field} history.*monthly values",
+        ):
+            chart_report_from_calculation(**arguments)
+
+
 def test_scope_is_limited_to_august_2026(report):
     from dataclasses import replace
 
@@ -345,15 +453,49 @@ def test_renderer_closes_figure_when_saving_fails(monkeypatch, tmp_path, report)
 
     from app.reporting.charts import render_quantity_chart
 
-    def fail_save(self, *args, **kwargs):
+    destination = tmp_path / "quantity.png"
+    original = b"existing chart bytes"
+    destination.write_bytes(original)
+
+    def fail_save(self, path, *args, **kwargs):
+        path.write_bytes(b"partial png")
         raise OSError("forced save failure")
 
     monkeypatch.setattr(Figure, "savefig", fail_save)
 
     with pytest.raises(OSError, match="forced save failure"):
-        render_quantity_chart(report, tmp_path / "quantity.png")
+        render_quantity_chart(report, destination)
 
     assert plt.get_fignums() == []
+    assert destination.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_renderer_fails_clearly_before_figure_creation_without_korean_font(
+    monkeypatch, tmp_path, report
+):
+    from app.reporting import charts
+
+    charts._font_path.cache_clear()
+    figure_created = False
+    original_new_figure = charts._new_figure
+
+    def record_new_figure(*args, **kwargs):
+        nonlocal figure_created
+        figure_created = True
+        return original_new_figure(*args, **kwargs)
+
+    def missing_font(*args, **kwargs):
+        raise ValueError("font not found")
+
+    monkeypatch.setattr(charts, "_new_figure", record_new_figure)
+    monkeypatch.setattr(charts.font_manager, "findfont", missing_font)
+
+    with pytest.raises(RuntimeError, match=r"Malgun Gothic.*Korean"):
+        charts.render_quantity_chart(report, tmp_path / "quantity.png")
+
+    assert not figure_created
+    charts._font_path.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -419,17 +561,19 @@ def test_rendered_artists_match_reference_palette_legend_and_table_keys(
     right_axis,
 ):
     from matplotlib.colors import to_hex
-    from matplotlib.figure import Figure
+    from itertools import combinations
+
+    from matplotlib.transforms import Bbox
 
     from app.reporting import charts
 
     captured = {}
 
-    def capture_figure(self, *args, **kwargs):
-        captured["figure"] = self
-        captured["renderer"] = self.canvas.get_renderer()
+    def capture_figure(figure, *args, **kwargs):
+        captured["figure"] = figure
+        captured["renderer"] = figure.canvas.get_renderer()
 
-    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    monkeypatch.setattr(charts, "_save", capture_figure)
 
     getattr(charts, renderer_name)(report, tmp_path / "captured.png")
 
@@ -471,6 +615,27 @@ def test_rendered_artists_match_reference_palette_legend_and_table_keys(
     assert figure.subplotpars.left >= 0.16
     renderer = captured["renderer"]
     figure_box = figure.bbox
+    if renderer_name != "render_combined_chart":
+        data_labels = [
+            text
+            for text in axis.texts
+            if text.get_visible() and text.get_gid() == "bar-data-label"
+        ]
+        assert len(data_labels) == 32
+        label_boxes = [text.get_window_extent(renderer) for text in data_labels]
+        legend_box = axis.get_legend().get_window_extent(renderer)
+        table_box = Bbox.union(
+            [cell.get_window_extent(renderer) for cell in table.get_celld().values()]
+        )
+        for box in label_boxes:
+            assert figure_box.contains(box.x0, box.y0)
+            assert figure_box.contains(box.x1, box.y1)
+            assert not box.overlaps(legend_box)
+            assert not box.overlaps(table_box)
+        assert all(
+            not first.overlaps(second)
+            for first, second in combinations(label_boxes, 2)
+        )
     for column, expected_label in enumerate(
         charts.build_quantity_chart_data(report).labels
     ):

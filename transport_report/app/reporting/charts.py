@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -19,10 +21,12 @@ from matplotlib import font_manager
 from matplotlib.axes import Axes
 from matplotlib.container import BarContainer
 from matplotlib.figure import Figure
+from matplotlib.ft2font import FT2Font
 from matplotlib.font_manager import FontProperties
 from matplotlib.lines import Line2D
-from matplotlib.transforms import IdentityTransform
+from matplotlib.transforms import Bbox, IdentityTransform
 from matplotlib.ticker import FuncFormatter, MultipleLocator
+from PIL import Image, ImageChops
 
 from app.domain.calculations import (
     HistoricalAverages,
@@ -61,13 +65,9 @@ _COMBINED_BLUE = "#0000FF"
 _STANDARD_GRID = "#F2F2F2"
 _STANDARD_BORDER = "#868686"
 _COMBINED_BORDER = "#D9D9D9"
-_FONT_CANDIDATES = (
-    "Malgun Gothic",
-    "Noto Sans KR",
-    "NanumGothic",
-    "HYGothic-Medium",
-    "DejaVu Sans",
-)
+_COMBINED_PERIMETER = "#D8D8D8"
+_KOREAN_FONT_FAMILY = "Malgun Gothic"
+_REQUIRED_KOREAN_GLYPHS = "년월평균계획실적수량운반비천원"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +116,7 @@ class ChartData:
     table_border_color: str
     axis_color: str
     text_color: str
+    perimeter_color: str
     left_axis: PresentationAxis
     right_axis: PresentationAxis | None = None
 
@@ -136,7 +137,8 @@ def chart_report_from_calculation(
     """Adapt a Task6 grand-total result and its precomputed histories.
 
     Historical mappings supply prior months; the canonical calculation result
-    supplies the report-month totals and retains its destination provenance.
+    supplies the report-month totals. Supplied averages are accepted only when
+    they exactly match Task6's authoritative recomputation from those mappings.
     """
     if not isinstance(current_total, GrandTotalResult):
         raise TypeError("current_total must be a Task6 GrandTotalResult")
@@ -151,36 +153,70 @@ def chart_report_from_calculation(
         raise ValueError(
             "current_total is incomplete for chart rendering: " + ", ".join(missing)
         )
+    plan_quantity = _with_current(
+        planned_quantity_by_month,
+        report_month,
+        current_total.planned_quantity,
+        "planned_quantity_by_month",
+    )
+    actual_quantity = _with_current(
+        actual_quantity_by_month,
+        report_month,
+        current_total.actual_quantity,
+        "actual_quantity_by_month",
+    )
+    plan_cost = _with_current(
+        planned_cost_won_by_month,
+        report_month,
+        current_total.planned_cost_won,
+        "planned_cost_won_by_month",
+    )
+    actual_cost = _with_current(
+        actual_cost_won_by_month,
+        report_month,
+        current_total.actual_cost_won,
+        "actual_cost_won_by_month",
+    )
+    validated_histories = (
+        _validated_history(
+            report_month,
+            plan_quantity,
+            "planned_quantity_by_month",
+            HistoricalValueKind.QUANTITY,
+            planned_quantity_history,
+        ),
+        _validated_history(
+            report_month,
+            actual_quantity,
+            "actual_quantity_by_month",
+            HistoricalValueKind.QUANTITY,
+            actual_quantity_history,
+        ),
+        _validated_history(
+            report_month,
+            plan_cost,
+            "planned_cost_won_by_month",
+            HistoricalValueKind.MONEY,
+            planned_cost_history,
+        ),
+        _validated_history(
+            report_month,
+            actual_cost,
+            "actual_cost_won_by_month",
+            HistoricalValueKind.MONEY,
+            actual_cost_history,
+        ),
+    )
     return ChartReport(
         report_month=report_month,
-        planned_quantity_by_month=_with_current(
-            planned_quantity_by_month,
-            report_month,
-            current_total.planned_quantity,
-            "planned_quantity_by_month",
-        ),
-        actual_quantity_by_month=_with_current(
-            actual_quantity_by_month,
-            report_month,
-            current_total.actual_quantity,
-            "actual_quantity_by_month",
-        ),
-        planned_cost_won_by_month=_with_current(
-            planned_cost_won_by_month,
-            report_month,
-            current_total.planned_cost_won,
-            "planned_cost_won_by_month",
-        ),
-        actual_cost_won_by_month=_with_current(
-            actual_cost_won_by_month,
-            report_month,
-            current_total.actual_cost_won,
-            "actual_cost_won_by_month",
-        ),
-        planned_quantity_history=planned_quantity_history,
-        actual_quantity_history=actual_quantity_history,
-        planned_cost_history=planned_cost_history,
-        actual_cost_history=actual_cost_history,
+        planned_quantity_by_month=plan_quantity,
+        actual_quantity_by_month=actual_quantity,
+        planned_cost_won_by_month=plan_cost,
+        actual_cost_won_by_month=actual_cost,
+        planned_quantity_history=validated_histories[0],
+        actual_quantity_history=validated_histories[1],
+        planned_cost_history=validated_histories[2],
+        actual_cost_history=validated_histories[3],
     )
 
 
@@ -254,6 +290,7 @@ def build_quantity_chart_data(report: ChartReport) -> ChartData:
         table_border_color=_STANDARD_BORDER,
         axis_color=_STANDARD_BORDER,
         text_color="#000000",
+        perimeter_color=_STANDARD_BORDER,
         left_axis=QUANTITY_AXIS,
     )
     _validate_fixed_axes(data)
@@ -329,6 +366,7 @@ def build_cost_chart_data(report: ChartReport) -> ChartData:
         table_border_color=_STANDARD_BORDER,
         axis_color=_STANDARD_BORDER,
         text_color="#000000",
+        perimeter_color=_STANDARD_BORDER,
         left_axis=COST_AXIS,
     )
     _validate_fixed_axes(data)
@@ -415,6 +453,7 @@ def build_combined_chart_data(report: ChartReport) -> ChartData:
         table_border_color=_COMBINED_BORDER,
         axis_color="#595959",
         text_color="#595959",
+        perimeter_color=_COMBINED_PERIMETER,
         left_axis=QUANTITY_AXIS,
         right_axis=COMBINED_COST_AXIS,
     )
@@ -441,10 +480,10 @@ def render_combined_chart(
 
 
 def _render_grouped_chart(data: ChartData, path: str | Path, dpi: int) -> None:
-    figure, axis = _new_figure(data.canvas_pixels, dpi)
+    font = _font(7.5)
+    bold_font = _font(8, bold=True)
+    figure, axis = _new_figure(data.canvas_pixels, dpi, data.perimeter_color)
     try:
-        font = _font(7.5)
-        bold_font = _font(8, bold=True)
         x_values = list(range(len(data.labels)))
         width = 0.28
         first, second, comparison = data.series
@@ -480,12 +519,6 @@ def _render_grouped_chart(data: ChartData, path: str | Path, dpi: int) -> None:
         )[0]
         _style_axis(axis, data, font)
         _set_axis_limit(axis, data.left_axis)
-        _label_bars(
-            axis, first_bars, first.values, first.unit, bold_font, data.text_color
-        )
-        _label_bars(
-            axis, second_bars, second.values, second.unit, bold_font, data.text_color
-        )
         axis.legend(
             [first_bars, second_bars, comparison_line],
             [first.label, second.label, comparison.label],
@@ -497,16 +530,25 @@ def _render_grouped_chart(data: ChartData, path: str | Path, dpi: int) -> None:
         )
         figure.subplots_adjust(left=0.16, right=0.99, top=0.90, bottom=0.20)
         _add_table(axis, data, font, bold_font, y=-0.205, height=0.19)
+        _label_grouped_bars(
+            axis,
+            (
+                (first_bars, first.values, first.unit),
+                (second_bars, second.values, second.unit),
+            ),
+            bold_font,
+            data.text_color,
+        )
         _save(figure, data, path, dpi)
     finally:
         plt.close(figure)
 
 
 def _render_combined_chart(data: ChartData, path: str | Path, dpi: int) -> None:
-    figure, left_axis = _new_figure(data.canvas_pixels, dpi)
+    font = _font(7)
+    bold_font = _font(7.5, bold=True)
+    figure, left_axis = _new_figure(data.canvas_pixels, dpi, data.perimeter_color)
     try:
-        font = _font(7)
-        bold_font = _font(7.5, bold=True)
         right_axis = left_axis.twinx()
         x_values = list(range(len(data.labels)))
         quantity, quantity_average, cost, cost_average = data.series
@@ -584,15 +626,20 @@ def _render_combined_chart(data: ChartData, path: str | Path, dpi: int) -> None:
         plt.close(figure)
 
 
-def _new_figure(canvas_pixels: tuple[int, int], dpi: int) -> tuple[Figure, Axes]:
+def _new_figure(
+    canvas_pixels: tuple[int, int], dpi: int, perimeter_color: str
+) -> tuple[Figure, Axes]:
     if not isinstance(dpi, int) or isinstance(dpi, bool) or dpi <= 0:
         raise ValueError("dpi must be a positive integer")
     width, height = canvas_pixels
-    return plt.subplots(
+    figure, axis = plt.subplots(
         figsize=(width / dpi, height / dpi),
         dpi=dpi,
         facecolor="white",
     )
+    figure.patch.set_edgecolor(perimeter_color)
+    figure.patch.set_linewidth(1)
+    return figure, axis
 
 
 def _style_axis(axis: Axes, data: ChartData, font: FontProperties) -> None:
@@ -616,27 +663,75 @@ def _set_axis_limit(axis: Axes, presentation: PresentationAxis) -> None:
     axis.yaxis.set_major_locator(MultipleLocator(float(presentation.major_interval)))
 
 
-def _label_bars(
+def _label_grouped_bars(
     axis: Axes,
-    bars: BarContainer,
-    values: tuple[Decimal, ...],
-    unit: str,
+    groups: tuple[
+        tuple[BarContainer, tuple[Decimal, ...], str],
+        tuple[BarContainer, tuple[Decimal, ...], str],
+    ],
     font: FontProperties,
     text_color: str,
 ) -> None:
-    offset = max((float(value) for value in values), default=1.0) * 0.013
-    for bar, value in zip(bars, values, strict=True):
-        axis.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + offset,
-            _format_value(value, unit),
-            ha="center",
-            va="bottom",
-            fontproperties=font,
-            color=text_color,
-            clip_on=False,
-            zorder=6,
+    figure = axis.figure
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    legend = axis.get_legend()
+    blocked = [legend.get_window_extent(renderer)] if legend is not None else []
+    if axis.tables:
+        blocked.append(
+            Bbox.union(
+                [
+                    cell.get_window_extent(renderer)
+                    for cell in axis.tables[0].get_celld().values()
+                ]
+            )
         )
+    placed: list[Bbox] = []
+    candidates = (
+        (3, "bottom"),
+        (14, "bottom"),
+        (25, "bottom"),
+        (36, "bottom"),
+        (-3, "top"),
+        (-14, "top"),
+        (-25, "top"),
+        (-36, "top"),
+    )
+    for bars, values, unit in groups:
+        for bar, value in zip(bars, values, strict=True):
+            label = axis.annotate(
+                _format_value(value, unit),
+                xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, candidates[0][0]),
+                textcoords="offset points",
+                ha="center",
+                va=candidates[0][1],
+                fontproperties=font,
+                color=text_color,
+                clip_on=False,
+                zorder=6,
+            )
+            label.set_gid("bar-data-label")
+            for offset, vertical_alignment in candidates:
+                label.set_position((0, offset))
+                label.set_verticalalignment(vertical_alignment)
+                box = label.get_window_extent(renderer)
+                inside_canvas = (
+                    box.x0 >= figure.bbox.x0
+                    and box.x1 <= figure.bbox.x1
+                    and box.y0 >= figure.bbox.y0
+                    and box.y1 <= figure.bbox.y1
+                )
+                if inside_canvas and not any(
+                    box.overlaps(other) for other in (*blocked, *placed)
+                ):
+                    placed.append(box)
+                    break
+            else:
+                raise RuntimeError(
+                    f"no collision-free data-label position for {_format_value(value, unit)}"
+                )
+    figure.canvas.draw()
 
 
 def _add_table(
@@ -731,22 +826,53 @@ def _save(figure: Figure, data: ChartData, path: str | Path, dpi: int) -> None:
             if not series.label.startswith(data.comparison_label)
         },
     }
-    figure.savefig(
-        Path(path),
-        format="png",
-        dpi=dpi,
-        facecolor="white",
-        edgecolor="white",
-        metadata={
-            "Title": f"{data.report_month} {data.chart_kind} transport report chart",
-            "Description": json.dumps(
-                metadata,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        },
+    destination = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
     )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        figure.savefig(
+            temporary,
+            format="png",
+            dpi=dpi,
+            facecolor="white",
+            edgecolor=data.perimeter_color,
+            metadata={
+                "Title": (
+                    f"{data.report_month} {data.chart_kind} transport report chart"
+                ),
+                "Description": json.dumps(
+                    metadata,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        )
+        _validate_png(temporary, data.canvas_pixels)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_png(path: Path, expected_size: tuple[int, int]) -> None:
+    with Image.open(path) as image:
+        image.verify()
+    with Image.open(path) as image:
+        if image.format != "PNG":
+            raise ValueError(f"rendered chart is not PNG: {path}")
+        if image.size != expected_size:
+            raise ValueError(
+                f"rendered chart size {image.size} does not match {expected_size}"
+            )
+        rgb = image.convert("RGB")
+        white = Image.new("RGB", image.size, "white")
+        if ImageChops.difference(rgb, white).getbbox() is None:
+            raise ValueError("rendered chart is blank")
 
 
 def _complete_history(
@@ -758,19 +884,13 @@ def _complete_history(
     require_comparison: bool = True,
     supplied: HistoricalAverages | None = None,
 ) -> HistoricalAverages:
-    if supplied is not None:
-        if not isinstance(supplied, HistoricalAverages):
-            raise TypeError(f"{field_name} history must be HistoricalAverages")
-        averages = supplied
-    else:
-        try:
-            averages = historical_averages(
-                report_month,
-                values,
-                value_kind=value_kind,
-            )
-        except ValueError as error:
-            raise ValueError(f"{field_name} is invalid: {error}") from error
+    averages = _validated_history(
+        report_month,
+        values,
+        field_name,
+        value_kind,
+        supplied,
+    )
     required_results = [
         averages.three_month,
         averages.six_month,
@@ -791,6 +911,31 @@ def _complete_history(
             + ", ".join(sorted(missing))
         )
     return averages
+
+
+def _validated_history(
+    report_month: str,
+    values: Mapping[str, Decimal | int | None],
+    field_name: str,
+    value_kind: HistoricalValueKind,
+    supplied: HistoricalAverages | None,
+) -> HistoricalAverages:
+    if supplied is not None and not isinstance(supplied, HistoricalAverages):
+        raise TypeError(f"{field_name} history must be HistoricalAverages")
+    try:
+        authoritative = historical_averages(
+            report_month,
+            values,
+            value_kind=value_kind,
+        )
+    except ValueError as error:
+        raise ValueError(f"{field_name} is invalid: {error}") from error
+    if supplied is not None and supplied != authoritative:
+        raise ValueError(
+            f"{field_name} history does not match {report_month} "
+            f"{value_kind.value} monthly values"
+        )
+    return authoritative
 
 
 def _with_current(
@@ -912,14 +1057,29 @@ def _format_value(value: Decimal, unit: str) -> str:
 
 @lru_cache(maxsize=1)
 def _font_path() -> str:
-    installed: dict[str, list[str]] = {}
-    for entry in font_manager.fontManager.ttflist:
-        installed.setdefault(entry.name, []).append(entry.fname)
-    for family in _FONT_CANDIDATES:
-        paths = installed.get(family)
-        if paths:
-            return sorted(paths)[0]
-    return font_manager.findfont("DejaVu Sans", fallback_to_default=False)
+    try:
+        path = font_manager.findfont(
+            FontProperties(family=[_KOREAN_FONT_FAMILY]),
+            fallback_to_default=False,
+        )
+        character_map = FT2Font(path).get_charmap()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RuntimeError(
+            "Malgun Gothic with Korean glyphs is required to render charts. "
+            "Install or enable the Windows Korean supplemental fonts and retry."
+        ) from error
+    missing = [
+        glyph
+        for glyph in _REQUIRED_KOREAN_GLYPHS
+        if ord(glyph) not in character_map
+    ]
+    if missing:
+        raise RuntimeError(
+            "Malgun Gothic does not contain the required Korean glyphs "
+            f"({''.join(missing)}). Install or repair the Windows Korean "
+            "supplemental fonts and retry."
+        )
+    return path
 
 
 def _font(size: float, *, bold: bool = False) -> FontProperties:
