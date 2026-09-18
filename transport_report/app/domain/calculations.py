@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Context, Decimal, DecimalException, ROUND_HALF_UP, localcontext
 from enum import Enum
+from typing import Literal, overload
 
 from app.domain.models import Destination, GroupMember
 
@@ -425,6 +426,24 @@ def calculate_group(
             tuple(item.destination_id for item in rules),
         ),
     )
+
+
+@overload
+def historical_averages(
+    report_month: str,
+    monthly_values: Mapping[str, Decimal | None],
+    *,
+    value_kind: Literal[HistoricalValueKind.QUANTITY] = HistoricalValueKind.QUANTITY,
+) -> HistoricalAverages: ...
+
+
+@overload
+def historical_averages(
+    report_month: str,
+    monthly_values: Mapping[str, int | Decimal | None],
+    *,
+    value_kind: Literal[HistoricalValueKind.MONEY],
+) -> HistoricalAverages: ...
 
 
 def historical_averages(

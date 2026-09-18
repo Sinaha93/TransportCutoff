@@ -320,6 +320,28 @@ def test_history_requires_an_explicit_supported_value_kind():
         historical_averages("2026-01", {}, value_kind="money")
 
 
+def test_history_overloads_express_metric_value_domains():
+    from collections.abc import Mapping
+    from typing import get_args, get_overloads, get_type_hints
+
+    from app.domain.calculations import HistoricalValueKind, historical_averages
+
+    overloads = get_overloads(historical_averages)
+    assert len(overloads) == 2
+    hints_by_kind = {}
+    for overload in overloads:
+        hints = get_type_hints(overload)
+        (value_kind,) = get_args(hints["value_kind"])
+        hints_by_kind[value_kind] = hints
+
+    assert hints_by_kind[HistoricalValueKind.QUANTITY]["monthly_values"] == Mapping[
+        str, Decimal | None
+    ]
+    assert hints_by_kind[HistoricalValueKind.MONEY]["monthly_values"] == Mapping[
+        str, int | Decimal | None
+    ]
+
+
 def test_review_selector_includes_exact_thresholds_and_orders_deterministically():
     from app.domain.calculations import (
         ReviewCandidate,
