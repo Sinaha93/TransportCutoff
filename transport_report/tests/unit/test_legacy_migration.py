@@ -121,6 +121,57 @@ def test_parses_exact_regions_cached_formulas_and_ignores_chart_helpers(
         alpha_august.quantity_ea = Decimal("1")
 
 
+def test_history_parser_uses_bounded_sequential_rows_without_cell_lookups(
+    tmp_path, service, monkeypatch
+):
+    import app.importers.legacy_migration as migration
+
+    source = build_legacy_fixture(tmp_path / "sequential-history.xlsx")
+    original = migration._parse_history
+    observed: list[tuple[str, dict[str, int]]] = []
+
+    class SequentialOnlySheet:
+        def __init__(self, kind, sheet):
+            self.kind = kind
+            self.sheet = sheet
+            self.title = sheet.title
+            self.max_row = sheet.max_row
+
+        def iter_rows(self, **kwargs):
+            observed.append((self.kind, kwargs))
+            return self.sheet.iter_rows(**kwargs)
+
+        def cell(self, *args, **kwargs):
+            raise AssertionError("누적 데이터 파서는 반복 cell 조회를 사용하면 안 됩니다.")
+
+    def guarded_parser(formula_sheet, cached_sheet, aliases):
+        return original(
+            SequentialOnlySheet("formula", formula_sheet),
+            SequentialOnlySheet("cached", cached_sheet),
+            aliases,
+        )
+
+    monkeypatch.setattr(migration, "_parse_history", guarded_parser)
+
+    result = service.dry_run(source, report_month="2026-08")
+
+    assert result.summary.actual_records == 280
+    assert observed == [
+        (
+            "formula",
+            {"min_row": 1, "max_row": 281, "min_col": 1, "max_col": 6},
+        ),
+        (
+            "cached",
+            {"min_row": 1, "max_row": 281, "min_col": 1, "max_col": 6},
+        ),
+        (
+            "cached",
+            {"min_row": 282, "max_row": 281, "min_col": 1, "max_col": 6},
+        ),
+    ]
+
+
 def test_non_august_headers_have_no_effect_on_august_migration(tmp_path, service):
     normal_source = build_legacy_fixture(tmp_path / "normal-headers.xlsx")
     changed_source = build_legacy_fixture(
@@ -226,6 +277,68 @@ def test_dry_run_is_strictly_read_only_for_sqlite(tmp_path, database, service):
     assert _table_counts(database) == before_counts == (0, 0, 0)
     assert database.path.read_bytes() == before_bytes
     assert source.read_bytes() == source_bytes
+
+
+def test_migration_public_boundary_rejects_non_august_before_staging_or_commit(
+    tmp_path, database, service, migration_api, monkeypatch
+):
+    import app.importers.legacy_migration as migration
+
+    source = build_legacy_fixture(tmp_path / "wrong-report-month.xlsx")
+    before_counts = _table_counts(database)
+
+    def unexpected_staging(*args, **kwargs):
+        raise AssertionError("지원하지 않는 보고월은 staging 전에 거부해야 합니다.")
+
+    monkeypatch.setattr(migration, "_parse_source", unexpected_staging)
+
+    with pytest.raises(migration_api["error"], match="2026-08.*전용"):
+        service.dry_run(source, report_month="2026-07")
+    with pytest.raises(migration_api["error"], match="2026-08.*전용"):
+        service.commit(
+            source,
+            report_month="2026-07",
+            confirmed=False,
+            expected_source_sha256="unused",
+            expected_master_revision="unused",
+            expected_database_revision="unused",
+            expected_revision="unused",
+        )
+    assert _table_counts(database) == before_counts == (0, 0, 0)
+
+
+def test_invalid_workbook_has_actionable_error_and_closes_first_open(
+    tmp_path, service, migration_api, monkeypatch
+):
+    import app.importers.legacy_migration as migration
+    from zipfile import BadZipFile
+
+    invalid = tmp_path / "invalid.xlsx"
+    invalid.write_bytes(b"not an xlsx archive")
+    with pytest.raises(migration_api["error"], match="XLSX.*열 수 없습니다.*형식.*권한"):
+        service.dry_run(invalid, report_month="2026-08")
+
+    first_open = type(
+        "FirstOpen",
+        (),
+        {
+            "closed": False,
+            "close": lambda self: setattr(self, "closed", True),
+        },
+    )()
+    calls = 0
+
+    def fail_second_open(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return first_open
+        raise BadZipFile("second workbook open failed")
+
+    monkeypatch.setattr(migration, "load_workbook", fail_second_open)
+    with pytest.raises(migration_api["error"], match="XLSX.*열 수 없습니다"):
+        service.dry_run(invalid, report_month="2026-08")
+    assert first_open.closed
 
 
 def test_commit_requires_confirmation_and_exact_dry_run_tokens(

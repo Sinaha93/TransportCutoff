@@ -7,13 +7,15 @@ import re
 import sqlite3
 import unicodedata
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from zipfile import BadZipFile
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import InvalidFileException
 
 from app.db import Database
 from app.domain.calculations import (
@@ -36,6 +38,9 @@ _PLAN_SHEET = "26년 월계획"
 _HISTORY_HEADERS = ("연도", "월", "연도+월", "납품처", "실적수량", "실적운반비")
 _PLAN_QUANTITY_HEADER = "수량"
 _PLAN_COST_HEADER = "운반비"
+_REPORT_MONTH = "2026-08"
+_AUGUST_QUANTITY_COLUMN = 17
+_AUGUST_COST_COLUMN = 18
 _MONTH = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
 
 
@@ -229,7 +234,6 @@ class LegacyMigrationService:
             master_revision = _master_revision(connection)
             parsed = _parse_source(
                 source,
-                report_month=report_month,
                 aliases=aliases,
                 initial_issues=resolution_issues,
             )
@@ -318,6 +322,7 @@ class LegacyMigrationService:
         expected_database_revision: str,
         expected_revision: str,
     ) -> MigrationCommitResult:
+        _require_report_month(report_month)
         if confirmed is not True:
             raise LegacyMigrationConfirmationError(
                 "마이그레이션 커밋에는 화면의 명시적인 확인이 필요합니다."
@@ -505,13 +510,25 @@ _DB_ISSUE_CODES = frozenset(
 def _parse_source(
     path: Path,
     *,
-    report_month: str,
     aliases: dict[str, int],
     initial_issues: tuple[MigrationIssue, ...],
 ) -> _ParsedSource:
-    formulas = load_workbook(path, read_only=True, data_only=False, keep_links=False)
-    cached = load_workbook(path, read_only=True, data_only=True, keep_links=False)
-    try:
+    with ExitStack() as workbooks:
+        try:
+            formulas = load_workbook(
+                path, read_only=True, data_only=False, keep_links=False
+            )
+            workbooks.callback(formulas.close)
+            cached = load_workbook(
+                path, read_only=True, data_only=True, keep_links=False
+            )
+            workbooks.callback(cached.close)
+        except (BadZipFile, InvalidFileException, OSError) as error:
+            raise LegacyMigrationError(
+                "레거시 원본 XLSX를 열 수 없습니다. 파일 형식과 접근 권한을 "
+                "확인한 뒤 다시 시도하세요."
+            ) from error
+
         missing_sheets = [
             name for name in (_HISTORY_SHEET, _PLAN_SHEET) if name not in cached.sheetnames
         ]
@@ -535,7 +552,6 @@ def _parse_source(
             formulas[_PLAN_SHEET],
             cached[_PLAN_SHEET],
             aliases,
-            report_month,
         )
         return _ParsedSource(
             plans=plans.plans,
@@ -547,9 +563,6 @@ def _parse_source(
             issues=tuple((*initial_issues, *history.issues, *plans.issues)),
             controls=plans.controls,
         )
-    finally:
-        formulas.close()
-        cached.close()
 
 
 def _empty_parsed(*issues: MigrationIssue) -> _ParsedSource:
@@ -560,8 +573,18 @@ def _parse_history(formula_sheet, cached_sheet, aliases: dict[str, int]) -> _Par
     issues: list[MigrationIssue] = []
     unknown: list[UnknownAlias] = []
     records: list[StagedActualRecord] = []
-    for column, expected in enumerate(_HISTORY_HEADERS, start=1):
-        actual = cached_sheet.cell(1, column).value
+    formula_rows = formula_sheet.iter_rows(
+        min_row=1, max_row=281, min_col=1, max_col=6
+    )
+    cached_rows = cached_sheet.iter_rows(
+        min_row=1, max_row=281, min_col=1, max_col=6
+    )
+    rows = zip(formula_rows, cached_rows, strict=True)
+    _, cached_header = next(rows)
+    for column, (cell, expected) in enumerate(
+        zip(cached_header, _HISTORY_HEADERS, strict=True), start=1
+    ):
+        actual = cell.value
         if actual != expected:
             issues.append(
                 MigrationIssue(
@@ -570,30 +593,15 @@ def _parse_history(formula_sheet, cached_sheet, aliases: dict[str, int]) -> _Par
                         f"헤더는 '{expected}'이어야 합니다. 원본 양식의 A:F 열을 "
                         "확인하세요."
                     ),
-                    source_locator=f"{_HISTORY_SHEET}!{cached_sheet.cell(1, column).coordinate}",
+                    source_locator=f"{_HISTORY_SHEET}!{get_column_letter(column)}1",
                     expected=expected,
                     actual=None if actual is None else str(actual),
                 )
             )
 
-    for row in range(282, cached_sheet.max_row + 1):
-        if any(
-            cached_sheet.cell(row, column).value is not None
-            for column in range(1, 7)
-        ):
-            issues.append(
-                MigrationIssue(
-                    code="HISTORY_ROW_OUT_OF_RANGE",
-                    message=(
-                        "누적 데이터의 업무 영역은 A2:F281(280행)입니다. "
-                        "범위 밖 값을 삭제하거나 올바른 행으로 이동하세요."
-                    ),
-                    source_locator=f"{_HISTORY_SHEET}!A{row}:F{row}",
-                )
-            )
     seen: set[tuple[str, int]] = set()
-    for row in range(2, 282):
-        values = tuple(cached_sheet.cell(row, column).value for column in range(1, 7))
+    for row, (formula_row, cached_row) in enumerate(rows, start=2):
+        values = tuple(cell.value for cell in cached_row)
         if all(value is None for value in values):
             issues.append(
                 MigrationIssue(
@@ -609,10 +617,18 @@ def _parse_history(formula_sheet, cached_sheet, aliases: dict[str, int]) -> _Par
         year = _parse_year(values[0], f"{_HISTORY_SHEET}!A{row}", issues)
         month = _parse_month_number(values[1], f"{_HISTORY_SHEET}!B{row}", issues)
         alias = _source_alias(values[3], f"{_HISTORY_SHEET}!D{row}", issues)
-        quantity_value = _cached_value(
-            formula_sheet, cached_sheet, row, 5, issues
+        quantity_value = _cached_cell_value(
+            formula_row[4],
+            cached_row[4],
+            f"{_HISTORY_SHEET}!E{row}",
+            issues,
         )
-        cost_value = _cached_value(formula_sheet, cached_sheet, row, 6, issues)
+        cost_value = _cached_cell_value(
+            formula_row[5],
+            cached_row[5],
+            f"{_HISTORY_SHEET}!F{row}",
+            issues,
+        )
         quantity = _parse_optional_quantity(
             quantity_value, f"{_HISTORY_SHEET}!E{row}", issues
         )
@@ -654,6 +670,26 @@ def _parse_history(formula_sheet, cached_sheet, aliases: dict[str, int]) -> _Par
                 source_row=row,
             )
         )
+    for row, cached_row in enumerate(
+        cached_sheet.iter_rows(
+            min_row=282,
+            max_row=cached_sheet.max_row,
+            min_col=1,
+            max_col=6,
+        ),
+        start=282,
+    ):
+        if any(cell.value is not None for cell in cached_row):
+            issues.append(
+                MigrationIssue(
+                    code="HISTORY_ROW_OUT_OF_RANGE",
+                    message=(
+                        "누적 데이터의 업무 영역은 A2:F281(280행)입니다. "
+                        "범위 밖 값을 삭제하거나 올바른 행으로 이동하세요."
+                    ),
+                    source_locator=f"{_HISTORY_SHEET}!A{row}:F{row}",
+                )
+            )
     records.sort(key=lambda item: (item.report_month, item.destination_id))
     return _ParsedSource((), tuple(records), tuple(unknown), tuple(issues), ())
 
@@ -662,25 +698,11 @@ def _parse_plans(
     formula_sheet,
     cached_sheet,
     aliases: dict[str, int],
-    report_month: str,
 ) -> _ParsedSource:
     issues: list[MigrationIssue] = []
     unknown: list[UnknownAlias] = []
     records: list[StagedPlanRecord] = []
     controls: list[_SourceControl] = []
-    report_year, report_month_number = map(int, report_month.split("-"))
-    expected_sheet_year = 2000 + int(_PLAN_SHEET[:2])
-    if report_year != expected_sheet_year:
-        issues.append(
-            MigrationIssue(
-                code="PLAN_YEAR_MISMATCH",
-                message=(
-                    f"'{_PLAN_SHEET}'은 {expected_sheet_year}년 계획 시트이므로 "
-                    f"{report_month} 보고월과 일치하지 않습니다."
-                ),
-                source_locator=_PLAN_SHEET,
-            )
-        )
     if cached_sheet["B4"].value != "납품처":
         issues.append(
             MigrationIssue(
@@ -691,11 +713,10 @@ def _parse_plans(
                 actual=_as_text(cached_sheet["B4"].value),
             )
         )
-    quantity_column = 3 + (report_month_number - 1) * 2
     for row, column, expected in (
-        (4, quantity_column, f"{report_month_number}월"),
-        (5, quantity_column, _PLAN_QUANTITY_HEADER),
-        (5, quantity_column + 1, _PLAN_COST_HEADER),
+        (4, _AUGUST_QUANTITY_COLUMN, "8월"),
+        (5, _AUGUST_QUANTITY_COLUMN, _PLAN_QUANTITY_HEADER),
+        (5, _AUGUST_COST_COLUMN, _PLAN_COST_HEADER),
     ):
         actual = cached_sheet.cell(row, column).value
         if actual != expected:
@@ -742,79 +763,72 @@ def _parse_plans(
                 UnknownAlias(alias, LEGACY_SOURCE_TYPE, f"{_PLAN_SHEET}!B{row}")
             )
             continue
-        for month in (report_month_number,):
-            quantity_column = 3 + (month - 1) * 2
-            cost_column = quantity_column + 1
-            quantity_value = _cached_value(
-                formula_sheet,
-                cached_sheet,
-                row,
-                quantity_column,
-                issues,
-            )
-            cost_value = _cached_value(
-                formula_sheet,
-                cached_sheet,
-                row,
-                cost_column,
-                issues,
-            )
-            if quantity_value is None and cost_value is None:
-                continue
-            if quantity_value is None or cost_value is None:
-                issues.append(
-                    MigrationIssue(
-                        code="PARTIAL_PLAN_VALUE",
-                        message=(
-                            "계획 수량과 운반비 중 하나만 있습니다. 두 값을 모두 "
-                            "입력하거나 모두 비워야 합니다."
-                        ),
-                        source_locator=(
-                            f"{_PLAN_SHEET}!{cached_sheet.cell(row, quantity_column).coordinate}:"
-                            f"{cached_sheet.cell(row, cost_column).coordinate}"
-                        ),
-                    )
-                )
-                continue
-            quantity = _parse_quantity(
-                quantity_value,
-                f"{_PLAN_SHEET}!{cached_sheet.cell(row, quantity_column).coordinate}",
-                issues,
-            )
-            cost = _parse_cost(
-                cost_value,
-                f"{_PLAN_SHEET}!{cached_sheet.cell(row, cost_column).coordinate}",
-                issues,
-            )
-            if quantity is None or cost is None:
-                continue
-            month_key = f"{report_year:04d}-{month:02d}"
-            key = (month_key, destination_id)
-            if key in seen:
-                issues.append(
-                    MigrationIssue(
-                        code="DUPLICATE_SOURCE_RECORD",
-                        message="같은 월과 납품처의 계획 행이 두 번 있습니다.",
-                        source_locator=f"{_PLAN_SHEET}!B{row}",
-                    )
-                )
-                continue
-            seen.add(key)
-            records.append(
-                StagedPlanRecord(
-                    report_month=month_key,
-                    destination_id=destination_id,
-                    destination_alias=alias,
-                    quantity_ea=quantity,
-                    cost_won=cost,
-                    source_sheet=_PLAN_SHEET,
-                    source_row=row,
+        quantity_value = _cached_value(
+            formula_sheet,
+            cached_sheet,
+            row,
+            _AUGUST_QUANTITY_COLUMN,
+            issues,
+        )
+        cost_value = _cached_value(
+            formula_sheet,
+            cached_sheet,
+            row,
+            _AUGUST_COST_COLUMN,
+            issues,
+        )
+        if quantity_value is None and cost_value is None:
+            continue
+        if quantity_value is None or cost_value is None:
+            issues.append(
+                MigrationIssue(
+                    code="PARTIAL_PLAN_VALUE",
+                    message=(
+                        "계획 수량과 운반비 중 하나만 있습니다. 두 값을 모두 "
+                        "입력하거나 모두 비워야 합니다."
+                    ),
+                    source_locator=f"{_PLAN_SHEET}!Q{row}:R{row}",
                 )
             )
+            continue
+        quantity = _parse_quantity(
+            quantity_value,
+            f"{_PLAN_SHEET}!Q{row}",
+            issues,
+        )
+        cost = _parse_cost(
+            cost_value,
+            f"{_PLAN_SHEET}!R{row}",
+            issues,
+        )
+        if quantity is None or cost is None:
+            continue
+        key = (_REPORT_MONTH, destination_id)
+        if key in seen:
+            issues.append(
+                MigrationIssue(
+                    code="DUPLICATE_SOURCE_RECORD",
+                    message="같은 월과 납품처의 계획 행이 두 번 있습니다.",
+                    source_locator=f"{_PLAN_SHEET}!B{row}",
+                )
+            )
+            continue
+        seen.add(key)
+        records.append(
+            StagedPlanRecord(
+                report_month=_REPORT_MONTH,
+                destination_id=destination_id,
+                destination_alias=alias,
+                quantity_ea=quantity,
+                cost_won=cost,
+                source_sheet=_PLAN_SHEET,
+                source_row=row,
+            )
+        )
 
     if total_row <= cached_sheet.max_row:
-        current_quantity_column = 3 + (report_month_number - 1) * 2
-        current_cost_column = current_quantity_column + 1
+        current_quantity_column = _AUGUST_QUANTITY_COLUMN
+        current_cost_column = _AUGUST_COST_COLUMN
         quantity_value = _cached_value(
             formula_sheet,
             cached_sheet,
@@ -868,8 +882,18 @@ def _parse_plans(
 def _cached_value(formula_sheet, cached_sheet, row, column, issues):
     formula = formula_sheet.cell(row, column).value
     cached = cached_sheet.cell(row, column).value
+    return _cached_cell_value(
+        formula,
+        cached,
+        f"{cached_sheet.title}!{get_column_letter(column)}{row}",
+        issues,
+    )
+
+
+def _cached_cell_value(formula_cell, cached_cell, locator, issues):
+    formula = getattr(formula_cell, "value", formula_cell)
+    cached = getattr(cached_cell, "value", cached_cell)
     if isinstance(formula, str) and formula.startswith("=") and cached is None:
-        coordinate = cached_sheet.cell(row, column).coordinate
         issues.append(
             MigrationIssue(
                 code="MISSING_FORMULA_CACHE",
@@ -877,7 +901,7 @@ def _cached_value(formula_sheet, cached_sheet, row, column, issues):
                     "수식의 저장값(캐시)이 없습니다. Excel에서 원본을 계산 후 "
                     "저장하고 다시 드라이런하세요."
                 ),
-                source_locator=f"{cached_sheet.title}!{coordinate}",
+                source_locator=locator,
             )
         )
     return cached
@@ -1694,3 +1718,8 @@ def _as_text(value) -> str | None:
 def _require_report_month(value: str) -> None:
     if not isinstance(value, str) or _MONTH.fullmatch(value) is None:
         raise LegacyMigrationError("보고월은 ASCII YYYY-MM 형식이어야 합니다.")
+    if value != _REPORT_MONTH:
+        raise LegacyMigrationError(
+            "2026-08 보고월 전용 마이그레이션입니다. "
+            "report_month를 '2026-08'로 지정해 다시 실행하세요."
+        )
