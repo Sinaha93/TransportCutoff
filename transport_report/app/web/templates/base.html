@@ -1,0 +1,22 @@
+{% macro intent(value) -%}
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="intent" value="{{ value }}">
+{%- endmacro %}
+{% macro destination_fields(d=none) %}
+<label>정식 명칭 <input name="name" value="{{ d.name if d else '' }}" required></label>
+<label>표시 순서 <input name="display_order" type="number" min="0" value="{{ d.display_order if d else '' }}" required></label>
+<label>대표 품목 <input name="representative_item" value="{{ (d.representative_item or '') if d else '' }}"></label>
+{% for field, label in [('active', '활성'), ('required_for_report', '보고 필수'), ('include_quantity_total', '총 수량 포함'), ('include_cost_total', '총 비용 포함'), ('include_sales_total', '총 매출 포함')] %}
+<label><input type="checkbox" name="{{ field }}" {% if d and d[field] %}checked{% endif %}>{{ label }}</label>
+{% endfor %}
+{% endmacro %}
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>운반비 보고 관리</title><link rel="stylesheet" href="/static/app.css"></head>
+<body>
+<header><strong>운반비 보고 관리</strong><nav aria-label="주 메뉴"><a href="/">대시보드</a><a href="/destinations">납품처</a><a href="/groups">그룹</a><a href="/months/{{ month }}/inputs">월 입력</a><a href="/imports/review">가져오기 검토</a><a href="/months/{{ month }}/preview">보고 미리보기</a></nav></header>
+<main>
+{% if error %}<section role="alert" class="error"><h1>작업을 완료하지 못했습니다</h1><p>{{ error }}</p><p>브라우저의 뒤로 가기로 입력 내용을 확인하거나 메뉴에서 화면을 다시 여세요.</p></section>{% endif %}
+{% block content %}{% endblock %}
+</main><footer>현재 보고 범위: 2026년 8월 · 원본 Excel은 읽기 전용으로 사용합니다.</footer>
+</body></html>

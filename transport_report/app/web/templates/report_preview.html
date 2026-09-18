@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ month }} 보고 미리보기</h1><p>저장된 값과 현재 납품처·그룹 기준을 다시 계산한 결과입니다. 단위 운반비 = 운반비 ÷ 납품 수량 (원/EA). 수량이 0이면 단위 운반비는 계산 불가입니다.</p>
+<div class="table-scroll"><table><thead><tr><th>납품처 / 그룹</th><th>계획 수량</th><th>계획 비용</th><th>실적 수량</th><th>실적 비용</th><th>실적 단위 운반비</th></tr></thead><tbody>
+{% for row in rows %}<tr><th scope="row">{{ row.destination.name }}</th><td>{{ row.result.planned_quantity|value }}</td><td>{{ row.result.planned_cost_won|value }}</td><td>{{ row.actual_quantity|value }}</td><td>{{ row.actual_cost|value }}</td><td>{{ row.result.actual_unit_cost if row.result.actual_unit_cost is not none else '계산 불가' }}</td></tr>{% endfor %}
+{% for group, result in groups %}<tr class="derived" data-planned-quantity="{{ result.planned_quantity|value }}" data-planned-cost="{{ result.planned_cost_won|value }}"><th scope="row">{{ group.name }} (그룹)</th><td>{{ result.planned_quantity|value }}</td><td>{{ result.planned_cost_won|value }}</td><td>{{ result.actual_quantity|value }}</td><td>{{ result.actual_cost_won|value }}</td><td>{{ result.actual_unit_cost if result.actual_unit_cost is not none else '계산 불가' }}</td></tr>{% endfor %}
+<tr class="total"><th scope="row">총계 (납품처 포함 기준)</th><td>{{ total.planned_quantity|value }}</td><td>{{ total.planned_cost_won|value }}</td><td>{{ total.actual_quantity|value }}</td><td>{{ total.actual_cost_won|value }}</td><td>{{ total.actual_unit_cost if total.actual_unit_cost is not none else '계산 불가' }}</td></tr>
+</tbody></table></div>
+<p>월 매출: {{ sales.amount_won if sales else '미입력' }}원 · 확정일 {{ sales.confirmed_at if sales else '미입력' }}</p>
+<section><h2>이력 평균</h2><table><thead><tr><th>기간</th><th>수량</th><th>운반비</th></tr></thead><tbody>{% for key, label in [('three_month', '이전 3개월'), ('six_month', '이전 6개월'), ('twelve_month', '이전 12개월'), ('comparison_year', '전년도')] %}<tr><th>{{ label }}</th><td>{{ historical.quantity[key].value|value }}</td><td>{{ historical.cost[key].value|value }}</td></tr>{% endfor %}</tbody></table></section>
+<section><h2>검증 항목</h2><ul>{% for issue in issues %}<li>{{ issue.message }}{% if issue.source_locator %} · {{ issue.source_locator }}{% endif %}</li>{% else %}<li>검증 차단 항목 없음</li>{% endfor %}</ul><p>생성 기능 준비 중입니다. 다음 달 계획·출력 메타데이터는 해당 기능 연결 전까지 미확인으로 표시됩니다.</p></section>
+{% endblock %}

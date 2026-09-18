@@ -72,6 +72,7 @@ class MasterRepository:
         include_quantity_total: bool = True,
         include_cost_total: bool = True,
         include_sales_total: bool = True,
+        initial_alias: tuple[str, str] | None = None,
     ) -> Destination:
         clean_name = _clean_text(name, "destination name")
         _validate_display_order(display_order)
@@ -84,6 +85,10 @@ class MasterRepository:
             ("include_sales_total", include_sales_total),
         ):
             _validate_bool(value, field)
+        if initial_alias is not None:
+            initial_alias = tuple(_normalize_alias_text(value, "alias") for value in initial_alias)
+            if len(initial_alias) != 2:
+                raise ValidationError("Alias requires name and source type")
         parameters = (
             clean_name,
             display_order,
@@ -104,6 +109,11 @@ class MasterRepository:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
                     parameters,
                 ).fetchone()
+                if initial_alias is not None:
+                    connection.execute(
+                        "INSERT INTO destination_aliases(destination_id, raw_name, source_type) VALUES (?, ?, ?)",
+                        (row["id"], *initial_alias),
+                    )
                 connection.commit()
             except sqlite3.IntegrityError as error:
                 connection.rollback()
@@ -490,6 +500,39 @@ class MasterRepository:
                 "SELECT * FROM report_groups WHERE id = ?", (group_id,)
             ).fetchone()
         return None if row is None else _group_from_row(row)
+
+    def save_group_form(
+        self, group_id: int | None, name: str, display_order: int,
+        active: bool, members: Sequence[tuple[int, bool, bool]],
+    ) -> None:
+        """Atomically save group metadata and ordered member inclusion rules."""
+        clean_name = _clean_text(name, "group name")
+        _validate_display_order(display_order)
+        _validate_bool(active, "active")
+        normalized = [_normalize_group_member(member) for member in members]
+        ids = [member[0] for member in normalized]
+        if len(ids) != len(set(ids)):
+            raise ValidationError("그룹 납품처가 중복되었습니다.")
+        if group_id is not None:
+            _validate_id(group_id, "group_id")
+        with self.database.connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if group_id is None:
+                group_id = connection.execute(
+                    "INSERT INTO report_groups(name, display_order, active) VALUES (?, ?, ?)",
+                    (clean_name, display_order, int(active)),
+                ).lastrowid
+            elif connection.execute(
+                "UPDATE report_groups SET name = ?, display_order = ?, active = ? WHERE id = ?",
+                (clean_name, display_order, int(active), group_id),
+            ).rowcount != 1:
+                raise MasterDataNotFoundError("그룹을 찾을 수 없습니다.")
+            connection.execute("DELETE FROM report_group_members WHERE group_id = ?", (group_id,))
+            connection.executemany(
+                "INSERT INTO report_group_members(group_id, destination_id, display_order, include_quantity, include_cost) VALUES (?, ?, ?, ?, ?)",
+                [(group_id, destination_id, order, int(quantity), int(cost))
+                 for order, (destination_id, quantity, cost) in enumerate(normalized, 1)],
+            )
 
     def list_groups(self) -> list[ReportGroup]:
         with self.database.connection() as connection:

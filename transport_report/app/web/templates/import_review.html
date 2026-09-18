@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% macro revision_fields() %}
+{% for key in ['source_sha256', 'master_revision', 'database_revision', 'revision'] %}<input type="hidden" name="{{ key }}" value="{{ review[key] }}">{% endfor %}
+{% endmacro %}
+{% block content %}
+<h1>기존 Excel 가져오기 검토</h1><p>누적 실적과 2026년 8월 계획을 검토합니다. 드라이런은 DB에 값을 저장하지 않으며 원본을 수정하지 않습니다.</p>
+<form method="post" action="/imports/dry-run">{{ intent('dry_run') }}<label>원본 Excel 전체 경로 <input class="wide" name="source_path" value="{{ review.source_path if review else '' }}" placeholder="D:\자료\보고.xlsx" required></label><button>드라이런 실행</button></form>
+{% if review %}
+<section><h2>드라이런 요약</h2><p>{{ review.source_path }}</p><p>계획 {{ review.summary.plan_records }}행 · 누적 실적 {{ review.summary.actual_records }}행 · 신규 저장 {{ review.summary.rows_to_insert }}행 · 동일 {{ review.summary.rows_unchanged }}행</p><p>8월 계획 합계: 수량 {{ review.reconciliation.current_total.planned_quantity|value }} · 비용 {{ review.reconciliation.current_total.planned_cost_won|value }}</p><p>8월 실적 합계: 수량 {{ review.reconciliation.current_total.actual_quantity|value }} · 비용 {{ review.reconciliation.current_total.actual_cost_won|value }}</p><details><summary>검토 리비전</summary><code>{{ review.revision }}</code></details></section>
+{% for unknown in review.unknown_aliases %}
+<section class="error"><h2>미등록 명칭: {{ unknown.alias }}</h2><p>원천: {{ unknown.source_type }} · 정확한 위치: {{ unknown.source_locator }}</p>
+<form method="post" action="/imports/aliases">{{ intent('resolve_alias') }}{{ revision_fields() }}<input type="hidden" name="alias" value="{{ unknown.alias }}"><input type="hidden" name="source_type" value="{{ unknown.source_type }}"><input type="hidden" name="action" value="link"><label>연결할 납품처 <select name="destination_id" required><option value="">선택하세요</option>{% for destination in destinations %}<option value="{{ destination.id }}">{{ destination.name }}</option>{% endfor %}</select></label><button>기존 납품처에 연결</button></form>
+<details><summary>새 납품처 등록</summary><form method="post" action="/imports/aliases">{{ intent('resolve_alias') }}{{ revision_fields() }}<input type="hidden" name="alias" value="{{ unknown.alias }}"><input type="hidden" name="source_type" value="{{ unknown.source_type }}"><input type="hidden" name="action" value="create">{{ destination_fields() }}<button>새 납품처 등록</button></form></details>
+</section>{% endfor %}
+<section><h2>검증 및 합계 대조</h2><ul>{% for issue in review.issues %}<li>{{ issue.message }} · {{ issue.source_locator }}{% if issue.expected is not none %} · 예상 {{ issue.expected }} / 실제 {{ issue.actual }}{% endif %}</li>{% else %}<li>차단 항목 없음</li>{% endfor %}</ul><table><thead><tr><th>대조 항목</th><th>원본</th><th>계산</th><th>일치</th></tr></thead><tbody>{% for control in review.reconciliation.controls %}<tr><td>{{ control.name }} · {{ control.source_locator }}</td><td>{{ control.expected|value }}</td><td>{{ control.actual|value }}</td><td>{{ '예' if control.matches else '아니오' }}</td></tr>{% endfor %}</tbody></table></section>
+<form method="post" action="/imports/confirm">{{ intent('confirm_import') }}{{ revision_fields() }}<label><input type="checkbox" name="confirmed" value="yes" required {% if not review.can_commit %}disabled{% endif %}>검토 결과와 합계가 맞음을 확인하고 가져오기를 확정합니다.</label><button {% if not review.can_commit %}disabled{% endif %}>가져오기 확정</button></form>
+{% endif %}
+{% endblock %}

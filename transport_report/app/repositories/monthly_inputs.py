@@ -98,6 +98,70 @@ class MonthlyInputRepository:
         self.database = database
         self.lock_guard = MonthLockGuard()
 
+    def save_form(
+        self, report_month: str, rows: list[dict], sales: MonthlySales | None
+    ) -> None:
+        """Save the entire required-destination form in one locked transaction.
+
+        Missing plan/actual values clear their row; explicit zero remains data.
+        Recheck the required set inside the write transaction to reject stale forms.
+        """
+        _validate_month(report_month)
+        ids = [row["destination_id"] for row in rows]
+        if len(ids) != len(set(ids)):
+            raise MonthlyInputValidationError("납품처 입력 행이 중복되었습니다.")
+        for row in rows:
+            _validate_id(row["destination_id"])
+            if (row["plan_quantity"] is None) != (row["plan_cost"] is None):
+                raise MonthlyInputValidationError("계획 수량과 비용을 함께 입력하세요.")
+            if row["plan_quantity"] is not None:
+                _canonical_quantity(row["plan_quantity"])
+                _validate_money(row["plan_cost"], "plan_cost")
+            if row["actual_quantity"] is not None:
+                _canonical_quantity(row["actual_quantity"])
+            _optional_text(row["representative_item"], "representative_item")
+            _optional_text(row["source_note"], "source_note")
+        if sales is not None:
+            if sales.report_month != report_month:
+                raise MonthlyInputValidationError("매출의 보고 월이 다릅니다.")
+            _validate_money(sales.amount_won, "sales")
+            confirmed_at = _normalize_confirmed_at(sales.confirmed_at)
+            _optional_text(sales.source_note, "source_note")
+        with self.database.connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.lock_guard.require_unlocked(connection, report_month)
+            required = {row[0] for row in connection.execute(
+                "SELECT id FROM destinations WHERE active = 1 AND required_for_report = 1"
+            )}
+            if set(ids) != required:
+                raise MonthlyInputValidationError("납품처 입력 행이 변경되었습니다. 화면을 다시 여세요.")
+            for row in rows:
+                destination_id = row["destination_id"]
+                if row["plan_quantity"] is None:
+                    connection.execute("DELETE FROM monthly_plans WHERE report_month = ? AND destination_id = ?", (report_month, destination_id))
+                else:
+                    connection.execute(
+                        "INSERT INTO monthly_plans(report_month, destination_id, quantity_ea_text, cost_won, representative_item) VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(report_month, destination_id) DO UPDATE SET quantity_ea_text = excluded.quantity_ea_text, cost_won = excluded.cost_won, representative_item = excluded.representative_item, updated_at = datetime('now')",
+                        (report_month, destination_id, _canonical_quantity(row["plan_quantity"]), row["plan_cost"], _optional_text(row["representative_item"], "representative_item")),
+                    )
+                if row["actual_quantity"] is None:
+                    connection.execute("DELETE FROM monthly_actual_quantities WHERE report_month = ? AND destination_id = ?", (report_month, destination_id))
+                else:
+                    connection.execute(
+                        "INSERT INTO monthly_actual_quantities(report_month, destination_id, quantity_ea_text, source_note) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(report_month, destination_id) DO UPDATE SET quantity_ea_text = excluded.quantity_ea_text, source_note = excluded.source_note, updated_at = datetime('now')",
+                        (report_month, destination_id, _canonical_quantity(row["actual_quantity"]), _optional_text(row["source_note"], "source_note")),
+                    )
+            if sales is None:
+                connection.execute("DELETE FROM monthly_sales WHERE report_month = ?", (report_month,))
+            else:
+                connection.execute(
+                    "INSERT INTO monthly_sales(report_month, amount_won, source_note, confirmed_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(report_month) DO UPDATE SET amount_won = excluded.amount_won, source_note = excluded.source_note, confirmed_at = excluded.confirmed_at, updated_at = datetime('now')",
+                    (report_month, sales.amount_won, sales.source_note, confirmed_at),
+                )
+
     def save_plan(
         self,
         report_month: str,

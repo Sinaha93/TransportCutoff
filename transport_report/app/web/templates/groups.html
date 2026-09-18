@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>보고 그룹 관리</h1><p>그룹은 구성원의 수량·비용을 선택적으로 합산합니다. 구성 순서를 숫자로 입력하세요. 구성원을 제외할 때 수량·비용 체크도 해제하세요.</p>
+{% for group in groups + [none] %}
+{% set existing = members[group.id] if group else [] %}
+<section><h2>{{ group.name if group else '새 그룹' }}</h2><form method="post" action="/groups/{{ group.id if group else 0 }}">
+{{ intent('save_group') }}<label>그룹명 <input name="name" value="{{ group.name if group else '' }}" required></label><label>표시 순서 <input type="number" min="0" name="display_order" value="{{ group.display_order if group else '' }}" required></label><label><input type="checkbox" name="active" {% if group and group.active %}checked{% endif %}>활성</label>
+<div class="table-scroll"><table><thead><tr><th>구성원 선택</th><th>구성 순서</th><th>수량 포함</th><th>비용 포함</th></tr></thead><tbody>
+{% for destination in destinations %}{% set member = existing | selectattr('destination_id', 'equalto', destination.id) | first %}
+<tr><td><label><input type="checkbox" name="member_id" value="{{ destination.id }}" {% if member %}checked{% endif %}>{{ destination.name }}</label></td>
+<td><input aria-label="{{ destination.name }} 구성 순서" type="number" min="0" name="order_{{ destination.id }}" value="{{ member.display_order if member else destination.display_order }}"></td>
+<td><input aria-label="{{ destination.name }} 수량 포함" type="checkbox" name="quantity_ids" value="{{ destination.id }}" {% if member and member.include_quantity %}checked{% endif %}></td>
+<td><input aria-label="{{ destination.name }} 비용 포함" type="checkbox" name="cost_ids" value="{{ destination.id }}" {% if member and member.include_cost %}checked{% endif %}></td></tr>{% endfor %}
+</tbody></table></div><button>그룹 저장</button></form></section>{% endfor %}
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>납품처 기준정보</h1><p>저장하면 현재 기준으로 보고 미리보기를 다시 계산합니다. 별칭은 원천 구분별로 연결됩니다.</p>
+{% for destination in destinations %}
+<section><h2>{{ destination.name }}</h2>
+<form method="post" action="/destinations/{{ destination.id }}">{{ intent('save_destination') }}{{ destination_fields(destination) }}<button>납품처 저장</button></form>
+<h3>원천별 별칭</h3>
+{% for alias in aliases if alias.destination_id == destination.id %}<form method="post" action="/aliases/{{ alias.id }}/remove">{{ intent('remove_alias') }}<span>{{ alias.source_type }}: {{ alias.raw_name }}</span><button>별칭 삭제</button></form>{% endfor %}
+<form method="post" action="/destinations/{{ destination.id }}/aliases">{{ intent('save_alias') }}<label>원천 구분 <input name="source_type" placeholder="legacy_workbook / transport / ERP" required></label><label>원천 명칭 <input name="raw_name" required></label><button>별칭 연결</button></form>
+</section>{% endfor %}
+<section><h2>새 납품처 등록</h2><form method="post" action="/destinations/0">{{ intent('save_destination') }}{{ destination_fields() }}<button>새 납품처 등록</button></form></section>
+{% endblock %}
