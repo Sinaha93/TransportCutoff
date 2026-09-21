@@ -350,8 +350,7 @@ def validate_report(context: ValidationContext) -> ValidationResult:
         if batch.is_current and batch.report_month == context.report_month:
             batches_by_source.setdefault(batch.source_type, []).append(batch)
     for source_type, batches in batches_by_source.items():
-        signatures = {batch.file_sha256 for batch in batches}
-        if len(signatures) > 1:
+        if len(batches) > 1:
             locators = ", ".join(
                 dict.fromkeys(
                     batch.source_locator
@@ -370,7 +369,7 @@ def validate_report(context: ValidationContext) -> ValidationResult:
                     code="DUPLICATE_IMPORT",
                     severity="error",
                     message=(
-                        f"원천 '{source_type}'에 서로 다른 현재 운반비 가져오기 배치"
+                        f"원천 '{source_type}'에 둘 이상의 현재 운반비 가져오기 배치"
                         f"({locators})가 있습니다. "
                         "사용할 배치 하나만 남기고 다시 생성하세요."
                     ),

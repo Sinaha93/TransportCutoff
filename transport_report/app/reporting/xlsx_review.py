@@ -57,7 +57,7 @@ ERROR_TOKENS = {
 }
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _ABSOLUTE_PATH_START = re.compile(
-    r"(?i)(?<![\w:/])(?:[A-Z]:[\\/]|\\\\|//|/)"
+    r"(?i)(?<![\w:/])(?:[A-Z]:[\\/]|\\\\|//|/(?=[^/\s]))"
 )
 _PATH_FILE_END = re.compile(
     r"(?i)\.(?:xlsx?|xlsm|csv|tsv|pptx?|docx?|pdf|txt|json|db|sqlite)"
@@ -112,7 +112,7 @@ class ImportBatchEvidence:
 class OperationEvidence:
     """One imported or manually entered value supporting the report."""
 
-    record_kind: Literal["destination", "nonregular"]
+    record_kind: Literal["destination", "nonregular", "sales"]
     value_role: Literal["plan", "actual"]
     input_kind: Literal["imported", "manual"]
     batch_id: int | None
@@ -126,25 +126,32 @@ class OperationEvidence:
     source_locator: str
 
     def __post_init__(self) -> None:
-        if self.record_kind not in {"destination", "nonregular"}:
-            raise ValueError("record_kind must be destination or nonregular")
+        if self.record_kind not in {"destination", "nonregular", "sales"}:
+            raise ValueError("record_kind must be destination, nonregular, or sales")
         if self.value_role not in {"plan", "actual"}:
             raise ValueError("value_role must be plan or actual")
-        if self.record_kind == "destination" and self.value_role != "actual":
-            raise ValueError("destination operation evidence must be actual")
         if self.input_kind not in {"imported", "manual"}:
             raise ValueError("input_kind must be imported or manual")
+        _text(self.source_locator, "source_locator")
         if self.input_kind == "imported":
             _positive_int(self.batch_id, "batch_id")
-            _text(self.raw_destination, "raw_destination")
-        elif self.batch_id is not None:
-            raise ValueError("manual evidence cannot have a batch_id")
+            if self.record_kind != "sales":
+                _text(self.raw_destination, "raw_destination")
+            if "!" not in self.source_locator:
+                raise ValueError("imported evidence requires a workbook source locator")
+        else:
+            if self.batch_id is not None:
+                raise ValueError("manual evidence cannot have a batch_id")
+            if self.raw_destination is not None:
+                raise ValueError("manual evidence cannot have a raw destination")
+            if _safe_display_text(self.source_locator) != self.source_locator:
+                raise ValueError("manual evidence source locator cannot expose a path")
         _text(self.provenance_id, "provenance_id")
         _month(self.report_month, "report_month")
         if self.record_kind == "destination":
             _positive_int(self.destination_id, "destination_id")
         elif self.destination_id is not None:
-            raise ValueError("nonregular evidence cannot have a destination_id")
+            raise ValueError("summary evidence cannot have a destination_id")
         _text(self.normalized_destination, "normalized_destination")
         if self.quantity_ea is not None:
             if not isinstance(self.quantity_ea, Decimal) or not self.quantity_ea.is_finite():
@@ -153,7 +160,8 @@ class OperationEvidence:
                 raise ValueError("quantity_ea must be nonnegative")
         if self.cost_won is not None:
             _nonnegative_int(self.cost_won, "cost_won")
-        _text(self.source_locator, "source_locator")
+        if self.record_kind == "sales" and self.quantity_ea is not None:
+            raise ValueError("sales evidence cannot have a quantity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +294,10 @@ def _write_summary(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
         "실적 단위 운반비(원/EA)",
         "단위 운반비 증감(원/EA)",
         "단위 운반비 증감률",
+        "운반비 3개월 평균(원)",
+        "운반비 6개월 평균(원)",
+        "운반비 12개월 평균(원)",
+        "운반비 전년도 평균(원)",
     )
     header_row = 8
     _write_header(sheet, header_row, headers)
@@ -293,12 +305,19 @@ def _write_summary(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
     rows.extend((report.nonregular, report.total))
     for row_number, row in enumerate(rows, start=header_row + 1):
         calculation = row.calculation
-        values = _summary_values(row.label, calculation)
+        values = (
+            *_summary_values(row.label, calculation),
+            *_history_average_values(
+                report.report_month,
+                row.cost_won_by_month,
+                HistoricalValueKind.MONEY,
+            ),
+        )
         for column, value in enumerate(values, start=1):
             sheet.cell(row_number, column, value)
         _format_summary_row(sheet, row_number, calculation, bundle.operations)
     detail_last = header_row + len(rows)
-    sheet.auto_filter.ref = f"A{header_row}:N{detail_last}"
+    sheet.auto_filter.ref = f"A{header_row}:R{detail_last}"
     sheet.freeze_panes = "C9"
 
     sales_row = detail_last + 3
@@ -369,6 +388,134 @@ def _write_summary(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
             sheet.cell(averages_header + offset, column).number_format = number_format
         _fill_range(sheet, averages_header + offset, 2, 9, _CALCULATED)
 
+    plan_title_row = averages_header + 5
+    sheet.cell(plan_title_row, 1, "2026년 9월 운반비 계획 검토")
+    sheet.cell(plan_title_row, 1).font = Font(
+        name=FONT_NAME, size=13, bold=True, color=_NAVY
+    )
+    plan_header = plan_title_row + 1
+    _write_header(
+        sheet,
+        plan_header,
+        (
+            "납품처",
+            "구분",
+            "계획 수량(EA)",
+            "계획 운반비(원)",
+            "계획 단위 운반비(원/EA)",
+            "운반비 3개월 평균(원)",
+            "운반비 6개월 평균(원)",
+            "운반비 12개월 평균(원)",
+            "운반비 전년도 평균(원)",
+        ),
+    )
+    plan_rows = [row for row in report.next_month.rows if row is not None]
+    plan_rows.extend((report.next_month.nonregular, report.next_month.total))
+    for row_number, row in enumerate(plan_rows, start=plan_header + 1):
+        _write_values(
+            sheet,
+            row_number,
+            (
+                row.label,
+                _calculation_label(row.calculation),
+                _excel_number(row.calculation.planned_quantity),
+                row.calculation.planned_cost_won,
+                _excel_number(row.calculation.planned_unit_cost),
+                *_history_average_values(
+                    report.next_month.month,
+                    row.cost_won_by_month,
+                    HistoricalValueKind.MONEY,
+                ),
+            ),
+        )
+        sheet.cell(row_number, 3).number_format = NUMBER_FORMAT
+        sheet.cell(row_number, 4).number_format = MONEY_FORMAT
+        sheet.cell(row_number, 5).number_format = UNIT_COST_FORMAT
+        for column in range(6, 10):
+            sheet.cell(row_number, column).number_format = MONEY_FORMAT
+        if row.calculation.kind is CalculationKind.DESTINATION:
+            _fill_range(sheet, row_number, 3, 5, _YELLOW)
+            _fill_range(sheet, row_number, 6, 9, _CALCULATED)
+        else:
+            _fill_range(sheet, row_number, 1, 9, _CALCULATED)
+            for column in range(1, 10):
+                sheet.cell(row_number, column).font = Font(
+                    name=FONT_NAME, bold=True, color=_DARK_TEXT
+                )
+
+    plan_summary_row = plan_header + len(plan_rows)
+    total_history_costs = _history_average_values(
+        report.next_month.month,
+        report.next_month.total.cost_won_by_month,
+        HistoricalValueKind.MONEY,
+    )
+    total_history_quantities = _history_average_values(
+        report.next_month.month,
+        report.next_month.total.quantity_by_month,
+        HistoricalValueKind.QUANTITY,
+    )
+    sales_history_values = _history_average_values(
+        report.next_month.month,
+        report.next_month.sales.actual_won_by_month,
+        HistoricalValueKind.MONEY,
+    )
+    for offset, values, number_format in (
+        (
+            1,
+            (
+                "총 대당 운반비",
+                "계산값",
+                None,
+                None,
+                _excel_number(report.next_month.total.calculation.planned_unit_cost),
+                *(
+                    _excel_number(_optional_ratio(cost, quantity))
+                    for cost, quantity in zip(
+                        total_history_costs, total_history_quantities
+                    )
+                ),
+            ),
+            UNIT_COST_FORMAT,
+        ),
+        (
+            2,
+            (
+                "매출액",
+                "수기 입력",
+                None,
+                report.next_month.sales.planned_won,
+                None,
+                *sales_history_values,
+            ),
+            MONEY_FORMAT,
+        ),
+        (
+            3,
+            (
+                "매출액 대비 운반비",
+                "계산값",
+                None,
+                _excel_number(
+                    _optional_ratio(
+                        report.next_month.total.calculation.planned_cost_won,
+                        report.next_month.sales.planned_won,
+                    )
+                ),
+                None,
+                *(
+                    _excel_number(_optional_ratio(cost, sales))
+                    for cost, sales in zip(total_history_costs, sales_history_values)
+                ),
+            ),
+            PERCENT_FORMAT,
+        ),
+    ):
+        row_number = plan_summary_row + offset
+        _write_values(sheet, row_number, values)
+        for column in range(4, 10):
+            sheet.cell(row_number, column).number_format = number_format
+        _fill_range(sheet, row_number, 1, 9, _CALCULATED)
+
     widths = {
         "A": 22,
         "B": 13,
@@ -384,28 +531,49 @@ def _write_summary(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
         "L": 20,
         "M": 22,
         "N": 15,
+        "O": 20,
+        "P": 20,
+        "Q": 20,
+        "R": 20,
     }
     _set_widths(sheet, widths)
     sheet.row_dimensions[header_row].height = 36
 
 
 def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
-    batch = bundle.import_batches[0]
     _title(sheet, "운행실적 입력 및 가져오기 증거")
-    metadata = (
-        ("보고 월", _month_date(bundle.report.report_month), DATE_FORMAT),
-        ("원본 파일명", _safe_filename(batch.source_filename), None),
-        ("원본 SHA-256", batch.file_sha256, None),
-        ("가져온 시각", batch.imported_at, DATETIME_FORMAT),
-        ("배치 ID", batch.batch_id, "0"),
-        ("프로비넌스 ID", batch.provenance_id, None),
+    batch_headers = (
+        "배치 ID",
+        "원천 유형",
+        "보고 월",
+        "원본 파일명",
+        "원본 SHA-256",
+        "가져온 시각",
+        "프로비넌스 ID",
     )
-    for row, (label, value, number_format) in enumerate(metadata, start=3):
-        sheet.cell(row, 1, label)
-        sheet.cell(row, 2, _safe_display_text(value) if isinstance(value, str) else value)
-        if number_format:
-            sheet.cell(row, 2).number_format = number_format
-        sheet.cell(row, 1).font = Font(name=FONT_NAME, bold=True, color=_DARK_TEXT)
+    _write_header(sheet, 3, batch_headers)
+    for row_number, batch in enumerate(bundle.import_batches, start=4):
+        _write_values(
+            sheet,
+            row_number,
+            (
+                batch.batch_id,
+                batch.source_type,
+                _month_date(batch.report_month),
+                _safe_filename(batch.source_filename),
+                batch.file_sha256,
+                batch.imported_at,
+                batch.provenance_id,
+            ),
+        )
+        sheet.cell(row_number, 3).number_format = DATE_FORMAT
+        sheet.cell(row_number, 6).number_format = DATETIME_FORMAT
+        for column in (4, 5, 7):
+            sheet.cell(row_number, column).alignment = Alignment(
+                horizontal="left", vertical="center", wrap_text=True
+            )
+        sheet.row_dimensions[row_number].height = 36
+        _fill_range(sheet, row_number, 1, 7, _BLUE)
 
     headers = (
         "입력 구분",
@@ -419,22 +587,13 @@ def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
         "수량(EA)",
         "운반비(원)",
         "원본 위치",
+        "원천 유형",
     )
-    _write_header(sheet, 9, headers)
-    for row_number, item in enumerate(bundle.operations, start=10):
-        values = (
-            "가져오기" if item.input_kind == "imported" else "수기 입력",
-            "납품처" if item.record_kind == "destination" else "비정규",
-            "계획" if item.value_role == "plan" else "실적",
-            item.batch_id,
-            item.provenance_id,
-            _month_date(item.report_month),
-            item.raw_destination,
-            item.normalized_destination,
-            _excel_number(item.quantity_ea),
-            item.cost_won,
-            _safe_locator(item.source_locator),
-        )
+    header_row = max(9, 5 + len(bundle.import_batches))
+    _write_header(sheet, header_row, headers)
+    batch_by_id = {item.batch_id: item for item in bundle.import_batches}
+    for row_number, item in enumerate(bundle.operations, start=header_row + 1):
+        values = _evidence_values(item, batch_by_id)
         _write_values(sheet, row_number, values)
         sheet.cell(row_number, 6).number_format = DATE_FORMAT
         sheet.cell(row_number, 9).number_format = NUMBER_FORMAT
@@ -444,13 +603,13 @@ def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
                 horizontal="center", vertical="center"
             )
         fill = _BLUE if item.input_kind == "imported" else _YELLOW
-        _fill_range(sheet, row_number, 1, 11, fill)
-    last_row = 9 + len(bundle.operations)
-    sheet.auto_filter.ref = f"A9:K{last_row}"
-    sheet.freeze_panes = "A10"
+        _fill_range(sheet, row_number, 1, 12, fill)
+    last_row = header_row + len(bundle.operations)
+    sheet.auto_filter.ref = f"A{header_row}:L{last_row}"
+    sheet.freeze_panes = f"A{header_row + 1}"
     _set_widths(
         sheet,
-        {"A": 13, "B": 22, "C": 10, "D": 18, "E": 28, "F": 13, "G": 20, "H": 20, "I": 14, "J": 16, "K": 38},
+        {"A": 13, "B": 22, "C": 13, "D": 22, "E": 42, "F": 20, "G": 28, "H": 20, "I": 14, "J": 16, "K": 38, "L": 16},
     )
 
 
@@ -493,11 +652,20 @@ def _write_validation(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
             sheet.cell(row_number, 3).alignment = Alignment(
                 horizontal="left", vertical="top", wrap_text=True
             )
+            sheet.cell(row_number, 6).alignment = Alignment(
+                horizontal="left", vertical="top", wrap_text=True
+            )
             for column in (2, 5):
                 sheet.cell(row_number, column).alignment = Alignment(
                     horizontal="center", vertical="center"
                 )
-            sheet.row_dimensions[row_number].height = 36
+            wrapped_lines = max(
+                _wrapped_line_count(str(values[2]), 45),
+                _wrapped_line_count("" if values[5] is None else str(values[5]), 26),
+            )
+            sheet.row_dimensions[row_number].height = min(
+                120, max(36, 18 * wrapped_lines)
+            )
         last_row = 7 + len(bundle.validation.issues)
     else:
         _write_values(sheet, 8, ("VALID", "정상", "차단 또는 경고 항목이 없습니다.", None, None, None))
@@ -612,8 +780,8 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     bundle.validation
     if report.report_month != "2026-08":
         raise ValueError("review workbook supports only report month 2026-08")
-    if len(bundle.import_batches) != 1:
-        raise ValueError("exactly one current import batch is required")
+    if not bundle.import_batches:
+        raise ValueError("at least one current import batch is required")
 
     _unique((item.id for item in bundle.destinations), "destination identity")
     _unique((item.name for item in bundle.destinations), "destination name identity")
@@ -631,6 +799,7 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     _unique((item.display_order for item in bundle.groups), "group display order")
     _unique((item.batch_id for item in bundle.import_batches), "batch identity")
     _unique((item.provenance_id for item in bundle.import_batches), "batch provenance identity")
+    _unique((item.source_type for item in bundle.import_batches), "batch source type")
 
     destination_by_id = {item.id: item for item in bundle.destinations}
     group_by_id = {item.id: item for item in bundle.groups}
@@ -733,6 +902,27 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     if report.total.calculation != expected_total:
         raise ValueError("total calculation does not match master provenance")
 
+    next_rows = tuple(report.next_month.rows)
+    expected_next_identity = tuple((item.id, item.name) for item in total_rules)
+    actual_next_identity = tuple(
+        (row.calculation.destination_id, row.label) for row in next_rows
+    )
+    if actual_next_identity != expected_next_identity:
+        raise ValueError("next-month rows do not match master identity and order")
+    next_calculations = {
+        row.calculation.destination_id: row.calculation for row in next_rows
+    }
+    try:
+        expected_next_total = calculate_total(next_calculations, total_rules)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "next-month total calculation does not match master provenance"
+        ) from error
+    if report.next_month.total.calculation != expected_next_total:
+        raise ValueError(
+            "next-month total calculation does not match master provenance"
+        )
+
     _validate_validation_snapshot(bundle, direct_calculations)
 
     batch_by_id = {item.batch_id: item for item in bundle.import_batches}
@@ -754,93 +944,167 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
         ),
         "operation evidence identity",
     )
-    quantity_totals: dict[int, Decimal] = {}
-    quantity_seen: set[int] = set()
-    cost_totals: dict[int, int] = {}
-    cost_seen: set[int] = set()
-    nonregular_quantity_totals = {"plan": Decimal(0), "actual": Decimal(0)}
-    nonregular_quantity_seen: set[str] = set()
-    nonregular_cost_totals = {"plan": 0, "actual": 0}
-    nonregular_cost_seen: set[str] = set()
-    nonregular_records = {"plan": 0, "actual": 0}
+    operation_by_input: dict[
+        tuple[str, str, str, int | None], list[OperationEvidence]
+    ] = {}
     for item in bundle.operations:
-        if item.report_month != report.report_month:
-            raise ValueError("operation report month does not match canonical report")
-        if item.record_kind == "nonregular":
-            nonregular_records[item.value_role] += 1
+        identity = (
+            item.report_month,
+            item.record_kind,
+            item.value_role,
+            item.destination_id,
+        )
+        operation_by_input.setdefault(identity, []).append(item)
+        if item.record_kind == "destination":
+            destination = destination_by_id.get(item.destination_id)
+            if destination is None or item.normalized_destination != destination.name:
+                raise ValueError("operation has a missing destination identity")
+            if item.destination_id not in direct_calculations:
+                raise ValueError("operation has a missing report destination identity")
+        elif item.record_kind == "nonregular":
             if item.normalized_destination != report.nonregular.label:
                 raise ValueError("nonregular evidence label does not match canonical report")
-            if item.input_kind == "imported":
-                batch = batch_by_id.get(item.batch_id)
-                if batch is None or batch.provenance_id != item.provenance_id:
-                    raise ValueError("nonregular evidence has a missing batch identity")
-            if item.quantity_ea is not None:
-                nonregular_quantity_seen.add(item.value_role)
-                nonregular_quantity_totals[item.value_role] += item.quantity_ea
-            if item.cost_won is not None:
-                nonregular_cost_seen.add(item.value_role)
-                nonregular_cost_totals[item.value_role] += item.cost_won
-            continue
-        destination = destination_by_id.get(item.destination_id)
-        if destination is None or item.normalized_destination != destination.name:
-            raise ValueError("operation has a missing destination identity")
-        if item.destination_id not in direct_calculations:
-            raise ValueError("operation has a missing report destination identity")
+        elif item.normalized_destination != "매출액":
+            raise ValueError("sales evidence label does not match canonical report")
         if item.input_kind == "imported":
             batch = batch_by_id.get(item.batch_id)
             if batch is None or batch.provenance_id != item.provenance_id:
                 raise ValueError("operation has a missing batch identity")
-            if alias_by_source.get(
-                (batch.source_type, item.raw_destination)
-            ) != item.destination_id:
+            if (
+                item.record_kind == "destination"
+                and alias_by_source.get((batch.source_type, item.raw_destination))
+                != item.destination_id
+            ):
                 raise ValueError("operation alias identity does not match master aliases")
-        if item.quantity_ea is not None:
-            quantity_seen.add(item.destination_id)
-            quantity_totals[item.destination_id] = (
-                quantity_totals.get(item.destination_id, Decimal(0))
-                + item.quantity_ea
-            )
-        if item.cost_won is not None:
-            cost_seen.add(item.destination_id)
-            cost_totals[item.destination_id] = (
-                cost_totals.get(item.destination_id, 0) + item.cost_won
-            )
+    expected_inputs: dict[
+        tuple[str, str, str, int | None],
+        tuple[Decimal | None, int | None],
+    ] = {}
     for destination_id, calculation in direct_calculations.items():
-        if not _metric_evidence_matches(
-            destination_id in quantity_seen,
-            quantity_totals.get(destination_id, Decimal(0)),
+        expected_inputs[(report.report_month, "destination", "plan", destination_id)] = (
+            calculation.planned_quantity,
+            calculation.planned_cost_won,
+        )
+        expected_inputs[(report.report_month, "destination", "actual", destination_id)] = (
             calculation.actual_quantity,
-        ) or not _metric_evidence_matches(
-            destination_id in cost_seen,
-            cost_totals.get(destination_id, 0),
             calculation.actual_cost_won,
-        ):
-            raise ValueError(
-                "operation evidence does not reconcile to canonical actuals"
-            )
-    nonregular = report.nonregular.calculation
+        )
     for role, quantity, cost in (
-        ("plan", nonregular.planned_quantity, nonregular.planned_cost_won),
-        ("actual", nonregular.actual_quantity, nonregular.actual_cost_won),
+        (
+            "plan",
+            report.nonregular.calculation.planned_quantity,
+            report.nonregular.calculation.planned_cost_won,
+        ),
+        (
+            "actual",
+            report.nonregular.calculation.actual_quantity,
+            report.nonregular.calculation.actual_cost_won,
+        ),
     ):
-        if nonregular_records[role] == 0 or not _metric_evidence_matches(
-            role in nonregular_quantity_seen,
-            nonregular_quantity_totals[role],
+        expected_inputs[(report.report_month, "nonregular", role, None)] = (
             quantity,
-        ) or not _metric_evidence_matches(
-            role in nonregular_cost_seen,
-            nonregular_cost_totals[role],
             cost,
+        )
+    expected_inputs[(report.report_month, "sales", "plan", None)] = (
+        None,
+        report.sales.planned_won,
+    )
+    expected_inputs[(report.report_month, "sales", "actual", None)] = (
+        None,
+        report.sales.actual_won,
+    )
+    for row in report.next_month.rows:
+        destination_id = row.calculation.destination_id
+        expected_inputs[(report.next_month.month, "destination", "plan", destination_id)] = (
+            row.calculation.planned_quantity,
+            row.calculation.planned_cost_won,
+        )
+    expected_inputs[(report.next_month.month, "nonregular", "plan", None)] = (
+        report.next_month.nonregular.calculation.planned_quantity,
+        report.next_month.nonregular.calculation.planned_cost_won,
+    )
+    expected_inputs[(report.next_month.month, "sales", "plan", None)] = (
+        None,
+        report.next_month.sales.planned_won,
+    )
+    if set(operation_by_input) - set(expected_inputs):
+        raise ValueError("operation evidence contains an input not displayed by the report")
+    blocking_issues = tuple(
+        issue for issue in bundle.validation.issues if issue.severity == "error"
+    )
+    for identity, (expected_quantity, expected_cost) in expected_inputs.items():
+        records = operation_by_input.get(identity, [])
+        destination_id = identity[3]
+        evidence_label = (
+            "nonregular evidence"
+            if identity[1] == "nonregular"
+            else "operation evidence"
+        )
+        missing = (
+            expected_cost is None
+            if identity[1] == "sales"
+            else expected_quantity is None or expected_cost is None
+        )
+        if missing and not _missing_input_is_blocked(identity, blocking_issues, report):
+            raise ValueError("missing report input has no blocking validation issue")
+        if expected_quantity is None and expected_cost is None:
+            if len(records) > 1 or any(
+                item.quantity_ea is not None or item.cost_won is not None
+                for item in records
+            ):
+                raise ValueError(
+                    f"{evidence_label} does not reconcile to missing input"
+                )
+            continue
+        if len(records) != 1:
+            if len(records) > 1:
+                raise ValueError("every present input requires exactly one evidence record")
+            raise ValueError(
+                f"{evidence_label} does not reconcile to canonical inputs"
+            )
+        record = records[0]
+        if (
+            record.quantity_ea != expected_quantity
+            or record.cost_won != expected_cost
         ):
             raise ValueError(
-                f"nonregular evidence does not reconcile to canonical {role} values"
+                f"{evidence_label} does not reconcile to canonical inputs"
             )
 
 
-def _metric_evidence_matches(seen: bool, total: object, expected: object) -> bool:
-    if expected is None:
-        return not seen
-    return seen and total == expected
+def _missing_input_is_blocked(
+    identity: tuple[str, str, str, int | None],
+    blocking_issues: tuple[object, ...],
+    report: PptReport,
+) -> bool:
+    month, record_kind, value_role, destination_id = identity
+    if (
+        month == report.report_month
+        and record_kind == "destination"
+        and value_role == "actual"
+    ):
+        return any(
+            issue.code == "MISSING_ACTUAL_QUANTITY"
+            and issue.destination_id == destination_id
+            for issue in blocking_issues
+        )
+    if (
+        month == report.next_month.month
+        and record_kind == "destination"
+        and value_role == "plan"
+    ):
+        return any(
+            issue.code in {"MISSING_NEXT_MONTH_PLAN", "REPORT_MONTH_MISMATCH"}
+            and issue.destination_id == destination_id
+            for issue in blocking_issues
+        )
+    if (
+        month == report.report_month
+        and record_kind == "sales"
+        and value_role == "actual"
+    ):
+        return any(issue.code == "MISSING_SALES" for issue in blocking_issues)
+    return False
 
 
 def _validate_validation_snapshot(
@@ -924,7 +1188,15 @@ def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
         summary_rows.extend((bundle.report.nonregular, bundle.report.total))
         for row_number, report_row in enumerate(summary_rows, start=9):
             for column, expected in enumerate(
-                _summary_values(report_row.label, report_row.calculation), start=1
+                (
+                    *_summary_values(report_row.label, report_row.calculation),
+                    *_history_average_values(
+                        bundle.report.report_month,
+                        report_row.cost_won_by_month,
+                        HistoricalValueKind.MONEY,
+                    ),
+                ),
+                start=1,
             ):
                 _assert_saved_value(summary.cell(row_number, column), expected)
             for column in (6, 10, 14):
@@ -1006,34 +1278,113 @@ def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
                     summary.cell(averages_header + offset, column), expected
                 )
 
-        evidence = workbook[SHEET_NAMES[1]]
-        batch = bundle.import_batches[0]
-        evidence_metadata = (
-            _month_date(bundle.report.report_month),
-            _safe_filename(batch.source_filename),
-            batch.file_sha256,
-            batch.imported_at,
-            batch.batch_id,
-            batch.provenance_id,
+        plan_title_row = averages_header + 5
+        _assert_saved_value(
+            summary.cell(plan_title_row, 1), "2026년 9월 운반비 계획 검토"
         )
-        for row, expected in enumerate(evidence_metadata, start=3):
-            _assert_saved_value(evidence.cell(row, 2), expected)
-        if not evidence["B6"].is_date:
-            raise ValueError("saved import timestamp is not a typed datetime")
-        for row_number, item in enumerate(bundle.operations, start=10):
-            values = (
-                "가져오기" if item.input_kind == "imported" else "수기 입력",
-                "납품처" if item.record_kind == "destination" else "비정규",
-                "계획" if item.value_role == "plan" else "실적",
-                item.batch_id,
-                item.provenance_id,
-                _month_date(item.report_month),
-                item.raw_destination,
-                item.normalized_destination,
-                _excel_number(item.quantity_ea),
-                item.cost_won,
-                _safe_locator(item.source_locator),
+        plan_rows = [
+            row for row in bundle.report.next_month.rows if row is not None
+        ]
+        plan_rows.extend(
+            (bundle.report.next_month.nonregular, bundle.report.next_month.total)
+        )
+        for row_number, report_row in enumerate(
+            plan_rows, start=plan_title_row + 2
+        ):
+            expected_values = (
+                report_row.label,
+                _calculation_label(report_row.calculation),
+                _excel_number(report_row.calculation.planned_quantity),
+                report_row.calculation.planned_cost_won,
+                _excel_number(report_row.calculation.planned_unit_cost),
+                *_history_average_values(
+                    bundle.report.next_month.month,
+                    report_row.cost_won_by_month,
+                    HistoricalValueKind.MONEY,
+                ),
             )
+            for column, expected in enumerate(expected_values, start=1):
+                _assert_saved_value(summary.cell(row_number, column), expected)
+        plan_last_row = plan_title_row + 1 + len(plan_rows)
+        costs = _history_average_values(
+            bundle.report.next_month.month,
+            bundle.report.next_month.total.cost_won_by_month,
+            HistoricalValueKind.MONEY,
+        )
+        quantities = _history_average_values(
+            bundle.report.next_month.month,
+            bundle.report.next_month.total.quantity_by_month,
+            HistoricalValueKind.QUANTITY,
+        )
+        sales_history = _history_average_values(
+            bundle.report.next_month.month,
+            bundle.report.next_month.sales.actual_won_by_month,
+            HistoricalValueKind.MONEY,
+        )
+        plan_summary_values = (
+            (
+                "총 대당 운반비",
+                "계산값",
+                None,
+                None,
+                _excel_number(
+                    bundle.report.next_month.total.calculation.planned_unit_cost
+                ),
+                *(
+                    _excel_number(_optional_ratio(cost, quantity))
+                    for cost, quantity in zip(costs, quantities)
+                ),
+            ),
+            (
+                "매출액",
+                "수기 입력",
+                None,
+                bundle.report.next_month.sales.planned_won,
+                None,
+                *sales_history,
+            ),
+            (
+                "매출액 대비 운반비",
+                "계산값",
+                None,
+                _excel_number(
+                    _optional_ratio(
+                        bundle.report.next_month.total.calculation.planned_cost_won,
+                        bundle.report.next_month.sales.planned_won,
+                    )
+                ),
+                None,
+                *(
+                    _excel_number(_optional_ratio(cost, sales))
+                    for cost, sales in zip(costs, sales_history)
+                ),
+            ),
+        )
+        for offset, values in enumerate(plan_summary_values, start=1):
+            for column, expected in enumerate(values, start=1):
+                _assert_saved_value(
+                    summary.cell(plan_last_row + offset, column), expected
+                )
+
+        evidence = workbook[SHEET_NAMES[1]]
+        for row_number, batch in enumerate(bundle.import_batches, start=4):
+            values = (
+                batch.batch_id,
+                batch.source_type,
+                _month_date(batch.report_month),
+                _safe_filename(batch.source_filename),
+                batch.file_sha256,
+                batch.imported_at,
+                batch.provenance_id,
+            )
+            for column, expected in enumerate(values, start=1):
+                _assert_saved_value(evidence.cell(row_number, column), expected)
+        header_row = max(9, 5 + len(bundle.import_batches))
+        batch_by_id = {item.batch_id: item for item in bundle.import_batches}
+        for row_number, item in enumerate(
+            bundle.operations, start=header_row + 1
+        ):
+            values = _evidence_values(item, batch_by_id)
             for column, expected in enumerate(values, start=1):
                 _assert_saved_value(evidence.cell(row_number, column), expected)
 
@@ -1105,6 +1456,30 @@ def _summary_values(
     )
 
 
+def _evidence_values(
+    item: OperationEvidence, batch_by_id: dict[int, ImportBatchEvidence]
+) -> tuple[object, ...]:
+    batch = batch_by_id.get(item.batch_id) if item.batch_id is not None else None
+    return (
+        "가져오기" if item.input_kind == "imported" else "수기 입력",
+        {
+            "destination": "납품처",
+            "nonregular": "비정규",
+            "sales": "매출액",
+        }[item.record_kind],
+        "계획" if item.value_role == "plan" else "실적",
+        item.batch_id,
+        item.provenance_id,
+        _month_date(item.report_month),
+        item.raw_destination,
+        item.normalized_destination,
+        _excel_number(item.quantity_ea),
+        item.cost_won,
+        _safe_locator(item.source_locator),
+        None if batch is None else batch.source_type,
+    )
+
+
 def _format_summary_row(
     sheet: Worksheet,
     row: int,
@@ -1119,6 +1494,8 @@ def _format_summary_row(
         sheet.cell(row, column).number_format = MONEY_FORMAT
     for column in (11, 12, 13):
         sheet.cell(row, column).number_format = UNIT_COST_FORMAT
+    for column in (15, 16, 17, 18):
+        sheet.cell(row, column).number_format = MONEY_FORMAT
     if calculation.kind is CalculationKind.DESTINATION:
         for column in (3, 7):
             sheet.cell(row, column).fill = PatternFill("solid", fgColor=_YELLOW)
@@ -1131,11 +1508,11 @@ def _format_summary_row(
             "solid",
             fgColor=_operation_fill(operations, destination_id, "cost_won"),
         )
-        for column in (5, 6, 9, 10, 11, 12, 13, 14):
+        for column in (5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18):
             sheet.cell(row, column).fill = PatternFill("solid", fgColor=_CALCULATED)
     else:
-        _fill_range(sheet, row, 1, 14, _CALCULATED)
-        for column in range(1, 15):
+        _fill_range(sheet, row, 1, 18, _CALCULATED)
+        for column in range(1, 19):
             sheet.cell(row, column).font = Font(name=FONT_NAME, bold=True, color=_DARK_TEXT)
 
 
@@ -1313,6 +1690,30 @@ def _average_status(complete: bool, missing_months: tuple[str, ...]) -> str:
     if complete:
         return "완전"
     return f"자료 부족 ({', '.join(missing_months)})"
+
+
+def _wrapped_line_count(value: str, characters_per_line: int) -> int:
+    return sum(
+        max(1, math.ceil(len(line) / characters_per_line))
+        for line in value.splitlines() or ("",)
+    )
+
+
+def _history_average_values(
+    month: str,
+    values: dict[str, object] | object,
+    kind: HistoricalValueKind,
+) -> tuple[float | int | None, ...]:
+    averages = historical_averages(month, values, value_kind=kind)
+    return tuple(
+        _excel_number(period.value)
+        for period in (
+            averages.three_month,
+            averages.six_month,
+            averages.twelve_month,
+            averages.comparison_year,
+        )
+    )
 
 
 def _excel_number(value: Decimal | int | None) -> float | int | None:

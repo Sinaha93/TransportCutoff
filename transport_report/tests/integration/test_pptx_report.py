@@ -173,10 +173,64 @@ def make_report():
 
 def with_actual_rows(report, *rows):
     """Update fictional actuals and the same identity's shared history together."""
+    from app.domain.calculations import calculate_total
+    from app.domain.models import Destination
+
     updates = {row.key: replace(row, quantity_by_month={**row.quantity_by_month, '2026-08': row.calculation.actual_quantity}, cost_won_by_month={**row.cost_won_by_month, '2026-08': row.calculation.actual_cost_won}) for row in rows}
     current = tuple(updates.get(row.key, row) if row else None for row in report.rows)
     next_rows = tuple(replace(row, quantity_by_month=updates[row.key].quantity_by_month, cost_won_by_month=updates[row.key].cost_won_by_month) if row and row.key in updates else row for row in report.next_month.rows)
-    return replace(report, rows=current, next_month=replace(report.next_month, rows=next_rows))
+    provenance = report.total.calculation.provenance
+    rules = tuple(
+        Destination(
+            index,
+            row.label,
+            order,
+            True,
+            True,
+            None,
+            index in provenance.quantity_destination_ids,
+            index in provenance.cost_destination_ids,
+            False,
+        )
+        for order, row in enumerate(current[:12], start=1)
+        for index in (row.calculation.destination_id,)
+    )
+    total = calculate_total(
+        {row.calculation.destination_id: row.calculation for row in current[:12]},
+        rules,
+    )
+    quantity_history = {
+        **report.total.quantity_by_month,
+        '2026-08': total.actual_quantity,
+    }
+    cost_history = {
+        **report.total.cost_won_by_month,
+        '2026-08': total.actual_cost_won,
+    }
+    return replace(
+        report,
+        rows=current,
+        total=replace(
+            report.total,
+            calculation=total,
+            quantity_by_month=quantity_history,
+            cost_won_by_month=cost_history,
+        ),
+        next_month=replace(
+            report.next_month,
+            rows=next_rows,
+            total=replace(
+                report.next_month.total,
+                quantity_by_month=quantity_history,
+                cost_won_by_month=cost_history,
+            ),
+        ),
+        charts=replace(
+            report.charts,
+            actual_quantity_by_month=quantity_history,
+            actual_cost_won_by_month=cost_history,
+        ),
+    )
 
 
 def reviewed_report(report, reason='가상 원인'):
@@ -231,6 +285,146 @@ def test_ppt_generation_updates_values_and_preserves_layout(template, report, tm
     assert named(p, 4, 'report.cost_average').text == '10,000'
     assert verify_ppt_layout(template, output) == []
     assert sha256(template.read_bytes()).hexdigest() == before
+
+
+def test_ppt_preflight_rejects_mutated_next_month_row_with_stale_total(report):
+    from app.domain.calculations import calculate_destination
+    from app.reporting.pptx_report import validate_ppt_report
+
+    first = report.next_month.rows[0]
+    mutated = replace(
+        first,
+        calculation=calculate_destination(
+            first.calculation.planned_quantity,
+            first.calculation.planned_cost_won + 1,
+            None,
+            None,
+            destination_id=first.calculation.destination_id,
+        ),
+    )
+    invalid = replace(
+        report,
+        next_month=replace(
+            report.next_month, rows=(mutated, *report.next_month.rows[1:])
+        ),
+    )
+
+    with pytest.raises(ValueError, match="next-month total"):
+        validate_ppt_report(invalid)
+
+
+def test_ppt_preflight_rejects_non_destination_next_month_row_cleanly(report):
+    from app.reporting.pptx_report import validate_ppt_report
+
+    invalid_row = replace(
+        report.next_month.rows[0], calculation=report.total.calculation
+    )
+    invalid = replace(
+        report,
+        next_month=replace(
+            report.next_month,
+            rows=(invalid_row, *report.next_month.rows[1:]),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="next-month destination identity"):
+        validate_ppt_report(invalid)
+
+
+def test_ppt_preflight_uses_split_quantity_and_cost_total_provenance(report):
+    from app.domain.calculations import calculate_destination, calculate_total
+    from app.domain.models import Destination
+    from app.reporting.pptx_report import validate_ppt_report
+
+    rules = tuple(
+        Destination(
+            index,
+            row.label,
+            index,
+            True,
+            True,
+            None,
+            index != 12,
+            index != 11,
+            False,
+        )
+        for index, row in enumerate(report.rows[:12], start=1)
+    )
+    current = {row.calculation.destination_id: row.calculation for row in report.rows[:12]}
+    following = {
+        row.calculation.destination_id: row.calculation
+        for row in report.next_month.rows
+    }
+    current_total = calculate_total(current, rules)
+    next_total = calculate_total(following, rules)
+    total_quantity_history = {
+        **report.total.quantity_by_month,
+        "2026-08": current_total.actual_quantity,
+    }
+    total_cost_history = {
+        **report.total.cost_won_by_month,
+        "2026-08": current_total.actual_cost_won,
+    }
+    split_report = replace(
+        report,
+        total=replace(
+            report.total,
+            calculation=current_total,
+            quantity_by_month=total_quantity_history,
+            cost_won_by_month=total_cost_history,
+        ),
+        next_month=replace(
+            report.next_month,
+            total=replace(
+                report.next_month.total,
+                calculation=next_total,
+                quantity_by_month=total_quantity_history,
+                cost_won_by_month=total_cost_history,
+            ),
+        ),
+        charts=replace(
+            report.charts,
+            planned_quantity_by_month={
+                **report.charts.planned_quantity_by_month,
+                "2026-08": current_total.planned_quantity,
+            },
+            actual_quantity_by_month={
+                **report.charts.actual_quantity_by_month,
+                "2026-08": current_total.actual_quantity,
+            },
+            planned_cost_won_by_month={
+                **report.charts.planned_cost_won_by_month,
+                "2026-08": current_total.planned_cost_won,
+            },
+            actual_cost_won_by_month={
+                **report.charts.actual_cost_won_by_month,
+                "2026-08": current_total.actual_cost_won,
+            },
+        ),
+    )
+    validate_ppt_report(split_report)
+
+    first = split_report.next_month.rows[0]
+    changed = replace(
+        first,
+        calculation=calculate_destination(
+            first.calculation.planned_quantity,
+            first.calculation.planned_cost_won + 1,
+            None,
+            None,
+            destination_id=first.calculation.destination_id,
+        ),
+    )
+    invalid = replace(
+        split_report,
+        next_month=replace(
+            split_report.next_month,
+            rows=(changed, *split_report.next_month.rows[1:]),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="next-month total"):
+        validate_ppt_report(invalid)
 
 
 @pytest.mark.parametrize('mutation', ['missing', 'duplicate', 'wrong_kind', 'rows', 'columns', 'missing_cell', 'merge', 'slides', 'picture'])

@@ -204,7 +204,11 @@ def _report_bundle():
                 normalized_destination=destination.name,
                 quantity_ea=calculations[destination.id].actual_quantity,
                 cost_won=calculations[destination.id].actual_cost_won,
-                source_locator=rf"D:\fictional\화성운반비내역(8월)!{11 + destination.id}",
+                source_locator=(
+                    "당월 실적 입력"
+                    if destination.id == 2
+                    else rf"D:\fictional\화성운반비내역(8월)!{11 + destination.id}"
+                ),
             )
             for destination in destinations
         ),
@@ -235,6 +239,96 @@ def _report_bundle():
             quantity_ea=Decimal("0"),
             cost_won=0,
             source_locator=r"D:\fictional\화성운반비내역(8월)!99",
+        ),
+        *(
+            OperationEvidence(
+                record_kind="destination",
+                value_role="plan",
+                input_kind="manual",
+                batch_id=None,
+                provenance_id=f"monthly-plan:2026-08:{destination.id}",
+                report_month="2026-08",
+                raw_destination=None,
+                destination_id=destination.id,
+                normalized_destination=destination.name,
+                quantity_ea=calculations[destination.id].planned_quantity,
+                cost_won=calculations[destination.id].planned_cost_won,
+                source_locator="당월 계획 입력",
+            )
+            for destination in destinations
+        ),
+        OperationEvidence(
+            record_kind="sales",
+            value_role="plan",
+            input_kind="manual",
+            batch_id=None,
+            provenance_id="monthly-sales-plan:2026-08",
+            report_month="2026-08",
+            raw_destination=None,
+            destination_id=None,
+            normalized_destination="매출액",
+            quantity_ea=None,
+            cost_won=sales.planned_won,
+            source_locator="당월 매출 계획 입력",
+        ),
+        OperationEvidence(
+            record_kind="sales",
+            value_role="actual",
+            input_kind="manual",
+            batch_id=None,
+            provenance_id="monthly-sales-actual:2026-08",
+            report_month="2026-08",
+            raw_destination=None,
+            destination_id=None,
+            normalized_destination="매출액",
+            quantity_ea=None,
+            cost_won=sales.actual_won,
+            source_locator="월 매출 입력",
+        ),
+        *(
+            OperationEvidence(
+                record_kind="destination",
+                value_role="plan",
+                input_kind="manual",
+                batch_id=None,
+                provenance_id=f"monthly-plan:2026-09:{destination.id}",
+                report_month="2026-09",
+                raw_destination=None,
+                destination_id=destination.id,
+                normalized_destination=destination.name,
+                quantity_ea=next_rows[destination.id - 1].calculation.planned_quantity,
+                cost_won=next_rows[destination.id - 1].calculation.planned_cost_won,
+                source_locator="다음 달 계획 입력",
+            )
+            for destination in destinations
+        ),
+        OperationEvidence(
+            record_kind="nonregular",
+            value_role="plan",
+            input_kind="manual",
+            batch_id=None,
+            provenance_id="monthly-plan:2026-09:nonregular",
+            report_month="2026-09",
+            raw_destination=None,
+            destination_id=None,
+            normalized_destination="비정규 운반비",
+            quantity_ea=Decimal("0"),
+            cost_won=0,
+            source_locator="다음 달 계획 입력",
+        ),
+        OperationEvidence(
+            record_kind="sales",
+            value_role="plan",
+            input_kind="manual",
+            batch_id=None,
+            provenance_id="monthly-sales-plan:2026-09",
+            report_month="2026-09",
+            raw_destination=None,
+            destination_id=None,
+            normalized_destination="매출액",
+            quantity_ea=None,
+            cost_won=1_300_000,
+            source_locator="다음 달 매출 계획 입력",
         ),
     )
     validation_context = ValidationContext(
@@ -287,6 +381,10 @@ def _find_row(sheet, label: str) -> int:
         if row[0].value == label:
             return row[0].row
     raise AssertionError(f"{label!r} row not found in {sheet.title}")
+
+
+def _find_rows(sheet, label: str) -> list[int]:
+    return [row[0].row for row in sheet.iter_rows() if row[0].value == label]
 
 
 def _as_date(value):
@@ -407,6 +505,7 @@ def _with_missing_first_actual(bundle):
 
 
 def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_path):
+    from app.domain.calculations import HistoricalValueKind, historical_averages
     from app.reporting.xlsx_review import export_review_workbook
 
     bundle = _report_bundle()
@@ -450,14 +549,46 @@ def test_export_review_workbook_reconciles_typed_values_and_review_evidence(tmp_
     assert isinstance(summary.cell(averages_row, 2).value, (int, float))
     assert summary.cell(averages_row, 3).value == "완전"
 
+    current_first = _find_rows(summary, "가상납품처01")[0]
+    current_averages = historical_averages(
+        bundle.report.report_month,
+        bundle.report.rows[0].cost_won_by_month,
+        value_kind=HistoricalValueKind.MONEY,
+    )
+    assert summary.cell(current_first, 15).value == float(
+        current_averages.three_month.value
+    )
+    assert summary.cell(current_first, 18).value == float(
+        current_averages.comparison_year.value
+    )
+
+    plan_title = _find_row(summary, "2026년 9월 운반비 계획 검토")
+    assert summary.cell(plan_title + 1, 1).value == "납품처"
+    first_plan = plan_title + 2
+    assert summary.cell(first_plan, 1).value == "가상납품처01"
+    assert summary.cell(first_plan, 3).value == 131
+    assert summary.cell(first_plan, 4).value == 14_410
+    assert summary.cell(first_plan, 5).value == 110
+    next_nonregular = first_plan + 12
+    assert summary.cell(next_nonregular, 1).value == "비정규 운반비"
+    next_total = next_nonregular + 1
+    assert summary.cell(next_total, 1).value == "합계"
+    assert summary.cell(next_total, 3).value == float(
+        bundle.report.next_month.total.calculation.planned_quantity
+    )
+    assert summary.cell(next_total, 4).value == bundle.report.next_month.total.calculation.planned_cost_won
+    assert summary.cell(next_total + 2, 1).value == "매출액"
+    assert summary.cell(next_total + 2, 4).value == 1_300_000
+
     evidence = workbook["운행실적"]
     assert evidence.freeze_panes == "A10"
     assert evidence.auto_filter.ref
-    assert evidence["B4"].value == "화성 가상자료.xlsx"
-    assert evidence["B5"].value == "ab" * 32
-    assert evidence["B6"].value == datetime(2026, 9, 1, 8, 30, 15)
-    assert evidence["B6"].is_date
-    assert evidence["B7"].value == 42
+    assert evidence["B4"].value == "transport"
+    assert evidence["D4"].value == "화성 가상자료.xlsx"
+    assert evidence["E4"].value == "ab" * 32
+    assert evidence["F4"].value == datetime(2026, 9, 1, 8, 30, 15)
+    assert evidence["F4"].is_date
+    assert evidence["A4"].value == 42
     assert _as_date(evidence["F10"].value) == date(2026, 8, 1)
     assert evidence["F10"].is_date
     assert evidence["A10"].value == "가져오기"
@@ -832,17 +963,22 @@ def test_export_review_workbook_rejects_nonregular_without_exact_evidence(
 
     bundle = _report_bundle()
     if case == "missing":
-        operations = bundle.operations[:-1]
+        operations = (*bundle.operations[:13], *bundle.operations[14:])
     else:
-        operations = (*bundle.operations[:-1], replace(bundle.operations[-1], cost_won=1))
+        operations = (
+            *bundle.operations[:13],
+            replace(bundle.operations[13], cost_won=1),
+            *bundle.operations[14:],
+        )
     with pytest.raises(ValueError, match="nonregular evidence"):
         export_review_workbook(
             replace(bundle, operations=operations), tmp_path / f"{case}.xlsx"
         )
 
 
-def test_export_review_workbook_preserves_missing_nonregular_as_blank(tmp_path):
+def test_export_review_workbook_rejects_missing_nonregular_without_matching_blocker(tmp_path):
     from app.domain.calculations import calculate_destination
+    from app.domain.validation import UnresolvedDestinationAlias
     from app.reporting.xlsx_review import export_review_workbook
 
     bundle = _report_bundle()
@@ -868,15 +1004,256 @@ def test_export_review_workbook_preserves_missing_nonregular_as_blank(tmp_path):
         nonregular=nonregular,
         next_month=replace(bundle.report.next_month, nonregular=next_nonregular),
     )
-    operations = (*bundle.operations[:-1], replace(bundle.operations[-1], quantity_ea=None, cost_won=None))
+    operations = (
+        *bundle.operations[:13],
+        replace(bundle.operations[13], quantity_ea=None, cost_won=None),
+        *bundle.operations[14:],
+    )
     output = tmp_path / "missing-nonregular.xlsx"
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(
+            UnresolvedDestinationAlias("미등록 비정규", "비정규 실적 입력"),
+        ),
+    )
 
-    export_review_workbook(replace(bundle, report=report, operations=operations), output)
+    with pytest.raises(ValueError, match="no blocking validation issue"):
+        export_review_workbook(
+            replace(
+                bundle,
+                report=report,
+                operations=operations,
+                validation_context=context,
+            ),
+            output,
+        )
 
-    summary = load_workbook(output)["월간 종합"]
-    row = _find_row(summary, "비정규 운반비")
-    assert summary.cell(row, 4).value is None
-    assert summary.cell(row, 8).value is None
+
+def test_export_review_workbook_requires_one_evidence_record_per_present_input(tmp_path):
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    current_plan_index = next(
+        index
+        for index, item in enumerate(bundle.operations)
+        if item.record_kind == "destination"
+        and item.value_role == "plan"
+        and item.report_month == "2026-08"
+        and item.destination_id == 1
+    )
+    missing = (
+        *bundle.operations[:current_plan_index],
+        *bundle.operations[current_plan_index + 1 :],
+    )
+    with pytest.raises(ValueError, match="evidence does not reconcile"):
+        export_review_workbook(
+            replace(bundle, operations=missing), tmp_path / "missing-input.xlsx"
+        )
+
+    duplicate = replace(
+        bundle.operations[current_plan_index],
+        provenance_id="duplicate-plan-provenance",
+    )
+    with pytest.raises(ValueError, match="exactly one evidence"):
+        export_review_workbook(
+            replace(bundle, operations=(*bundle.operations, duplicate)),
+            tmp_path / "duplicate-input.xlsx",
+        )
+
+
+def test_unrelated_global_blocker_does_not_excuse_missing_input_evidence(tmp_path):
+    from app.domain.validation import UnresolvedDestinationAlias
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    current_plan_index = next(
+        index
+        for index, item in enumerate(bundle.operations)
+        if item.record_kind == "destination"
+        and item.value_role == "plan"
+        and item.report_month == "2026-08"
+        and item.destination_id == 1
+    )
+    operations = (
+        *bundle.operations[:current_plan_index],
+        *bundle.operations[current_plan_index + 1 :],
+    )
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(
+            UnresolvedDestinationAlias("무관한 원천", "별칭 검토"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="evidence does not reconcile"):
+        export_review_workbook(
+            replace(bundle, operations=operations, validation_context=context),
+            tmp_path / "unrelated-blocker.xlsx",
+        )
+
+
+def test_xlsx_recomputes_next_month_total_without_trusting_ppt_validator(
+    tmp_path, monkeypatch
+):
+    from app.domain.calculations import calculate_destination
+    from app.reporting import xlsx_review
+
+    bundle = _report_bundle()
+    first = bundle.report.next_month.rows[0]
+    changed = replace(
+        first,
+        calculation=calculate_destination(
+            first.calculation.planned_quantity,
+            first.calculation.planned_cost_won + 1,
+            None,
+            None,
+            destination_id=first.calculation.destination_id,
+        ),
+    )
+    report = replace(
+        bundle.report,
+        next_month=replace(
+            bundle.report.next_month,
+            rows=(changed, *bundle.report.next_month.rows[1:]),
+        ),
+    )
+    monkeypatch.setattr(xlsx_review, "validate_ppt_report", lambda report: None)
+
+    with pytest.raises(ValueError, match="next-month total calculation"):
+        xlsx_review.export_review_workbook(
+            replace(bundle, report=report), tmp_path / "stale-next-total.xlsx"
+        )
+
+
+def test_export_review_workbook_exports_one_current_batch_per_source_type(tmp_path):
+    from app.domain.models import DestinationAlias
+    from app.domain.validation import ImportBatchInput
+    from app.reporting.xlsx_review import ImportBatchEvidence, export_review_workbook
+
+    bundle = _report_bundle()
+    second = ImportBatchEvidence(
+        batch_id=43,
+        provenance_id="erp:2026-08:43",
+        report_month="2026-08",
+        source_type="erp",
+        source_filename=r"D:\fictional\ERP 가상자료.xlsx",
+        file_sha256="cd" * 32,
+        imported_at=datetime(2026, 9, 1, 9, 45),
+    )
+    first_operation = replace(
+        bundle.operations[0],
+        batch_id=43,
+        provenance_id=second.provenance_id,
+        raw_destination="ERP원천01",
+        source_locator=r"D:\fictional\ERP 가상자료.xlsx!A12",
+    )
+    context = replace(
+        bundle.validation_context,
+        current_import_batches=(
+            *bundle.validation_context.current_import_batches,
+            ImportBatchInput(
+                second.batch_id,
+                second.report_month,
+                second.source_type,
+                second.file_sha256,
+                second.source_filename,
+                True,
+            ),
+        ),
+    )
+    output = tmp_path / "two-sources.xlsx"
+    export_review_workbook(
+        replace(
+            bundle,
+            validation_context=context,
+            aliases=(
+                *bundle.aliases,
+                DestinationAlias(99, 1, "ERP원천01", "erp"),
+            ),
+            import_batches=(*bundle.import_batches, second),
+            operations=(first_operation, *bundle.operations[1:]),
+        ),
+        output,
+    )
+
+    evidence = load_workbook(output)["운행실적"]
+    assert evidence["B4"].value == "transport"
+    assert evidence["B5"].value == "erp"
+    assert evidence["D4"].value == "화성 가상자료.xlsx"
+    assert evidence["D5"].value == "ERP 가상자료.xlsx"
+
+
+def test_export_review_workbook_rejects_duplicate_batch_source_type(tmp_path):
+    from app.domain.validation import ImportBatchInput
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    duplicate = replace(
+        bundle.import_batches[0],
+        batch_id=99,
+        provenance_id="transport:2026-08:99",
+    )
+    context = replace(
+        bundle.validation_context,
+        current_import_batches=(
+            *bundle.validation_context.current_import_batches,
+            ImportBatchInput(
+                duplicate.batch_id,
+                duplicate.report_month,
+                duplicate.source_type,
+                duplicate.file_sha256,
+                duplicate.source_filename,
+                True,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="source type.*duplicate"):
+        export_review_workbook(
+            replace(
+                bundle,
+                validation_context=context,
+                import_batches=(*bundle.import_batches, duplicate),
+            ),
+            tmp_path / "duplicate-source.xlsx",
+        )
+
+
+def test_safe_text_preserves_plain_comparison_slash_and_redacts_real_paths():
+    from app.reporting.xlsx_review import _safe_display_text
+
+    value = (
+        r"계획 / 실적 비교 | D:\secret folder\source.xlsx!A1 | "
+        r"\\server\share\hidden\source.xlsx!B2 | /home/user/private/source.xlsx!C3"
+    )
+    safe = _safe_display_text(value)
+
+    assert "계획 / 실적 비교" in safe
+    assert r"D:\secret folder" not in safe
+    assert r"\\server\share" not in safe
+    assert "/home/user/private" not in safe
+    assert "source.xlsx!A1" in safe
+
+
+def test_validation_message_rows_expand_within_visual_bounds(tmp_path):
+    from app.domain.validation import UnresolvedDestinationAlias
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(
+            UnresolvedDestinationAlias(
+                "매우 긴 가상 원천 납품처 이름 " * 8,
+                "계획 / 실적 비교 화면에서 확인해야 하는 매우 긴 수기 위치 설명 " * 5,
+            ),
+        ),
+    )
+    output = tmp_path / "long-validation.xlsx"
+    export_review_workbook(replace(bundle, validation_context=context), output)
+
+    checks = load_workbook(output)["검증 결과"]
+    assert 36 < checks.row_dimensions[8].height <= 120
+    assert checks["C8"].alignment.wrap_text is True
 
 
 @pytest.mark.parametrize(

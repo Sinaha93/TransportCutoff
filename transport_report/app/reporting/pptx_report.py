@@ -29,8 +29,9 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from app.domain.calculations import (
     DestinationCalculation, GrandTotalResult, HistoricalValueKind, MAX_SQLITE_INTEGER,
-    ReviewCandidate, historical_averages, select_unit_cost_reviews,
+    ReviewCandidate, calculate_total, historical_averages, select_unit_cost_reviews,
 )
+from app.domain.models import Destination
 from app.reporting.charts import (
     ChartReport, render_quantity_chart, render_cost_chart, render_combined_chart,
 )
@@ -299,6 +300,71 @@ def validate_ppt_report(report):
     for period in (report, report.next_month):
         if not isinstance(period.total.calculation, GrandTotalResult):
             raise ValueError('total requires a Task6 GrandTotalResult')
+    current_direct = tuple(
+        row
+        for row in report.rows
+        if row is not None
+        and getattr(row.calculation, 'destination_id', None) is not None
+    )
+    next_direct = tuple(
+        row
+        for row in report.next_month.rows
+        if row is not None
+        and getattr(row.calculation, 'destination_id', None) is not None
+    )
+    current_identity = tuple(
+        (row.calculation.destination_id, row.label) for row in current_direct
+    )
+    next_identity = tuple(
+        (row.calculation.destination_id, row.label) for row in next_direct
+    )
+    if len(current_direct) != 12:
+        raise ValueError('current report has a missing destination identity')
+    if len(next_direct) != 12 or next_identity != current_identity:
+        raise ValueError('next-month destination identity, order, or label conflicts with current report')
+    provenance = report.total.calculation.provenance
+    destination_ids = tuple(identity for identity, _ in current_identity)
+    quantity_ids = provenance.quantity_destination_ids
+    cost_ids = provenance.cost_destination_ids
+    if (
+        provenance.destination_ids != destination_ids
+        or quantity_ids != tuple(i for i in destination_ids if i in quantity_ids)
+        or cost_ids != tuple(i for i in destination_ids if i in cost_ids)
+    ):
+        raise ValueError('current total calculation provenance conflicts with destination order')
+    total_rules = tuple(
+        Destination(
+            identity,
+            label,
+            order,
+            True,
+            True,
+            None,
+            identity in quantity_ids,
+            identity in cost_ids,
+            True,
+        )
+        for order, (identity, label) in enumerate(current_identity, start=1)
+    )
+    expected_current = calculate_total(
+        {row.calculation.destination_id: row.calculation for row in current_direct},
+        total_rules,
+    )
+    if report.total.calculation != expected_current:
+        raise ValueError('current total conflicts with destination values')
+    expected_next = calculate_total(
+        {row.calculation.destination_id: row.calculation for row in next_direct},
+        total_rules,
+    )
+    if report.next_month.total.calculation != expected_next:
+        raise ValueError('next-month total conflicts with destination plans')
+    if (
+        report.next_month.nonregular.key != report.nonregular.key
+        or report.next_month.nonregular.label != report.nonregular.label
+        or report.next_month.total.key != report.total.key
+        or report.next_month.total.label != report.total.label
+    ):
+        raise ValueError('next-month summary identity or label conflicts with current report')
     for row in (*report.next_month.rows, report.next_month.nonregular, report.next_month.total):
         if row is not None and (row.calculation.planned_quantity is None or row.calculation.planned_cost_won is None):
             raise ValueError('next-month plan values are missing')

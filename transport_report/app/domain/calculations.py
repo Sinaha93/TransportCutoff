@@ -69,6 +69,25 @@ class DerivedGroupProvenance:
 @dataclass(frozen=True, slots=True)
 class GrandTotalProvenance:
     destination_ids: tuple[int, ...]
+    quantity_destination_ids: tuple[int, ...] | None = None
+    cost_destination_ids: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "destination_ids", tuple(self.destination_ids))
+        # Older callers only supplied ``destination_ids`` because every total
+        # previously implied the same membership for both measures.
+        if self.quantity_destination_ids is None:
+            object.__setattr__(self, "quantity_destination_ids", self.destination_ids)
+        else:
+            object.__setattr__(
+                self, "quantity_destination_ids", tuple(self.quantity_destination_ids)
+            )
+        if self.cost_destination_ids is None:
+            object.__setattr__(self, "cost_destination_ids", self.destination_ids)
+        else:
+            object.__setattr__(
+                self, "cost_destination_ids", tuple(self.cost_destination_ids)
+            )
 
 
 CalculationProvenance = (
@@ -223,6 +242,8 @@ class DerivedGroupResult(DestinationCalculation):
 @dataclass(frozen=True, slots=True, init=False)
 class GrandTotalResult(DestinationCalculation):
     _destination_ids: tuple[int, ...] = field(init=False, repr=False)
+    _quantity_destination_ids: tuple[int, ...] = field(init=False, repr=False)
+    _cost_destination_ids: tuple[int, ...] = field(init=False, repr=False)
 
     def __init__(
         self,
@@ -236,10 +257,18 @@ class GrandTotalResult(DestinationCalculation):
         cls,
         *,
         destination_ids: tuple[int, ...],
+        quantity_destination_ids: tuple[int, ...],
+        cost_destination_ids: tuple[int, ...],
         values: Mapping[str, object],
     ) -> GrandTotalResult:
         result = object.__new__(cls)
         object.__setattr__(result, "_destination_ids", tuple(destination_ids))
+        object.__setattr__(
+            result, "_quantity_destination_ids", tuple(quantity_destination_ids)
+        )
+        object.__setattr__(
+            result, "_cost_destination_ids", tuple(cost_destination_ids)
+        )
         _initialize_result_fields(result, values)
         return result
 
@@ -248,12 +277,24 @@ class GrandTotalResult(DestinationCalculation):
         return self._destination_ids
 
     @property
+    def quantity_destination_ids(self) -> tuple[int, ...]:
+        return self._quantity_destination_ids
+
+    @property
+    def cost_destination_ids(self) -> tuple[int, ...]:
+        return self._cost_destination_ids
+
+    @property
     def kind(self) -> CalculationKind:
         return CalculationKind.GRAND_TOTAL
 
     @property
     def provenance(self) -> GrandTotalProvenance:
-        return GrandTotalProvenance(self.destination_ids)
+        return GrandTotalProvenance(
+            self.destination_ids,
+            self.quantity_destination_ids,
+            self.cost_destination_ids,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,7 +442,11 @@ def calculate_total(
         _sum_metric(calculations, rules, "actual_quantity", "include_quantity_total", Decimal(0)),
         _sum_metric(calculations, rules, "actual_cost_won", "include_cost_total", 0),
         kind=CalculationKind.GRAND_TOTAL,
-        provenance=GrandTotalProvenance(tuple(item.id for item in rules)),
+        provenance=GrandTotalProvenance(
+            tuple(item.id for item in rules),
+            tuple(item.id for item in rules if item.include_quantity_total),
+            tuple(item.id for item in rules if item.include_cost_total),
+        ),
     )
 
 
@@ -559,6 +604,8 @@ def _make_calculation(
         )
     return GrandTotalResult._create(
         destination_ids=provenance.destination_ids,
+        quantity_destination_ids=provenance.quantity_destination_ids,
+        cost_destination_ids=provenance.cost_destination_ids,
         values=common_fields,
     )
 

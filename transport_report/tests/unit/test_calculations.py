@@ -109,6 +109,9 @@ def test_totals_follow_master_rules_and_do_not_count_derived_group_twice():
     assert total.actual_quantity == Decimal("60")
     assert total.planned_cost_won == 10_000
     assert total.actual_cost_won == 11_300
+    assert total.provenance.destination_ids == (1, 2, 3, 4)
+    assert total.provenance.quantity_destination_ids == (1, 2, 3)
+    assert total.provenance.cost_destination_ids == (1, 2, 3, 4)
     with pytest.raises(ValueError, match="derived group"):
         calculate_total({**calculations, 1: group}, destinations)
     with pytest.raises(ValueError, match="direct destination"):

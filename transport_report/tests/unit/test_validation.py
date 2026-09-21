@@ -215,12 +215,12 @@ def test_conflicting_current_import_batches_are_blocking_duplicates():
     issue = next(issue for issue in result.issues if issue.code == "DUPLICATE_IMPORT")
     assert issue.severity == "error"
     assert issue.source_locator == "배치 #21, 배치 #22"
-    assert "서로 다른" in issue.message
+    assert "둘 이상의" in issue.message
     assert "하나만" in issue.message
     assert "transport" in issue.message
 
 
-def test_same_file_import_retry_is_idempotent_not_a_duplicate_conflict():
+def test_same_file_current_import_retry_is_a_duplicate_source_conflict():
     from app.domain.validation import ImportBatchInput, validate_report
 
     result = validate_report(
@@ -232,7 +232,7 @@ def test_same_file_import_retry_is_idempotent_not_a_duplicate_conflict():
         )
     )
 
-    assert "DUPLICATE_IMPORT" not in {issue.code for issue in result.issues}
+    assert "DUPLICATE_IMPORT" in {issue.code for issue in result.issues}
 
 
 def test_current_batches_from_another_report_month_are_not_duplicate_candidates():
@@ -946,7 +946,7 @@ def test_import_batch_requires_64_character_hexadecimal_sha256(file_sha256):
         )
 
 
-def test_import_batch_canonicalizes_uppercase_sha_for_idempotent_comparison():
+def test_import_batch_canonicalizes_uppercase_sha_and_still_rejects_duplicate_source():
     from app.domain.validation import ImportBatchInput, validate_report
 
     uppercase = ImportBatchInput(
@@ -961,7 +961,7 @@ def test_import_batch_canonicalizes_uppercase_sha_for_idempotent_comparison():
     )
 
     assert uppercase.file_sha256 == SHA_A
-    assert "DUPLICATE_IMPORT" not in {issue.code for issue in result.issues}
+    assert "DUPLICATE_IMPORT" in {issue.code for issue in result.issues}
 
 
 def test_import_batch_current_state_is_strict_bool():
