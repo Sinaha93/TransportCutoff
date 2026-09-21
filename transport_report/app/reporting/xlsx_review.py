@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from functools import lru_cache
 import math
 import os
 from pathlib import Path
@@ -23,6 +24,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import Cell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.worksheet.worksheet import Worksheet
+
+try:
+    from PIL import ImageFont
+except ImportError:  # pragma: no cover - conservative metrics remain available
+    ImageFont = None
 
 from app.domain.calculations import (
     CalculationKind,
@@ -58,14 +64,20 @@ ERROR_TOKENS = {
 }
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _ABSOLUTE_PATH_START = re.compile(
-    r"(?i)(?<![\w:/\\])(?:[A-Z]:[\\/]|\\\\(?=[^\\/\s])|//(?=[^/\s])|/(?=[^/\s]))"
+    r"(?i)(?<![\w/\\])(?:[A-Z]:[\\/]|\\\\(?=[^\\/\s])|//(?=[^/\s])|/(?=[^/\s]))"
 )
+_WEB_URL_PREFIX = re.compile(r"(?i)(?:https?|ftps?)://$")
 _LOCATOR_SUFFIX = re.compile(r"(![A-Za-z0-9_$:.\-]+)$")
 _PATH_BOUNDARY = re.compile(r"[\r\n,;\)\]\}>]")
 _REDACTED_PATH = "경로 숨김"
 _VALIDATION_FONT_SIZE = 9
-_VALIDATION_MESSAGE_WIDTH = 59
-_VALIDATION_LOCATOR_WIDTH = 59
+_VALIDATION_MIN_WIDTH = 59
+# Wider than ordinary tables but still reviewable without Excel's 255-unit extreme.
+_VALIDATION_MAX_WIDTH = 80
+_VALIDATION_MIN_ROW_HEIGHT = 36
+_VALIDATION_MAX_ROW_HEIGHT = 120
+_VALIDATION_CELL_MARGIN_PIXELS = 12
+_SCREEN_DPI = 96
 
 _NAVY = "17365D"
 _BLUE = "D9EAF7"
@@ -632,59 +644,102 @@ def _write_validation(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
     _write_header(sheet, 7, headers)
     destination_by_id = {item.id: item for item in bundle.destinations}
     if bundle.validation.issues:
-        for row_number, issue in enumerate(bundle.validation.issues, start=8):
+        safe_messages = tuple(
+            _safe_display_text(issue.message) for issue in bundle.validation.issues
+        )
+        safe_locators = tuple(
+            ""
+            if issue.source_locator is None
+            else _safe_locator(issue.source_locator)
+            for issue in bundle.validation.issues
+        )
+        message_width = _validation_column_width(safe_messages)
+        locator_width = _validation_column_width(safe_locators)
+        lines_per_row = _validation_line_capacity(
+            _VALIDATION_MAX_ROW_HEIGHT, _VALIDATION_FONT_SIZE
+        )
+        row_number = 8
+        for issue, safe_message, safe_locator in zip(
+            bundle.validation.issues, safe_messages, safe_locators
+        ):
             destination = destination_by_id.get(issue.destination_id)
-            values = (
-                issue.code,
-                "오류" if issue.severity == "error" else "경고",
-                issue.message,
-                None if destination is None else destination.name,
-                None if destination is None else destination.display_order,
-                None
-                if issue.source_locator is None
-                else _safe_locator(issue.source_locator),
+            message_lines = _wrap_text_lines(
+                safe_message, message_width, _VALIDATION_FONT_SIZE
             )
-            _write_values(sheet, row_number, values)
+            locator_lines = _wrap_text_lines(
+                safe_locator, locator_width, _VALIDATION_FONT_SIZE
+            )
+            part_count = max(
+                1,
+                math.ceil(max(len(message_lines), len(locator_lines)) / lines_per_row),
+            )
             color = _RED if issue.severity == "error" else _AMBER
             text = _RED_TEXT if issue.severity == "error" else _AMBER_TEXT
-            _fill_range(sheet, row_number, 1, 6, color)
-            for column in range(1, 7):
-                sheet.cell(row_number, column).font = Font(
-                    name=FONT_NAME,
-                    size=_VALIDATION_FONT_SIZE,
-                    color=text,
-                    bold=column in (1, 2),
+            for part_index in range(part_count):
+                line_start = part_index * lines_per_row
+                line_end = line_start + lines_per_row
+                message_part = "\n".join(message_lines[line_start:line_end])
+                locator_part = "\n".join(locator_lines[line_start:line_end])
+                continued = part_index > 0
+                values = (
+                    (
+                        f"{issue.code} (계속 {part_index + 1}/{part_count})"
+                        if continued
+                        else issue.code
+                    ),
+                    "계속"
+                    if continued
+                    else "오류"
+                    if issue.severity == "error"
+                    else "경고",
+                    message_part,
+                    None
+                    if continued or destination is None
+                    else destination.name,
+                    None
+                    if continued or destination is None
+                    else destination.display_order,
+                    locator_part,
                 )
-            sheet.cell(row_number, 3).alignment = Alignment(
-                horizontal="left", vertical="top", wrap_text=True
-            )
-            sheet.cell(row_number, 6).alignment = Alignment(
-                horizontal="left", vertical="top", wrap_text=True
-            )
-            for column in (2, 5):
-                sheet.cell(row_number, column).alignment = Alignment(
-                    horizontal="center", vertical="center"
+                _write_values(sheet, row_number, values)
+                _fill_range(sheet, row_number, 1, 6, color)
+                for column in range(1, 7):
+                    sheet.cell(row_number, column).font = Font(
+                        name=FONT_NAME,
+                        size=_VALIDATION_FONT_SIZE,
+                        color=text,
+                        bold=column in (1, 2),
+                    )
+                for column in (3, 6):
+                    sheet.cell(row_number, column).alignment = Alignment(
+                        horizontal="left", vertical="top", wrap_text=True
+                    )
+                for column in (2, 5):
+                    sheet.cell(row_number, column).alignment = Alignment(
+                        horizontal="center", vertical="center"
+                    )
+                wrapped_lines = max(
+                    _wrapped_line_count(
+                        message_part, message_width, _VALIDATION_FONT_SIZE
+                    ),
+                    _wrapped_line_count(
+                        locator_part, locator_width, _VALIDATION_FONT_SIZE
+                    ),
                 )
-            wrapped_lines = max(
-                _wrapped_line_count(
-                    str(values[2]),
-                    _VALIDATION_MESSAGE_WIDTH,
-                    _VALIDATION_FONT_SIZE,
-                ),
-                _wrapped_line_count(
-                    "" if values[5] is None else str(values[5]),
-                    _VALIDATION_LOCATOR_WIDTH,
-                    _VALIDATION_FONT_SIZE,
-                ),
-            )
-            sheet.row_dimensions[row_number].height = min(
-                120,
-                max(36, 6 + (_VALIDATION_FONT_SIZE * 1.5 * wrapped_lines)),
-            )
-        last_row = 7 + len(bundle.validation.issues)
+                sheet.row_dimensions[row_number].height = _validation_row_height(
+                    wrapped_lines, _VALIDATION_FONT_SIZE
+                )
+                row_number += 1
+        last_row = row_number - 1
     else:
-        _write_values(sheet, 8, ("VALID", "정상", "차단 또는 경고 항목이 없습니다.", None, None, None))
+        _write_values(
+            sheet,
+            8,
+            ("VALID", "정상", "차단 또는 경고 항목이 없습니다.", None, None, None),
+        )
         last_row = 8
+        message_width = _VALIDATION_MIN_WIDTH
+        locator_width = _VALIDATION_MIN_WIDTH
     sheet.auto_filter.ref = f"A7:F{last_row}"
     sheet.freeze_panes = "A8"
     _set_widths(
@@ -692,10 +747,10 @@ def _write_validation(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
         {
             "A": 32,
             "B": 12,
-            "C": _VALIDATION_MESSAGE_WIDTH,
+            "C": message_width,
             "D": 20,
             "E": 12,
-            "F": _VALIDATION_LOCATOR_WIDTH,
+            "F": locator_width,
         },
     )
 
@@ -1430,8 +1485,13 @@ def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
                 raise ValueError(f"{sheet.title} is missing freeze panes or filters")
             if not any(cell.style_id for row in sheet.iter_rows() for cell in row):
                 raise ValueError(f"{sheet.title} is missing review styles")
-            for dimension in sheet.column_dimensions.values():
-                if dimension.width is None or not 0 < dimension.width < 60:
+            for column, dimension in sheet.column_dimensions.items():
+                max_width = (
+                    _VALIDATION_MAX_WIDTH
+                    if sheet.title == SHEET_NAMES[2] and column in {"C", "F"}
+                    else 59
+                )
+                if dimension.width is None or not 0 < dimension.width <= max_width:
                     raise ValueError(f"{sheet.title} has an invalid column width")
             for row in sheet.iter_rows():
                 for cell in row:
@@ -1657,7 +1717,7 @@ def _safe_display_text(value: str) -> str:
     """Remove absolute directory components from embedded user-visible paths."""
     output: list[str] = []
     cursor = 0
-    while match := _ABSOLUTE_PATH_START.search(value, cursor):
+    while match := _next_absolute_path_match(value, cursor):
         start = match.start()
         end = _absolute_path_end(value, start)
         path_text = value[start:end]
@@ -1670,7 +1730,18 @@ def _safe_display_text(value: str) -> str:
 
 def _contains_absolute_path(value: str) -> bool:
     """Detect an absolute path independently from its display replacement."""
-    return _ABSOLUTE_PATH_START.search(value) is not None
+    return _next_absolute_path_match(value, 0) is not None
+
+
+def _next_absolute_path_match(value: str, cursor: int):
+    while match := _ABSOLUTE_PATH_START.search(value, cursor):
+        if match.group(0).startswith(("/", "\\")) and _WEB_URL_PREFIX.search(
+            value[: match.end()]
+        ):
+            cursor = match.end()
+            continue
+        return match
+    return None
 
 
 def _absolute_path_end(value: str, start: int) -> int:
@@ -1733,24 +1804,117 @@ def _average_status(complete: bool, missing_months: tuple[str, ...]) -> str:
 def _wrapped_line_count(
     value: str, column_width: float, font_size: float = 10
 ) -> int:
-    units_per_line = max(1, int((column_width - 2) * 9 / font_size))
-    return sum(
-        max(
-            1,
-            math.ceil(
-                sum(
-                    4
-                    if character == "\t"
-                    else 2
-                    if unicodedata.east_asian_width(character) in {"W", "F", "A"}
-                    else 1
-                    for character in line
-                )
-                / units_per_line
-            ),
-        )
-        for line in value.splitlines() or ("",)
+    return len(_wrap_text_lines(value, column_width, font_size))
+
+
+def _wrap_text_lines(
+    value: str, column_width: float, font_size: float
+) -> tuple[str, ...]:
+    available_pixels = max(
+        1,
+        int(
+            (_excel_column_width_pixels(column_width) - _VALIDATION_CELL_MARGIN_PIXELS)
+            * 0.85
+        ),
     )
+    wrapped: list[str] = []
+    for logical_line in value.split("\n"):
+        if not logical_line:
+            wrapped.append("")
+            continue
+        current: list[str] = []
+        current_pixels = 0.0
+        for character in logical_line:
+            character_pixels = _glyph_pixel_width(character, font_size)
+            if current and current_pixels + character_pixels > available_pixels:
+                wrapped.append("".join(current))
+                current = []
+                current_pixels = 0.0
+            current.append(character)
+            current_pixels += character_pixels
+        wrapped.append("".join(current))
+    return tuple(wrapped or ("",))
+
+
+def _validation_column_width(values: tuple[str, ...]) -> int:
+    max_lines = _validation_line_capacity(
+        _VALIDATION_MAX_ROW_HEIGHT, _VALIDATION_FONT_SIZE
+    )
+    for width in range(_VALIDATION_MIN_WIDTH, _VALIDATION_MAX_WIDTH + 1):
+        if all(
+            _wrapped_line_count(value, width, _VALIDATION_FONT_SIZE) <= max_lines
+            for value in values
+        ):
+            return width
+    return _VALIDATION_MAX_WIDTH
+
+
+def _validation_row_height(line_count: int, font_size: float) -> float:
+    return min(
+        _VALIDATION_MAX_ROW_HEIGHT,
+        max(
+            _VALIDATION_MIN_ROW_HEIGHT,
+            6 + (_validation_line_height_points(font_size) * max(1, line_count)),
+        ),
+    )
+
+
+def _validation_line_capacity(row_height: float, font_size: float) -> int:
+    return max(
+        1,
+        math.floor(
+            (row_height - 6) / _validation_line_height_points(font_size)
+        ),
+    )
+
+
+def _excel_column_width_pixels(width: float) -> int:
+    return max(1, math.floor((width * 7) + 5))
+
+
+@lru_cache(maxsize=16)
+def _validation_font(font_size: float):
+    if ImageFont is None:
+        return None
+    pixel_size = max(1, round(font_size * _SCREEN_DPI / 72))
+    windows_directory = os.environ.get("WINDIR")
+    candidates = [Path("C:/Windows/Fonts/malgun.ttf")]
+    if windows_directory:
+        candidates.insert(0, Path(windows_directory) / "Fonts" / "malgun.ttf")
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            return ImageFont.truetype(str(candidate), pixel_size)
+        except OSError:
+            continue
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _glyph_pixel_width(character: str, font_size: float) -> float:
+    font = _validation_font(font_size)
+    if font is not None:
+        return max(1.0, float(font.getlength(character)))
+    pixel_size = font_size * _SCREEN_DPI / 72
+    if character == "\t":
+        return pixel_size * 2.8
+    if character.isspace():
+        return pixel_size * 0.55
+    if unicodedata.east_asian_width(character) in {"W", "F", "A"}:
+        return pixel_size
+    if character in "MW@%#&":
+        return pixel_size * 0.95
+    return pixel_size * 0.72
+
+
+def _validation_line_height_points(font_size: float) -> float:
+    font = _validation_font(font_size)
+    if font is None:
+        return font_size * 1.5
+    ascent, descent = font.getmetrics()
+    metric_height = (ascent + descent) * 72 / _SCREEN_DPI
+    return max(font_size * 1.45, metric_height + 1.2)
 
 
 def _history_average_values(

@@ -1263,10 +1263,35 @@ def test_safe_text_redacts_extension_independent_absolute_paths(
 
 
 def test_safe_text_preserves_plain_comparison_slash_and_masks_root_only_paths():
-    from app.reporting.xlsx_review import _safe_display_text
+    from app.reporting.xlsx_review import _contains_absolute_path, _safe_display_text
 
     assert _safe_display_text("계획 / 실적 비교") == "계획 / 실적 비교"
     assert _safe_display_text('원본 "D:\\"') == '원본 "경로 숨김"'
+    for value in (
+        "https://example.com/a",
+        "http://example.com/a/b",
+        "시간 12:30",
+        "계획:실적 비율 1:2",
+    ):
+        assert _safe_display_text(value) == value
+        assert _contains_absolute_path(value) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "safe_fragment"),
+    [
+        (r"원본:D:\secret folder\private\drive.parquet!A2, 확인", "drive.parquet!A2"),
+        (r"source:\\server\share\private\unc.log!B3; 확인", "unc.log!B3"),
+        ("source:/home/user/private/posix!C4, 확인", "posix!C4"),
+    ],
+)
+def test_safe_text_redacts_colon_adjacent_local_paths(value, safe_fragment):
+    from app.reporting.xlsx_review import _contains_absolute_path, _safe_display_text
+
+    assert _contains_absolute_path(value) is True
+    safe = _safe_display_text(value)
+    assert safe_fragment in safe
+    assert _contains_absolute_path(safe) is False
 
 
 def test_validation_message_rows_expand_within_visual_bounds(tmp_path):
@@ -1308,6 +1333,82 @@ def test_validation_message_rows_expand_within_visual_bounds(tmp_path):
     assert required_lines <= line_capacity
 
 
+def test_validation_layout_uses_font_metrics_for_wide_latin_and_long_text(tmp_path):
+    from app.domain.validation import UnresolvedDestinationAlias
+    from app.reporting.xlsx_review import (
+        _validation_line_capacity,
+        _wrapped_line_count,
+        export_review_workbook,
+    )
+
+    assert _wrapped_line_count("W" * 200, 59, 9) >= 6
+    bundle = _report_bundle()
+    alias = "W" * 200
+    locator = "M" * 300
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(UnresolvedDestinationAlias(alias, locator),),
+    )
+    output = tmp_path / "wide-latin-validation.xlsx"
+    export_review_workbook(replace(bundle, validation_context=context), output)
+
+    checks = load_workbook(output)["검증 결과"]
+    message_width = checks.column_dimensions["C"].width
+    locator_width = checks.column_dimensions["F"].width
+    assert 59 < max(message_width, locator_width) <= 80
+    message_text = "".join(
+        str(checks.cell(row, 3).value or "").replace("\n", "")
+        for row in range(8, checks.max_row + 1)
+    )
+    locator_text = "".join(
+        str(checks.cell(row, 6).value or "").replace("\n", "")
+        for row in range(8, checks.max_row + 1)
+    )
+    assert alias in message_text
+    assert locator in message_text
+    assert locator in locator_text
+    for row in range(8, checks.max_row + 1):
+        height = checks.row_dimensions[row].height
+        font_size = checks.cell(row, 3).font.sz
+        assert font_size >= 9
+        assert 36 <= height <= 120
+        required = max(
+            _wrapped_line_count(
+                str(checks.cell(row, 3).value or ""), message_width, font_size
+            ),
+            _wrapped_line_count(
+                str(checks.cell(row, 6).value or ""), locator_width, font_size
+            ),
+        )
+        assert required <= _validation_line_capacity(height, font_size)
+
+
+def test_validation_layout_uses_continuation_rows_before_clipping(tmp_path):
+    from app.domain.validation import UnresolvedDestinationAlias
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    alias = "W" * 2_000
+    locator = "M" * 2_000
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(UnresolvedDestinationAlias(alias, locator),),
+    )
+    output = tmp_path / "continuation-validation.xlsx"
+    export_review_workbook(replace(bundle, validation_context=context), output)
+
+    checks = load_workbook(output)["검증 결과"]
+    assert checks.max_row > 8
+    assert any(
+        "계속" in str(checks.cell(row, 1).value or "")
+        for row in range(9, checks.max_row + 1)
+    )
+    assert all(
+        36 <= checks.row_dimensions[row].height <= 120
+        for row in range(8, checks.max_row + 1)
+    )
+
+
 def test_saved_workbook_validation_detects_path_leak_independently(
     tmp_path, monkeypatch
 ):
@@ -1317,7 +1418,7 @@ def test_saved_workbook_validation_detects_path_leak_independently(
     output = tmp_path / "leaked-path.xlsx"
     xlsx_review.export_review_workbook(bundle, output)
     workbook = load_workbook(output)
-    leaked = r"원본 D:\secret folder\private data\payload.parquet!A2, 확인"
+    leaked = r"원본:D:\secret folder\private data\payload.parquet!A2, 확인"
     workbook["검증 결과"]["C8"] = leaked
     workbook.save(output)
     original_sanitizer = xlsx_review._safe_display_text
@@ -1332,24 +1433,42 @@ def test_saved_workbook_validation_detects_path_leak_independently(
 
 
 @pytest.mark.parametrize(
-    ("locator", "secret_fragments"),
+    ("locator", "safe_fragment", "secret_fragments"),
     [
         (
             r'D:\secret folder\private data\source file.xlsx!A2',
+            "source file.xlsx!A2",
             (r"D:\secret folder", "private data"),
         ),
         (
             r"\\server\share name\secret folder\source file.xlsx!A2",
+            "source file.xlsx!A2",
             (r"\\server\share name", "secret folder"),
         ),
         (
             "/home/user folder/private data/source file.xlsx!A2",
+            "source file.xlsx!A2",
+            ("/home/user folder", "private data"),
+        ),
+        (
+            r"원본:D:\secret folder\private data\source.parquet!A2, 확인",
+            "source.parquet!A2",
+            (r"D:\secret folder", "private data"),
+        ),
+        (
+            r"source:\\server\share name\secret folder\source.log!A2; 확인",
+            "source.log!A2",
+            (r"\\server\share name", "secret folder"),
+        ),
+        (
+            "source:/home/user folder/private data/source file!A2, 확인",
+            "source file!A2",
             ("/home/user folder", "private data"),
         ),
     ],
 )
 def test_export_review_workbook_sanitizes_paths_in_all_visible_text(
-    tmp_path, locator, secret_fragments
+    tmp_path, locator, safe_fragment, secret_fragments
 ):
     from app.domain.validation import UnresolvedDestinationAlias
     from app.reporting.xlsx_review import export_review_workbook
@@ -1373,7 +1492,7 @@ def test_export_review_workbook_sanitizes_paths_in_all_visible_text(
     )
     for fragment in secret_fragments:
         assert fragment not in text
-    assert "source file.xlsx!A2" in text
+    assert safe_fragment in text
 
 
 @pytest.mark.parametrize(
