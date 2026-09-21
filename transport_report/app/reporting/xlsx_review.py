@@ -66,7 +66,9 @@ _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _ABSOLUTE_PATH_START = re.compile(
     r"(?i)(?<![\w/\\])(?:[A-Z]:[\\/]|\\\\(?=[^\\/\s])|//(?=[^/\s])|/(?=[^/\s]))"
 )
-_WEB_URL_PREFIX = re.compile(r"(?i)(?:https?|ftps?)://$")
+_WEB_URL_TOKEN = re.compile(
+    r"(?i)(?<![\w+.-])(?:https?|ftps?)://[^\s\"'<>,;\)\]\}]+"
+)
 _LOCATOR_SUFFIX = re.compile(r"(![A-Za-z0-9_$:.\-]+)$")
 _PATH_BOUNDARY = re.compile(r"[\r\n,;\)\]\}>]")
 _REDACTED_PATH = "경로 숨김"
@@ -1717,7 +1719,8 @@ def _safe_display_text(value: str) -> str:
     """Remove absolute directory components from embedded user-visible paths."""
     output: list[str] = []
     cursor = 0
-    while match := _next_absolute_path_match(value, cursor):
+    protected_spans = tuple(match.span() for match in _WEB_URL_TOKEN.finditer(value))
+    while match := _next_absolute_path_match(value, cursor, protected_spans):
         start = match.start()
         end = _absolute_path_end(value, start)
         path_text = value[start:end]
@@ -1730,18 +1733,46 @@ def _safe_display_text(value: str) -> str:
 
 def _contains_absolute_path(value: str) -> bool:
     """Detect an absolute path independently from its display replacement."""
-    return _next_absolute_path_match(value, 0) is not None
+    protected_spans = tuple(match.span() for match in _WEB_URL_TOKEN.finditer(value))
+    return _next_absolute_path_match(value, 0, protected_spans) is not None
 
 
-def _next_absolute_path_match(value: str, cursor: int):
+def _next_absolute_path_match(
+    value: str, cursor: int, protected_spans: tuple[tuple[int, int], ...]
+):
     while match := _ABSOLUTE_PATH_START.search(value, cursor):
-        if match.group(0).startswith(("/", "\\")) and _WEB_URL_PREFIX.search(
-            value[: match.end()]
+        protected_end = next(
+            (
+                end
+                for start, end in protected_spans
+                if start <= match.start() < end
+            ),
+            None,
+        )
+        if protected_end is not None:
+            cursor = protected_end
+            continue
+        if match.group(0) == "/" and not _is_credible_posix_path(
+            value[match.start() : _absolute_path_end(value, match.start())]
         ):
             cursor = match.end()
             continue
         return match
     return None
+
+
+def _is_credible_posix_path(candidate: str) -> bool:
+    clean = candidate.strip()
+    locator_match = _LOCATOR_SUFFIX.search(clean)
+    path = clean if locator_match is None else clean[: locator_match.start()]
+    components = [part.strip() for part in path.split("/")[1:] if part.strip()]
+    if len(components) >= 2:
+        return True
+    if len(components) != 1:
+        return False
+    return locator_match is not None or bool(
+        re.search(r"\.[^./\\\s]+$", components[0])
+    )
 
 
 def _absolute_path_end(value: str, start: int) -> int:

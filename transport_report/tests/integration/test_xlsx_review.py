@@ -1278,6 +1278,42 @@ def test_safe_text_preserves_plain_comparison_slash_and_masks_root_only_paths():
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.com/a/b?next=/c/d#frag/path",
+        "https://example.com?next=/a/b#section/path",
+        "ftp://example.com/a/b?next=/c/d#frag/path",
+        "ftps://example.com/a/b?next=/c/d#frag/path",
+        "계획 /실적 비교",
+        "계획/실적",
+        "/실적",
+    ],
+)
+def test_safe_text_preserves_full_urls_and_ordinary_slash_phrases(value):
+    from app.reporting.xlsx_review import _contains_absolute_path, _safe_display_text
+
+    assert _safe_display_text(value) == value
+    assert _contains_absolute_path(value) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "safe"),
+    [
+        ("/home/user/file", "file"),
+        ("/home/user folder/source.parquet", "source.parquet"),
+        ("source:/home/user/file", "source:file"),
+        ("/source.xlsx!A2", "source.xlsx!A2"),
+    ],
+)
+def test_safe_text_redacts_only_credible_posix_absolute_paths(value, safe):
+    from app.reporting.xlsx_review import _contains_absolute_path, _safe_display_text
+
+    assert _contains_absolute_path(value) is True
+    assert _safe_display_text(value) == safe
+    assert _contains_absolute_path(safe) is False
+
+
+@pytest.mark.parametrize(
     ("value", "safe_fragment"),
     [
         (r"원본:D:\secret folder\private\drive.parquet!A2, 확인", "drive.parquet!A2"),
@@ -1433,6 +1469,42 @@ def test_saved_workbook_validation_detects_path_leak_independently(
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.com/a/b?next=/c/d#frag/path",
+        "https://example.com?next=/a/b#section/path",
+        "ftp://example.com/a/b?next=/c/d#frag/path",
+        "ftps://example.com/a/b?next=/c/d#frag/path",
+        "계획 /실적 비교",
+        "계획/실적",
+        "/실적",
+    ],
+)
+def test_export_review_workbook_preserves_urls_and_ordinary_slash_phrases(
+    tmp_path, value
+):
+    from app.domain.validation import UnresolvedDestinationAlias
+    from app.reporting.xlsx_review import export_review_workbook
+
+    bundle = _report_bundle()
+    context = replace(
+        bundle.validation_context,
+        unresolved_aliases=(UnresolvedDestinationAlias(value, value),),
+    )
+    output = tmp_path / "preserved-text.xlsx"
+    export_review_workbook(replace(bundle, validation_context=context), output)
+
+    text = "\n".join(
+        cell.value
+        for sheet in load_workbook(output).worksheets
+        for row in sheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str)
+    )
+    assert value in text
+
+
+@pytest.mark.parametrize(
     ("locator", "safe_fragment", "secret_fragments"),
     [
         (
@@ -1464,6 +1536,11 @@ def test_saved_workbook_validation_detects_path_leak_independently(
             "source:/home/user folder/private data/source file!A2, 확인",
             "source file!A2",
             ("/home/user folder", "private data"),
+        ),
+        (
+            "/source.xlsx!A2",
+            "source.xlsx!A2",
+            ("/source.xlsx!A2",),
         ),
     ],
 )
