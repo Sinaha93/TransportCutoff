@@ -892,21 +892,21 @@ git commit -m "feat: orchestrate validated report generation"
 - Create: `transport_report/tests/unit/test_launcher.py`
 - Create: `transport_report/README.md`
 
-- [ ] **Step 1: Write failing launcher tests**
+- [x] **Step 1: Write failing launcher tests**
 
 Test root discovery in source and PyInstaller modes, runtime directory creation, port selection, browser URL generation, and a second-launch result that opens the existing instance rather than starting another server.
 
-- [ ] **Step 2: Run the tests and verify failure**
+- [x] **Step 2: Run the tests and verify failure**
 
 Run: `python -m pytest tests/unit/test_launcher.py -v`
 
 Expected: FAIL because the launcher is missing.
 
-- [ ] **Step 3: Implement a localhost-only launcher**
+- [x] **Step 3: Implement a localhost-only launcher**
 
 Bind to `127.0.0.1`, choose port `8765` or the next free port, store the active URL and process ID under `runtime`, open the default browser, and expose a UI shutdown action protected by a per-run random token. Never bind to `0.0.0.0`.
 
-- [ ] **Step 4: Implement the PyInstaller one-folder build**
+- [x] **Step 4: Implement the PyInstaller one-folder build**
 
 `build_portable.ps1` must:
 
@@ -917,7 +917,7 @@ python -m PyInstaller --noconfirm --clean --onedir --name TransportReport app/la
 
 Then copy `web/templates`, `web/static`, database migrations, and `assets/report_template.pptx` into `dist/TransportReport`. Create empty `runtime/data`, `runtime/imports`, `runtime/backups`, and `runtime/outputs` directories.
 
-- [ ] **Step 5: Document the user workflow**
+- [x] **Step 5: Document the user workflow**
 
 README instructions must be limited to:
 
@@ -928,7 +928,7 @@ README instructions must be limited to:
 5. generate and open output files;
 6. use the backup button before moving to another PC.
 
-- [ ] **Step 6: Run launcher tests and build**
+- [x] **Step 6: Run launcher tests and build**
 
 Run:
 
@@ -939,7 +939,7 @@ powershell -ExecutionPolicy Bypass -File tools/build_portable.ps1
 
 Expected: tests PASS and `dist/TransportReport/TransportReport.exe` exists.
 
-- [ ] **Step 7: Commit packaging**
+- [x] **Step 7: Commit packaging**
 
 ```powershell
 git add transport_report/app/launcher.py transport_report/tools/build_portable.ps1 transport_report/tests/unit/test_launcher.py transport_report/README.md
