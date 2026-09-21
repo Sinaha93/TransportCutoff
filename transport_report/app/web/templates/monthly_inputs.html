@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ month }} 월 입력</h1><p>빈칸은 미입력, 0은 실적 없음으로 저장됩니다. 계획 수량·비용은 함께 입력하거나 함께 비우세요. 모든 행과 매출이 한 번에 저장됩니다.</p>
+<p><a href="/months/{{ month }}/report-inputs">당월 비정규 실적·계획 매출 및 다음 달 계획 입력</a></p>
 <form method="post" action="/months/{{ month }}/inputs" data-zero-is-valid="true">
 {{ intent('save_inputs') }}
 <input type="hidden" name="monthly_revision" value="{{ monthly_revision }}">

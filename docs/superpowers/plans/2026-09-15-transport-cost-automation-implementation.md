@@ -1018,11 +1018,11 @@ The initial release ends with manual ERP quantity entry. A later upgrade adds th
 app/importers/erp_quantity_workbook.py
 app/repositories/item_destination_mappings.py
 web/templates/item_mappings.html
-db/migrations/006_item_destination_mapping.sql
+db/migrations/007_item_destination_mapping.sql
 tests/unit/test_erp_quantity_importer.py
 ```
 
-`ErpWorkbookQuantityProvider` will implement the existing `QuantityProvider` contract. It will parse item number and quantity from an ERP export, require every item number to map to one standard destination, aggregate quantities by destination and month, and present unmapped item numbers for user resolution before replacing manual quantities. Existing databases will be upgraded through migration `006` without losing master data, groups, reports, or history.
+`ErpWorkbookQuantityProvider` will implement the existing `QuantityProvider` contract. It will parse item number and quantity from an ERP export, require every item number to map to one standard destination, aggregate quantities by destination and month, and present unmapped item numbers for user resolution before replacing manual quantities. Existing databases will be upgraded through migration `007` without losing master data, groups, reports, or history. Migration `006` is used for canonical persisted report supplemental inputs.
 
 ## Verification summary
 

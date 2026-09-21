@@ -8,7 +8,7 @@
 
 - Add failing tests for fresh migration, populated upgrade, eligible-status backfill, row preservation, strict boolean/index enforcement, and transactional rollback.
 - Add `005_import_batch_selection.sql` with the column, deterministic backfill, and partial unique index.
-- Move the documented future ERP item-mapping migration from 005 to 006.
+- Move the documented future ERP item-mapping migration from 005 to 007 (006 is now allocated to persisted report supplemental inputs).
 
 ## Task 2: Repository lifecycle
 

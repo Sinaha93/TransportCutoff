@@ -170,7 +170,7 @@ def test_import_batch_selection_upgrade_backfills_latest_eligible_and_preserves_
     assert [row[3] for row in batches] == [0, 1, 0, 0, 1]
     assert batches[1][2] == "Unknown destination alias: 미등록"
     assert tuple(entry) == (batch_ids[1], "미등록", 1000)
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
 
 
 def test_failed_import_batch_selection_migration_rolls_back_column_and_version(
@@ -245,7 +245,7 @@ def test_month_lock_migration_is_versioned_and_upgrades_an_existing_database(tmp
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             )
         }
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert {
         "report_month",
         "is_locked",
@@ -381,7 +381,7 @@ def test_transport_source_alias_migration_preserves_known_legacy_state(tmp_path)
                 "UPDATE transport_entries SET cost_won = cost_won + 1 "
                 "WHERE source_row = 3"
             )
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert tuple(rows[0]) == (destination_id, None, None, None)
     assert tuple(rows[1]) == (None, "Legacy Unknown", "Legacy Unknown", None)
     assert tuple(rows[2]) == (destination_id, "   ", None, None)
@@ -832,7 +832,7 @@ def test_migrations_are_repeatable(tmp_path):
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5, 6]
 
 
 def test_migrate_rejects_schema_versions_newer_than_bundled_migrations(tmp_path):
@@ -1496,7 +1496,7 @@ def test_concurrent_migrate_calls_do_not_reapply_versions(tmp_path, monkeypatch)
         ).fetchall()
     finally:
         connection.close()
-    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5, 6]
 
 
 def _schema_objects(db):

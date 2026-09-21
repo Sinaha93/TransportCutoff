@@ -383,3 +383,5 @@ def register_web(app: FastAPI) -> None:
     for error_type in (FormError, MasterDataError, MonthlyInputError, LegacyMigrationError, sqlite3.IntegrityError):
         app.add_exception_handler(error_type, handle_error)
     app.include_router(router)
+    from app.web.report_input_routes import router as report_input_router
+    app.include_router(report_input_router)
