@@ -12,10 +12,11 @@ from datetime import date, datetime
 from decimal import Decimal
 import math
 import os
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 import re
 import tempfile
 from typing import Literal
+import unicodedata
 from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
@@ -57,12 +58,14 @@ ERROR_TOKENS = {
 }
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _ABSOLUTE_PATH_START = re.compile(
-    r"(?i)(?<![\w:/])(?:[A-Z]:[\\/]|\\\\|//|/(?=[^/\s]))"
+    r"(?i)(?<![\w:/\\])(?:[A-Z]:[\\/]|\\\\(?=[^\\/\s])|//(?=[^/\s])|/(?=[^/\s]))"
 )
-_PATH_FILE_END = re.compile(
-    r"(?i)\.(?:xlsx?|xlsm|csv|tsv|pptx?|docx?|pdf|txt|json|db|sqlite)"
-    r"(?:![A-Za-z0-9_$:.\-]+)?"
-)
+_LOCATOR_SUFFIX = re.compile(r"(![A-Za-z0-9_$:.\-]+)$")
+_PATH_BOUNDARY = re.compile(r"[\r\n,;\)\]\}>]")
+_REDACTED_PATH = "경로 숨김"
+_VALIDATION_FONT_SIZE = 9
+_VALIDATION_MESSAGE_WIDTH = 59
+_VALIDATION_LOCATOR_WIDTH = 59
 
 _NAVY = "17365D"
 _BLUE = "D9EAF7"
@@ -647,7 +650,10 @@ def _write_validation(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
             _fill_range(sheet, row_number, 1, 6, color)
             for column in range(1, 7):
                 sheet.cell(row_number, column).font = Font(
-                    name=FONT_NAME, color=text, bold=column in (1, 2)
+                    name=FONT_NAME,
+                    size=_VALIDATION_FONT_SIZE,
+                    color=text,
+                    bold=column in (1, 2),
                 )
             sheet.cell(row_number, 3).alignment = Alignment(
                 horizontal="left", vertical="top", wrap_text=True
@@ -660,11 +666,20 @@ def _write_validation(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
                     horizontal="center", vertical="center"
                 )
             wrapped_lines = max(
-                _wrapped_line_count(str(values[2]), 45),
-                _wrapped_line_count("" if values[5] is None else str(values[5]), 26),
+                _wrapped_line_count(
+                    str(values[2]),
+                    _VALIDATION_MESSAGE_WIDTH,
+                    _VALIDATION_FONT_SIZE,
+                ),
+                _wrapped_line_count(
+                    "" if values[5] is None else str(values[5]),
+                    _VALIDATION_LOCATOR_WIDTH,
+                    _VALIDATION_FONT_SIZE,
+                ),
             )
             sheet.row_dimensions[row_number].height = min(
-                120, max(36, 18 * wrapped_lines)
+                120,
+                max(36, 6 + (_VALIDATION_FONT_SIZE * 1.5 * wrapped_lines)),
             )
         last_row = 7 + len(bundle.validation.issues)
     else:
@@ -672,7 +687,17 @@ def _write_validation(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
         last_row = 8
     sheet.auto_filter.ref = f"A7:F{last_row}"
     sheet.freeze_panes = "A8"
-    _set_widths(sheet, {"A": 32, "B": 12, "C": 55, "D": 20, "E": 12, "F": 32})
+    _set_widths(
+        sheet,
+        {
+            "A": 32,
+            "B": 12,
+            "C": _VALIDATION_MESSAGE_WIDTH,
+            "D": 20,
+            "E": 12,
+            "F": _VALIDATION_LOCATOR_WIDTH,
+        },
+    )
 
 
 def _write_masters(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
@@ -1415,7 +1440,7 @@ def _validate_saved_workbook(path: Path, bundle: ReviewWorkbookReport) -> None:
                             f"{sheet.title}!{cell.coordinate} contains an Excel error"
                         )
                     if isinstance(cell.value, str):
-                        if _safe_display_text(cell.value) != cell.value:
+                        if _contains_absolute_path(cell.value):
                             raise ValueError(
                                 f"{sheet.title}!{cell.coordinate} exposes an absolute path"
                             )
@@ -1635,35 +1660,48 @@ def _safe_display_text(value: str) -> str:
     while match := _ABSOLUTE_PATH_START.search(value, cursor):
         start = match.start()
         end = _absolute_path_end(value, start)
-        if end is None:
-            output.append(value[cursor : match.end()])
-            cursor = match.end()
-            continue
         path_text = value[start:end]
-        if re.match(r"(?i)^[A-Z]:[\\/]", path_text) or path_text.startswith(
-            ("\\\\", "//")
-        ):
-            basename = PureWindowsPath(path_text.replace("/", "\\")).name
-        else:
-            basename = PurePosixPath(path_text).name
+        basename = _safe_path_basename(path_text)
         output.extend((value[cursor:start], basename))
         cursor = end
     output.append(value[cursor:])
     return "".join(output)
 
 
-def _absolute_path_end(value: str, start: int) -> int | None:
-    """Find an embedded path boundary without treating spaces as separators."""
+def _contains_absolute_path(value: str) -> bool:
+    """Detect an absolute path independently from its display replacement."""
+    return _ABSOLUTE_PATH_START.search(value) is not None
+
+
+def _absolute_path_end(value: str, start: int) -> int:
+    """Find a strong embedded-path boundary without treating spaces as separators."""
     if start > 0 and value[start - 1] in {'"', "'"}:
         quote = value[start - 1]
         closing = value.find(quote, start)
         if closing >= 0:
             return closing
-    file_end = _PATH_FILE_END.search(value, start)
-    if file_end is not None:
-        return file_end.end()
-    fallback = re.search(r"[\s,;\)\]\}<>]", value[start:])
-    return len(value) if fallback is None else start + fallback.start()
+    boundary = _PATH_BOUNDARY.search(value, start)
+    return len(value) if boundary is None else boundary.start()
+
+
+def _safe_path_basename(path_text: str) -> str:
+    clean = path_text.strip()
+    locator_match = _LOCATOR_SUFFIX.search(clean)
+    locator = "" if locator_match is None else locator_match.group(1)
+    path = clean if locator_match is None else clean[: locator_match.start()]
+    windows_path = bool(re.match(r"(?i)^[A-Z]:[\\/]", path)) or path.startswith(
+        ("\\\\", "//")
+    )
+    parts = [part for part in re.split(r"[\\/]", path) if part]
+    if windows_path and path.startswith(("\\\\", "//")) and len(parts) <= 2:
+        basename = ""
+    elif windows_path and len(parts) <= 1:
+        basename = ""
+    else:
+        basename = "" if not parts else parts[-1].strip()
+    if basename in {"", ".", ".."}:
+        basename = _REDACTED_PATH
+    return f"{basename}{locator}"
 
 
 def _yes_no(value: bool) -> str:
@@ -1692,9 +1730,25 @@ def _average_status(complete: bool, missing_months: tuple[str, ...]) -> str:
     return f"자료 부족 ({', '.join(missing_months)})"
 
 
-def _wrapped_line_count(value: str, characters_per_line: int) -> int:
+def _wrapped_line_count(
+    value: str, column_width: float, font_size: float = 10
+) -> int:
+    units_per_line = max(1, int((column_width - 2) * 9 / font_size))
     return sum(
-        max(1, math.ceil(len(line) / characters_per_line))
+        max(
+            1,
+            math.ceil(
+                sum(
+                    4
+                    if character == "\t"
+                    else 2
+                    if unicodedata.east_asian_width(character) in {"W", "F", "A"}
+                    else 1
+                    for character in line
+                )
+                / units_per_line
+            ),
+        )
         for line in value.splitlines() or ("",)
     )
 
