@@ -1,4 +1,4 @@
-"""Local HTML forms. Rendering/export orchestration is intentionally unavailable."""
+"""Local HTML forms and server-validated report generation."""
 from __future__ import annotations
 
 import re
@@ -9,11 +9,13 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.datastructures import FormData
 
 from app.db import Database
+from app.config import RuntimePaths
+from app.services.report_service import ReportGenerationError, ReportService
 from app.domain.calculations import (
     MAX_QUANTITY_EA, MAX_QUANTITY_SCALE, MAX_SQLITE_INTEGER,
     HistoricalValueKind, calculate_destination, calculate_group,
@@ -189,6 +191,13 @@ def report_preview_data(db: Database, month: str) -> dict:
         issues.append(ValidationIssue("NO_DESTINATIONS", "error", "활성 납품처를 등록하세요."))
     groups = [(group, calculate_group(calculations, masters.group_members(group.id), group_id=group.id)) for group in masters.list_groups() if group.active]
     required = [d for d in active if d.required_for_report]
+    # The generation gate is the same snapshot preflight used by the exporter.
+    # Partial preview rows remain available while users correct missing inputs.
+    try:
+        bundle, _ = ReportService(db, RuntimePaths.from_root(Path(__file__).resolve().parents[2])).prepare(month)
+        issues = list(bundle.validation.issues)
+    except ReportGenerationError as error:
+        issues = list(error.issues)
     return {"rows": rows, "groups": groups, "total": calculate_total(calculations, active), "issues": issues, "can_generate": ValidationResult(tuple(issues)).can_generate,
             "batches": batches, "plan_count": sum(d.id in plans for d in required), "actual_count": sum(d.id in actuals for d in required), "required_count": len(required), "sales": sales, "historical": historical}
 
@@ -209,9 +218,12 @@ async def generate(request: Request, month: str, kind: str):
     require_month(month)
     if kind not in {"excel", "ppt"}:
         raise FormError("지원하지 않는 생성 종류입니다.")
-    if not report_preview_data(database(request), month)["can_generate"]:
-        raise FormError("검증 차단 항목을 해결한 후 생성할 수 있습니다.", 409)
-    raise FormError("생성 기능 준비 중입니다. Excel/PPT 생성 서비스가 아직 연결되지 않았습니다.", 503)
+    try:
+        result = ReportService(database(request), request.app.state.runtime_paths).generate(month)
+    except ReportGenerationError as error:
+        raise FormError(str(error), 409) from error
+    filename = "review.xlsx" if kind == "excel" else "report.pptx"
+    return FileResponse(result.directory / filename, filename=f"{month}-{filename}")
 
 
 @router.get("/destinations")

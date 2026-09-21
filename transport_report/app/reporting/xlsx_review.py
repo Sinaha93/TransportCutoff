@@ -131,7 +131,7 @@ class OperationEvidence:
 
     record_kind: Literal["destination", "nonregular", "sales"]
     value_role: Literal["plan", "actual"]
-    input_kind: Literal["imported", "manual"]
+    input_kind: Literal["imported", "manual", "derived"]
     batch_id: int | None
     provenance_id: str
     report_month: str
@@ -147,8 +147,8 @@ class OperationEvidence:
             raise ValueError("record_kind must be destination, nonregular, or sales")
         if self.value_role not in {"plan", "actual"}:
             raise ValueError("value_role must be plan or actual")
-        if self.input_kind not in {"imported", "manual"}:
-            raise ValueError("input_kind must be imported or manual")
+        if self.input_kind not in {"imported", "manual", "derived"}:
+            raise ValueError("input_kind must be imported, manual, or derived")
         _text(self.source_locator, "source_locator")
         if self.input_kind == "imported":
             _positive_int(self.batch_id, "batch_id")
@@ -619,7 +619,7 @@ def _write_evidence(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
             sheet.cell(row_number, column).alignment = Alignment(
                 horizontal="center", vertical="center"
             )
-        fill = _BLUE if item.input_kind == "imported" else _YELLOW
+        fill = {"imported": _BLUE, "manual": _YELLOW, "derived": _CALCULATED}[item.input_kind]
         _fill_range(sheet, row_number, 1, 12, fill)
     last_row = header_row + len(bundle.operations)
     sheet.auto_filter.ref = f"A{header_row}:L{last_row}"
@@ -1548,7 +1548,7 @@ def _evidence_values(
 ) -> tuple[object, ...]:
     batch = batch_by_id.get(item.batch_id) if item.batch_id is not None else None
     return (
-        "가져오기" if item.input_kind == "imported" else "수기 입력",
+        {"imported": "가져오기", "manual": "수기 입력", "derived": "혼합 원천 집계"}[item.input_kind],
         {
             "destination": "납품처",
             "nonregular": "비정규",

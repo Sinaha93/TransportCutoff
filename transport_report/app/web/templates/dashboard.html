@@ -5,8 +5,8 @@
 <section id="import-status"><h2>2. 가져오기 상태</h2>{% for batch in batches %}<p>{{ batch.source_filename }} · {{ batch.status }}</p>{% else %}<p>선택된 운반비 가져오기 없음</p>{% endfor %}<a href="/imports/review">원본 드라이런 및 검토</a></section>
 <section id="input-status"><h2>3. 입력 완료 상태</h2><p>계획 {{ plan_count }} / {{ required_count }} · 실적 수량 {{ actual_count }} / {{ required_count }} · 매출 {{ '입력 완료' if sales else '미입력' }}</p><a href="/months/{{ month }}/inputs">월 입력 수정</a></section>
 <section id="validation-issues"><h2>4. 생성 차단 항목</h2><ul>{% for issue in issues %}<li>{{ issue.message }}{% if issue.source_locator %} <small>{{ issue.source_locator }}</small>{% endif %}</li>{% else %}<li>검증 차단 항목 없음</li>{% endfor %}</ul></section>
-<section id="generation-actions" data-can-generate="{{ 'true' if can_generate else 'false' }}"><h2>5. 보고 파일 생성</h2><p>생성 기능 준비 중 · Excel/PPT 생성 서비스 연결 후 사용할 수 있습니다.</p>{% if not can_generate %}<p>검증 차단 항목을 먼저 해결하세요.</p>{% endif %}
-<form method="post" action="/months/{{ month }}/generate/excel">{{ intent('generate') }}<button disabled aria-disabled="true">Excel 검토파일 생성</button></form>
-<form method="post" action="/months/{{ month }}/generate/ppt">{{ intent('generate') }}<button disabled aria-disabled="true">PPT 생성</button></form>
+<section id="generation-actions" data-can-generate="{{ 'true' if can_generate else 'false' }}"><h2>5. 보고 파일 생성</h2><p>생성할 때마다 Excel·PPT·차트 3개를 함께 검증해 실행별 출력 폴더에 저장하고, 선택한 파일을 다운로드합니다.</p><p><a href="/months/{{ month }}/report-inputs">매출·비정규 및 다음 달 계획 입력</a></p>{% if not can_generate %}<p>검증 차단 항목을 먼저 해결하세요.</p>{% endif %}
+<form method="post" action="/months/{{ month }}/generate/excel">{{ intent('generate') }}<button{% if not can_generate %} disabled aria-disabled="true"{% endif %}>Excel 검토파일 생성</button></form>
+<form method="post" action="/months/{{ month }}/generate/ppt">{{ intent('generate') }}<button{% if not can_generate %} disabled aria-disabled="true"{% endif %}>PPT 생성</button></form>
 </section>
 {% endblock %}

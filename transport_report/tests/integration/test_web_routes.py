@@ -97,7 +97,7 @@ def test_dashboard_order_missing_inputs_and_generation_gate(client):
         assert post(client, f"/months/2026-08/generate/{kind}", {"intent": "generate"}).status_code == 409
 
 
-def test_generation_explicitly_unavailable_even_with_no_validation_errors(client, monkeypatch):
+def test_generation_rechecks_server_gate_even_if_preview_claims_valid(client, monkeypatch):
     from app.web import routes
     original = routes.report_preview_data
     def valid(database, month):
@@ -107,9 +107,9 @@ def test_generation_explicitly_unavailable_even_with_no_validation_errors(client
     monkeypatch.setattr(routes, "report_preview_data", valid)
     response = client.get("/")
     assert 'data-can-generate="true"' in response.text
-    assert "생성 기능 준비 중" in response.text
-    assert re.search(r'<button[^>]+disabled[^>]*>PPT 생성', response.text)
-    assert post(client, "/months/2026-08/generate/ppt", {"intent": "generate"}).status_code == 503
+    assert "생성 기능 준비 중" not in response.text
+    assert not re.search(r'<button[^>]+disabled[^>]*>PPT 생성', response.text)
+    assert post(client, "/months/2026-08/generate/ppt", {"intent": "generate"}).status_code == 409
 
 
 def test_save_zero_then_blank_preserves_missing_semantics(client, masters, database):

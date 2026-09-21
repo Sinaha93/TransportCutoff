@@ -8,5 +8,5 @@
 </tbody></table></div>
 <p>월 매출: {{ sales.amount_won if sales else '미입력' }}원 · 확정일 {{ sales.confirmed_at if sales else '미입력' }}</p>
 <section><h2>이력 평균</h2><table><thead><tr><th>기간</th><th>수량</th><th>운반비</th></tr></thead><tbody>{% for key, label in [('three_month', '이전 3개월'), ('six_month', '이전 6개월'), ('twelve_month', '이전 12개월'), ('comparison_year', '전년도')] %}<tr><th>{{ label }}</th><td>{{ historical.quantity[key].value|value }}</td><td>{{ historical.cost[key].value|value }}</td></tr>{% endfor %}</tbody></table></section>
-<section><h2>검증 항목</h2><ul>{% for issue in issues %}<li>{{ issue.message }}{% if issue.source_locator %} · {{ issue.source_locator }}{% endif %}</li>{% else %}<li>검증 차단 항목 없음</li>{% endfor %}</ul><p>생성 기능 준비 중입니다. 다음 달 계획·출력 메타데이터는 해당 기능 연결 전까지 미확인으로 표시됩니다.</p></section>
+<section><h2>검증 항목</h2><ul>{% for issue in issues %}<li>{{ issue.message }}{% if issue.source_locator %} · {{ issue.source_locator }}{% endif %}</li>{% else %}<li>검증 차단 항목 없음</li>{% endfor %}</ul><p><a href="/months/{{ month }}/report-inputs">매출·비정규 및 다음 달 계획 입력</a> · <a href="/">보고 파일 생성</a></p></section>
 {% endblock %}

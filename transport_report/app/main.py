@@ -12,12 +12,13 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def create_app(*, database: Database | None = None) -> FastAPI:
+def create_app(*, database: Database | None = None, paths: RuntimePaths | None = None) -> FastAPI:
     application = FastAPI()
+    application.state.runtime_paths = paths or RuntimePaths.from_root(Path(__file__).resolve().parents[1])
     # Startup is lazy for the module-level app so merely importing /health never
     # creates a database in an unexpected working directory.
     application.state.database = database or Database(
-        RuntimePaths.from_root(Path(__file__).resolve().parents[1]).database
+        application.state.runtime_paths.database
     )
     application.state.database_ready = False
     application.state.import_reviews = {}
