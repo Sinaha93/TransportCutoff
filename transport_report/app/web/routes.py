@@ -51,6 +51,10 @@ class FormError(ValueError):
 def database(request: Request) -> Database:
     if not request.app.state.database_ready:
         request.app.state.database.migrate()
+        try:
+            ReportService(request.app.state.database, request.app.state.runtime_paths).recover_pending()
+        except ReportGenerationError as error:
+            raise FormError(str(error), 409) from error
         request.app.state.database_ready = True
     return request.app.state.database
 
@@ -191,14 +195,31 @@ def report_preview_data(db: Database, month: str) -> dict:
         issues.append(ValidationIssue("NO_DESTINATIONS", "error", "활성 납품처를 등록하세요."))
     groups = [(group, calculate_group(calculations, masters.group_members(group.id), group_id=group.id)) for group in masters.list_groups() if group.active]
     required = [d for d in active if d.required_for_report]
+    total = calculate_total(calculations, active)
     # The generation gate is the same snapshot preflight used by the exporter.
     # Partial preview rows remain available while users correct missing inputs.
     try:
         bundle, _ = ReportService(db, RuntimePaths.from_root(Path(__file__).resolve().parents[2])).prepare(month)
         issues = list(bundle.validation.issues)
+        by_id = {d.id: d for d in bundle.destinations}
+        group_by_id = {g.id: g for g in bundle.groups}
+        rows, groups = [], []
+        for row in bundle.report.rows:
+            if row is None:
+                continue
+            result = row.calculation
+            if getattr(result, "destination_id", None) is not None:
+                rows.append({"destination": by_id[result.destination_id], "result": result, "actual_quantity": result.actual_quantity, "actual_cost": result.actual_cost_won})
+            else:
+                groups.append((group_by_id[result.group_id], result))
+        total = bundle.report.total.calculation
+        historical = {
+            "quantity": historical_averages(month, bundle.report.total.quantity_by_month),
+            "cost": historical_averages(month, bundle.report.total.cost_won_by_month, value_kind=HistoricalValueKind.MONEY),
+        }
     except ReportGenerationError as error:
         issues = list(error.issues)
-    return {"rows": rows, "groups": groups, "total": calculate_total(calculations, active), "issues": issues, "can_generate": ValidationResult(tuple(issues)).can_generate,
+    return {"rows": rows, "groups": groups, "total": total, "issues": issues, "can_generate": ValidationResult(tuple(issues)).can_generate,
             "batches": batches, "plan_count": sum(d.id in plans for d in required), "actual_count": sum(d.id in actuals for d in required), "required_count": len(required), "sales": sales, "historical": historical}
 
 

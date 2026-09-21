@@ -120,7 +120,17 @@ class BackupService:
                 # Hard-link publication is atomic and refuses any existing name
                 # on Windows and POSIX; source and target are siblings.
                 try:
-                    os.link(temporary, final)
+                    try:
+                        os.link(temporary, final)
+                    except FileExistsError:
+                        raise
+                    except OSError:
+                        if os.name != "nt":
+                            raise
+                        # Windows rename refuses existing targets and publishes
+                        # the complete sibling file atomically, including on
+                        # exFAT/SMB volumes without hard-link support.
+                        os.rename(temporary, final)
                     return final
                 except FileExistsError:
                     index += 1

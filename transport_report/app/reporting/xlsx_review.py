@@ -857,6 +857,8 @@ def _write_masters(sheet: Worksheet, bundle: ReviewWorkbookReport) -> None:
 
 def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
     report = bundle.report
+    if report.nonregular.calculation.actual_cost_won is None:
+        raise ValueError("missing report input has no blocking validation issue")
     validate_ppt_report(report)
     # Force authoritative Task7 recomputation before any workbook/temp file exists.
     bundle.validation
@@ -978,7 +980,7 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
         )
     )
     try:
-        expected_total = calculate_total(direct_calculations, total_rules)
+        expected_total = calculate_total(direct_calculations, total_rules, nonregular=report.nonregular.calculation)
     except (TypeError, ValueError) as error:
         raise ValueError("total calculation does not match master provenance") from error
     if report.total.calculation != expected_total:
@@ -995,7 +997,7 @@ def _validate_report_identity(bundle: ReviewWorkbookReport) -> None:
         row.calculation.destination_id: row.calculation for row in next_rows
     }
     try:
-        expected_next_total = calculate_total(next_calculations, total_rules)
+        expected_next_total = calculate_total(next_calculations, total_rules, nonregular=report.next_month.nonregular.calculation)
     except (TypeError, ValueError) as error:
         raise ValueError(
             "next-month total calculation does not match master provenance"

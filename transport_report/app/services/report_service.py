@@ -4,12 +4,15 @@ The input revision hashes an immutable, canonical dump of every application
 input table (including master rules, selected batches, history and locks).
 Concurrent edits are allowed after snapshot capture and affect the next run.
 The audit retains that dump and the exact typed report model, not just a pointer
-to mutable rows. Files are published together, then audited in a short SQLite
-transaction; any raised failure removes only this run's unpublished files.
+to mutable rows. SQLite and directory rename cannot commit atomically together:
+a durable pending record owns staging/final paths before rendering. Recovery
+finishes a hash-verified published run or removes an unpublished interrupted run.
+A process-owned file lock prevents recovery from cleaning another live renderer.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -18,9 +21,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sqlite3
-import tempfile
 
 from PIL import Image
 from pptx import Presentation
@@ -117,6 +120,100 @@ class ReportService:
         return bundle, canonical_json(snapshot)
 
     def generate(self, month="2026-08", *, requested_run_id=None):
+        with self._generation_lock():
+            self._recover_pending()
+            return self._generate_locked(month, requested_run_id=requested_run_id)
+
+    @contextmanager
+    def _generation_lock(self):
+        # OS locks are released even after process termination. Keep this file
+        # outside outputs so it is never mistaken for a report deliverable.
+        self.paths.outputs.parent.mkdir(parents=True, exist_ok=True)
+        with (self.paths.outputs.parent / ".report-generation.lock").open("a+b") as lock:
+            if lock.tell() == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise ReportGenerationError((_issue("REPORT_GENERATION_BUSY", "다른 보고서 생성·복구가 진행 중입니다. 완료 후 다시 시도하세요."),)) from error
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def recover_pending(self):
+        """Reconcile interrupted runs at application startup, without rendering."""
+        with self.database.connection() as connection:
+            if connection.execute("SELECT 1 FROM report_runs WHERE status='pending' LIMIT 1").fetchone() is None:
+                return
+        with self._generation_lock():
+            self._recover_pending()
+
+    def _recover_pending(self):
+        with self.database.connection() as connection:
+            rows = connection.execute("SELECT * FROM report_runs WHERE status='pending' ORDER BY id").fetchall()
+        for row in rows:
+            try:
+                manifest = json.loads(row["output_hashes_json"])
+                temporary, final = self._pending_paths(row["report_month"], manifest)
+                if final.exists() and self._matches_manifest(final, manifest):
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+                    self._audit(row["id"])
+                else:
+                    # A remaining staging directory proves rename never
+                    # happened: a conflicting final directory is not ours.
+                    # An empty manifest also proves publication was never
+                    # possible (including death before staging was created).
+                    owned = (temporary,) if temporary.exists() else (final,) if manifest["files"] else ()
+                    for directory in owned:
+                        if directory.exists():
+                            shutil.rmtree(directory)
+                    self._discard_pending(row["id"])
+            except Exception as error:
+                raise ReportGenerationError((_issue("REPORT_RECOVERY_FAILED", "중단된 보고서 복구를 완료하지 못했습니다. 파일 사용 여부를 확인하고 다시 시작하세요."),)) from error
+
+    def _pending_paths(self, month, manifest):
+        parent = (self.paths.outputs / month).resolve()
+        root = self.paths.outputs.resolve()
+        if parent.parent != root or not re.fullmatch(r"[0-9]{4}-[0-9]{2}", month):
+            raise ValueError("invalid pending month")
+        paths = []
+        for key, pattern in (("temporary", r"\.run-[A-Za-z0-9_-]+"), ("final", r"run-[0-9]{8}-[0-9]{6}(?:-[0-9]{3,})?")):
+            relative = Path(manifest["publication"][key])
+            path = (root / relative).resolve()
+            if relative.is_absolute() or path.parent != parent or not re.fullmatch(pattern, path.name):
+                raise ValueError("invalid pending output path")
+            paths.append(path)
+        return tuple(paths)
+
+    def _matches_manifest(self, final, manifest):
+        required = {"quantity.png", "cost.png", "combined.png", "review.xlsx", "report.pptx"}
+        records = manifest["files"]
+        if len(records) != 5 or {p.name for p in final.iterdir()} != required:
+            return False
+        if {Path(r["path"]).name for r in records} != required:
+            return False
+        for record in records:
+            path = final / Path(record["path"]).name
+            if record["path"] != path.relative_to(self.paths.outputs.resolve()).as_posix():
+                return False
+            if path.stat().st_size != record["size"] or sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+                return False
+        return True
+
+    def _generate_locked(self, month, *, requested_run_id=None):
         stamp = self.clock()
         bundle, snapshot_json = self.prepare(month)
         model_json = canonical_json(bundle)
@@ -126,25 +223,43 @@ class ReportService:
             raise ReportGenerationError((_issue("INVALID_RUN_ID", "실행 이름 형식이 올바르지 않습니다. 보고서를 다시 생성하세요."),))
         parent = self.paths.outputs / month
         parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=".run-", dir=parent))
-        final = None
+        index = 0
+        final = parent / name
+        while final.exists():
+            if requested_run_id is not None:
+                raise ReportGenerationError((_issue("REPORT_RUN_EXISTS", "같은 실행 이름의 보고서가 이미 있습니다. 새 실행 이름으로 생성하세요."),))
+            index += 1
+            final = parent / f"{name}-{index:03}"
+        temporary = parent / (".run-" + secrets.token_hex(16))
+        run_id = None
+        published = False
+        temporary_created = False
+        manifest = {"format_version": 2, "files": [], "input_snapshot_json": snapshot_json, "model_json": model_json, "model_sha256": sha256(model_json.encode()).hexdigest(), "publication": {"temporary": temporary.relative_to(self.paths.outputs).as_posix(), "final": final.relative_to(self.paths.outputs).as_posix()}}
         try:
+            run_id = self._start_pending(month, revision, manifest, stamp)
+            temporary.mkdir()
+            temporary_created = True
             self._charts(bundle, temporary)
             self._xlsx(bundle, temporary)
             self._pptx(bundle, temporary)
             self._verify(bundle, temporary)
-            final = self._rename(temporary, parent, name, requested_run_id is not None)
-            files = [{"path": p.relative_to(self.paths.outputs).as_posix(), "sha256": sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size} for p in sorted(final.iterdir())]
-            manifest = {"format_version": 1, "files": files, "input_snapshot_json": snapshot_json, "model_json": model_json, "model_sha256": sha256(model_json.encode()).hexdigest()}
-            run_id = self._audit(month, revision, manifest, stamp)
+            manifest["files"] = [{"path": (final / p.name).relative_to(self.paths.outputs).as_posix(), "sha256": sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size} for p in sorted(temporary.iterdir())]
+            self._update_pending(run_id, manifest)
+            self._rename(temporary, parent, final.name, True)
+            published = True
+            self._audit(run_id)
             return ReportRun(run_id, final, revision)
         except Exception as error:
-            if final is not None:
-                shutil.rmtree(final)
+            try:
+                owned = (temporary, final) if published else (temporary,) if temporary_created else ()
+                for directory in owned:
+                    if directory.exists():
+                        shutil.rmtree(directory)
+                if run_id is not None:
+                    self._discard_pending(run_id)
+            except Exception as cleanup_error:
+                raise ReportGenerationError((_issue("REPORT_RECOVERY_REQUIRED", "보고서 생성이 중단되어 복구 기록을 남겼습니다. 파일·데이터베이스 사용 상태를 확인한 뒤 앱을 다시 시작하세요."),)) from cleanup_error
             raise ReportGenerationError((_issue("REPORT_GENERATION_FAILED", "보고서 생성을 완료하지 못했습니다. 저장 공간·파일 사용 여부를 확인하고 다시 생성하세요. 기존 보고서는 보존되었습니다."),)) from error
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
 
     def _charts(self, bundle, directory):
         for name, renderer in (("quantity", charts.render_quantity_chart), ("cost", charts.render_cost_chart), ("combined", charts.render_combined_chart)):
@@ -185,16 +300,30 @@ class ReportService:
                 raise FileExistsError("requested run already exists")
             index += 1
 
-    def _audit(self, month, revision, manifest, stamp):
+    def _start_pending(self, month, revision, manifest, stamp):
         with self.database.connection() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute("INSERT INTO report_runs(report_month,status,input_revision,output_hashes_json,created_at) VALUES (?,'completed',?,?,?)", (month, revision, canonical_json(manifest), stamp.isoformat())).lastrowid
+                row = connection.execute("INSERT INTO report_runs(report_month,status,input_revision,output_hashes_json,created_at) VALUES (?,'pending',?,?,?)", (month, revision, canonical_json(manifest), stamp.isoformat())).lastrowid
                 connection.commit()
                 return row
             except Exception:
                 connection.rollback()
                 raise
+
+    def _update_pending(self, run_id, manifest):
+        with self.database.connection() as connection, connection:
+            if connection.execute("UPDATE report_runs SET output_hashes_json=? WHERE id=? AND status='pending'", (canonical_json(manifest), run_id)).rowcount != 1:
+                raise ValueError("pending run is missing")
+
+    def _audit(self, run_id):
+        with self.database.connection() as connection, connection:
+            if connection.execute("UPDATE report_runs SET status='completed' WHERE id=? AND status='pending'", (run_id,)).rowcount != 1:
+                raise ValueError("pending run is missing")
+
+    def _discard_pending(self, run_id):
+        with self.database.connection() as connection, connection:
+            connection.execute("DELETE FROM report_runs WHERE id=? AND status='pending'", (run_id,))
 
     def _build(self, snapshot, created_on):
         month, next_month = "2026-08", "2026-09"
@@ -213,13 +342,13 @@ class ReportService:
         entries = [r for r in snapshot["transport_entries"] if r["import_batch_id"] in current_batches]
         entry_groups = {}
         for row in entries:
-            if row["destination_id"] is not None:
+            if row["destination_id"] is not None and row["transport_type"] == "regular":
                 entry_groups.setdefault((row["report_month"], row["destination_id"]), []).append(row)
         costs.update({key: sum(r["cost_won"] for r in rows) for key, rows in entry_groups.items()})
         aliases_by_source = {(a.source_type, a.raw_name): a.destination_id for a in aliases}
         unresolved = []
         for row in entries:
-            if row["report_month"] != month:
+            if row["report_month"] != month or row["transport_type"] != "regular":
                 continue
             batch = current_batches[row["import_batch_id"]]
             alias = row["source_alias"] or row["unresolved_alias"]
@@ -228,6 +357,7 @@ class ReportService:
         months = sorted({m for m, _ in plans} | {m for m, _ in quantities} | {m for m, _ in costs})
         calculations = {}
         totals = {}
+        nonregular = {}
         for m in months:
             by_destination = {}
             for d in active:
@@ -235,9 +365,38 @@ class ReportService:
                 q, c = quantities.get((m, d.id)), costs.get((m, d.id))
                 by_destination[d.id] = calculate_destination(_decimal(plan["quantity_ea_text"]) if plan else None, plan["cost_won"] if plan else None, q if c is not None else None, c if q is not None else None, destination_id=d.id)
             calculations[m] = by_destination
-            totals[m] = calculate_total(by_destination, active)
+            supplement = supplementary.get(m, {})
+            nonregular[m] = calculate_destination(
+                _decimal(supplement.get("nonregular_planned_quantity_text")),
+                supplement.get("nonregular_planned_cost_won"),
+                _decimal(supplement.get("nonregular_actual_quantity_text")) if m <= month else None,
+                supplement.get("nonregular_actual_cost_won") if m <= month else None,
+            )
+            totals[m] = calculate_total(by_destination, active, nonregular=nonregular[m])
         total_q = {m: t.actual_quantity for m, t in totals.items() if m <= month}
         total_c = {m: t.actual_cost_won for m, t in totals.items() if m <= month}
+        planned_q = {m: t.planned_quantity for m, t in totals.items() if m <= month}
+        planned_c = {m: t.planned_cost_won for m, t in totals.items() if m <= month}
+        # Legacy monthly rows are already the authoritative historical source,
+        # including their separate nonregular/miscellaneous records. Preserve
+        # that historical total; never require retroactive supplemental entry
+        # or add supplemental cost to an already complete legacy total.
+        required_ids = {d.id for d in active}
+        for historical_month in (m for m in months if m < month):
+            legacy = {r["destination_id"]: r["cost_won"] for r in snapshot["monthly_actual_costs"] if r["report_month"] == historical_month and r["source_type"] == "legacy_workbook"}
+            if legacy:
+                rules = tuple(d for d in destinations if d.id in required_ids or d.id in legacy)
+                # Cost-only aggregation uses the same Task6 adapter as legacy
+                # migration. These zero quantities are not reported inputs.
+                source_costs = {d.id: calculate_destination(None, None, Decimal(0) if d.id in legacy else None, legacy.get(d.id), destination_id=d.id) for d in rules}
+                total_c[historical_month] = calculate_total(source_costs, rules).actual_cost_won
+            if historical_month not in supplementary:
+                records = {destination_id: r for (m, destination_id), r in plans.items() if m == historical_month}
+                rules = tuple(d for d in destinations if d.id in required_ids or d.id in records)
+                source_plans = {d.id: calculate_destination(_decimal(records[d.id]["quantity_ea_text"]) if d.id in records else None, records[d.id]["cost_won"] if d.id in records else None, None, None, destination_id=d.id) for d in rules}
+                source_total = calculate_total(source_plans, rules)
+                planned_q[historical_month] = source_total.planned_quantity
+                planned_c[historical_month] = source_total.planned_cost_won
         batch_rows = sorted((r for r in current_batches.values() if r["report_month"] == month), key=lambda r: r["id"])
         sales_row = sales.get(month)
         context = ValidationContext(month, SalesInput(sales_row["amount_won"], sales_row["confirmed_at"], "월 매출 확정 입력") if sales_row else None, historical_averages(month, total_q).comparison_year, ReportMonthSources(month, month, month, month, month), tuple(unresolved), tuple(DestinationValidationInput(d.id, d.name, d.display_order, d.required_for_report, quantities.get((month, d.id)), NextMonthPlanInput(next_month, _decimal(plans[next_month, d.id]["quantity_ea_text"])) if (next_month, d.id) in plans else None) for d in active), tuple(ImportBatchInput(r["id"], month, r["source_type"], r["file_sha256"], _filename(r["source_filename"]), True) for r in batch_rows))
@@ -257,7 +416,7 @@ class ReportService:
                 required += ["nonregular_actual_quantity_text", "nonregular_actual_cost_won"]
             if any(supplement.get(field) is None for field in required):
                 issues.append(_issue("MISSING_REPORT_SUPPLEMENT", f"{m}: 매출 계획과 비정규 수량·운반비를 입력하세요. 해당 없음은 확인한 0을 입력하세요."))
-        for values, label, kind in ((total_q, "실적 수량", HistoricalValueKind.QUANTITY), (total_c, "실적 운반비", HistoricalValueKind.MONEY), ({m: t.planned_quantity for m, t in totals.items()}, "계획 수량", HistoricalValueKind.QUANTITY), ({m: t.planned_cost_won for m, t in totals.items()}, "계획 운반비", HistoricalValueKind.MONEY)):
+        for values, label, kind in ((total_q, "실적 수량", HistoricalValueKind.QUANTITY), (total_c, "실적 운반비", HistoricalValueKind.MONEY), (planned_q, "계획 수량", HistoricalValueKind.QUANTITY), (planned_c, "계획 운반비", HistoricalValueKind.MONEY)):
             history = historical_averages(month, values, value_kind=kind)
             periods = (history.twelve_month, history.comparison_year) if label.startswith("실적") else (history.twelve_month,)
             missing = sorted({m for period in periods for m in period.missing_months})
@@ -270,10 +429,7 @@ class ReportService:
         def total_row(m):
             return ReportRow("total", "합계", totals[m], total_q, total_c)
         def nonregular_row(m):
-            r = supplementary[m]
-            current = m == month
-            calc = calculate_destination(_decimal(r["nonregular_planned_quantity_text"]), r["nonregular_planned_cost_won"], _decimal(r["nonregular_actual_quantity_text"]) if current else None, r["nonregular_actual_cost_won"] if current else None)
-            return ReportRow("nonregular", "비정규 운반비", calc, {hm: _decimal(v["nonregular_actual_quantity_text"]) for hm, v in supplementary.items() if hm <= month}, {hm: v["nonregular_actual_cost_won"] for hm, v in supplementary.items() if hm <= month})
+            return ReportRow("nonregular", "비정규 운반비", nonregular[m], {hm: _decimal(v["nonregular_actual_quantity_text"]) for hm, v in supplementary.items() if hm <= month}, {hm: v["nonregular_actual_cost_won"] for hm, v in supplementary.items() if hm <= month})
         current_rows = [direct_row(d, month) for d in active]
         for g in groups:
             if not g.active:
@@ -283,7 +439,7 @@ class ReportService:
             current_rows.append(ReportRow(f"group:{g.id}", g.name, values[month], {m: v.actual_quantity for m, v in values.items()}, {m: v.actual_cost_won for m, v in values.items()}))
         current_rows.extend([None] * (14 - len(current_rows)))
         sales_history = {m: r["amount_won"] for m, r in sales.items() if m <= month}
-        chart = charts.ChartReport(month, {m: t.planned_quantity for m, t in totals.items() if m <= month}, total_q, {m: t.planned_cost_won for m, t in totals.items() if m <= month}, total_c)
+        chart = charts.ChartReport(month, planned_q, total_q, planned_c, total_c)
         report = PptReport(month, created_on, tuple(current_rows), nonregular_row(month), total_row(month), SalesReport(supplementary[month]["planned_sales_won"], sales_row["amount_won"], sales_history), PlanReport(next_month, tuple(direct_row(d, next_month) for d in active), nonregular_row(next_month), total_row(next_month), SalesReport(supplementary[next_month]["planned_sales_won"], None, sales_history)), chart)
         evidence_batches = tuple(ImportBatchEvidence(r["id"], f'batch:{r["id"]}', month, r["source_type"], _filename(r["source_filename"]), r["file_sha256"], datetime.fromisoformat(r["imported_at"])) for r in batch_rows)
         operations = []
@@ -308,6 +464,11 @@ class ReportService:
             operation("nonregular", "plan", m, None, report.nonregular.label, extra.planned_quantity, extra.planned_cost_won, "비정규 계획 입력")
             operation("sales", "plan", m, None, "매출액", None, period.sales.planned_won, "매출 계획 입력")
             if period is report:
-                operation("nonregular", "actual", m, None, report.nonregular.label, extra.actual_quantity, extra.actual_cost_won, "비정규 실적 입력")
+                raw_nonregular = [r for r in entries if r["report_month"] == m and r["transport_type"] == "nonregular"]
+                locator = "비정규 실적 확정 입력"
+                if raw_nonregular:
+                    locator += f" · 원천 비정규 {sum(r['cost_won'] for r in raw_nonregular):,}원(보고 합산 제외): "
+                    locator += ", ".join(f'{r["import_batch_id"]}:{r["source_sheet"]}!{r["source_row"]}' for r in raw_nonregular)
+                operation("nonregular", "actual", m, None, report.nonregular.label, extra.actual_quantity, extra.actual_cost_won, locator)
                 operation("sales", "actual", m, None, "매출액", None, report.sales.actual_won, "매출 확정 입력")
         return ReviewWorkbookData(report, context, destinations, aliases, groups, members, evidence_batches, tuple(operations))

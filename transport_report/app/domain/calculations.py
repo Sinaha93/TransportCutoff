@@ -425,6 +425,8 @@ def calculate_destination(
 def calculate_total(
     calculations: Mapping[int, DestinationCalculation],
     destinations: Iterable[Destination],
+    *,
+    nonregular: DestinationCalculation | None = None,
 ) -> DestinationCalculation:
     """Aggregate direct destinations using their editable total flags.
 
@@ -432,15 +434,28 @@ def calculate_total(
     and each key must match that result's destination identity. Rules select
     which validated entries contribute. Missing included values propagate as
     missing rather than becoming zero.
+    A separately confirmed nonregular row contributes cost exactly once, never
+    quantity. Omit it to retain the direct-destination total contract.
     """
     rules = tuple(destinations)
     _validate_destination_rules(rules)
     _validate_calculation_map(calculations)
+    if nonregular is not None and (
+        not isinstance(nonregular, DestinationResult)
+        or nonregular.destination_id is not None
+    ):
+        raise ValueError("nonregular must be an unbound canonical destination result")
+    def total_cost(field: str) -> int | None:
+        subtotal = _sum_metric(calculations, rules, field, "include_cost_total", 0)
+        if nonregular is None:
+            return subtotal
+        extra = getattr(nonregular, field)
+        return None if subtotal is None or extra is None else subtotal + extra
     return _make_calculation(
         _sum_metric(calculations, rules, "planned_quantity", "include_quantity_total", Decimal(0)),
-        _sum_metric(calculations, rules, "planned_cost_won", "include_cost_total", 0),
+        total_cost("planned_cost_won"),
         _sum_metric(calculations, rules, "actual_quantity", "include_quantity_total", Decimal(0)),
-        _sum_metric(calculations, rules, "actual_cost_won", "include_cost_total", 0),
+        total_cost("actual_cost_won"),
         kind=CalculationKind.GRAND_TOTAL,
         provenance=GrandTotalProvenance(
             tuple(item.id for item in rules),

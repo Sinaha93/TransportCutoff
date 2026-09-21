@@ -349,12 +349,14 @@ def validate_ppt_report(report):
     expected_current = calculate_total(
         {row.calculation.destination_id: row.calculation for row in current_direct},
         total_rules,
+        nonregular=report.nonregular.calculation,
     )
     if report.total.calculation != expected_current:
         raise ValueError('current total conflicts with destination values')
     expected_next = calculate_total(
         {row.calculation.destination_id: row.calculation for row in next_direct},
         total_rules,
+        nonregular=report.next_month.nonregular.calculation,
     )
     if report.next_month.total.calculation != expected_next:
         raise ValueError('next-month total conflicts with destination plans')

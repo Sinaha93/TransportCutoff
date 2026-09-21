@@ -393,3 +393,253 @@ def test_restore_accepts_sql_formatting_and_sqlite_statistics(prepared):
     finally:
         connection.close()
     assert service.restore(candidate, exclusive_access=True).pre_restore_backup.is_file()
+
+
+def test_nonregular_is_report_cost_once_and_never_destination_cost(prepared):
+    from decimal import Decimal
+    from openpyxl import load_workbook
+    from pptx import Presentation
+    module = service_module()
+    db, paths = prepared
+    with db.connection() as c:
+        c.execute("UPDATE transport_entries SET cost_won=2000000")
+        c.execute("UPDATE transport_entries SET cost_won=2475000 WHERE destination_id=1")
+        c.execute("INSERT INTO transport_entries(import_batch_id,report_month,destination_id,source_sheet,source_row,transport_day,transport_type,trip_count_text,cost_won,source_alias) VALUES (1,'2026-08',1,'용차',90,1,'nonregular','1',4510000,'원천01')")
+        c.execute("UPDATE report_supplemental_inputs SET nonregular_actual_quantity_text='123', nonregular_actual_cost_won=2880000 WHERE report_month='2026-08'")
+        c.commit()
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    bundle, snapshot = service.prepare()
+    assert sum(r.calculation.actual_cost_won for r in bundle.report.rows if r) == 24475000
+    assert bundle.report.nonregular.calculation.actual_cost_won == 2880000
+    assert bundle.report.total.calculation.actual_cost_won == 27355000
+    assert bundle.report.total.calculation.actual_quantity == Decimal(60000)
+    assert bundle.report.charts.actual_cost_won_by_month["2026-08"] == 27355000
+    assert any(r["transport_type"] == "nonregular" and r["cost_won"] == 4510000 for r in json.loads(snapshot)["transport_entries"])
+    assert all("용차!90" not in o.source_locator for o in bundle.operations if o.record_kind == "destination")
+    result = service.generate()
+    book = load_workbook(result.directory / "review.xlsx", data_only=True)
+    try:
+        assert any(cell.value == 27355000 for row in book["월간 종합"] for cell in row)
+    finally:
+        book.close()
+    ppt = Presentation(result.directory / "report.pptx")
+    table = next(s.table for s in ppt.slides[1].shapes if s.name == "report.monthly_table")
+    assert table.cell(17, 6).text == "27,355"
+    assert table.cell(16, 5).text == "2,880"
+    from app.main import create_app
+    from tests.integration.test_web_routes import WebClient
+    page = WebClient(create_app(database=db, paths=paths)).get("/months/2026-08/preview").text
+    assert "27355000" in page and "28985000" not in page
+
+
+def test_nonregular_missing_pair_blocks_generation(prepared):
+    module = service_module()
+    db, paths = prepared
+    with db.connection() as c:
+        c.execute("UPDATE report_supplemental_inputs SET nonregular_actual_quantity_text=NULL, nonregular_actual_cost_won=NULL WHERE report_month='2026-08'")
+        c.commit()
+    with pytest.raises(module.ReportGenerationError) as error:
+        module.ReportService(db, paths).generate()
+    assert "MISSING_REPORT_SUPPLEMENT" in {i.code for i in error.value.issues}
+    assert not list(paths.outputs.iterdir())
+
+
+def test_backup_without_hardlink_support_is_atomic_and_collision_safe(prepared, monkeypatch):
+    module = backup_module()
+    db, paths = prepared
+    monkeypatch.setattr(module.os, "link", lambda *args: (_ for _ in ()).throw(OSError(95, "hard links unsupported")))
+    service = module.BackupService(db, paths.backups, clock=lambda: NOW)
+    first = service.backup()
+    original = first.read_bytes()
+    second = service.backup()
+    assert first != second
+    assert first.read_bytes() == original
+    assert service._validate(second) == 6
+    assert set(paths.backups.iterdir()) == {first, second}
+
+
+class SimulatedTermination(BaseException):
+    pass
+
+
+def test_canonical_total_optional_nonregular_cost_preserves_quantity_and_missing_pair():
+    from decimal import Decimal
+    from app.domain.calculations import calculate_destination, calculate_total
+    from app.domain.models import Destination
+    rules = [Destination(1, "가상", 1, True, True, None, True, True, True)]
+    direct = {1: calculate_destination(Decimal(10), 100, Decimal(20), 200, destination_id=1)}
+    extra = calculate_destination(Decimal(999), 30, Decimal(888), 50)
+    total = calculate_total(direct, rules, nonregular=extra)
+    assert (total.planned_quantity, total.actual_quantity) == (Decimal(10), Decimal(20))
+    assert (total.planned_cost_won, total.actual_cost_won) == (130, 250)
+    assert calculate_total(direct, rules).actual_cost_won == 200
+    missing = calculate_destination(None, None, None, None)
+    assert calculate_total(direct, rules, nonregular=missing).actual_cost_won is None
+
+
+@pytest.mark.parametrize("boundary", ["render", "before_publish", "after_publish"])
+def test_terminated_run_has_durable_pending_state_and_recovers(prepared, monkeypatch, boundary):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    original_rename = service._rename
+    def interrupted_render(*args):
+        raise SimulatedTermination()
+    def interrupted_publish(*args):
+        if boundary == "after_publish":
+            original_rename(*args)
+        raise SimulatedTermination()
+    monkeypatch.setattr(service, "_charts" if boundary == "render" else "_rename", interrupted_render if boundary == "render" else interrupted_publish)
+    with pytest.raises(SimulatedTermination):
+        service.generate()
+    with db.connection() as c:
+        rows = c.execute("SELECT * FROM report_runs").fetchall()
+    assert len(rows) == 1 and rows[0]["status"] == "pending"
+    module.ReportService(db, paths).recover_pending()
+    with db.connection() as c:
+        rows = c.execute("SELECT * FROM report_runs").fetchall()
+    if boundary == "after_publish":
+        assert len(rows) == 1 and rows[0]["status"] == "completed"
+        assert len(list(paths.outputs.rglob("*.png"))) == 3
+    else:
+        assert rows == []
+        assert not list(paths.outputs.rglob("*.*"))
+
+
+def test_application_start_recovers_interrupted_publication(prepared, monkeypatch):
+    from app.main import create_app
+    from tests.integration.test_web_routes import WebClient
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    monkeypatch.setattr(service, "_audit", lambda *args: (_ for _ in ()).throw(SimulatedTermination()))
+    with pytest.raises(SimulatedTermination):
+        service.generate()
+    assert WebClient(create_app(database=db, paths=paths)).get("/").status_code == 200
+    with db.connection() as c:
+        assert c.execute("SELECT status FROM report_runs").fetchone()[0] == "completed"
+
+
+def test_pending_recovery_does_not_interrupt_live_generation(prepared, monkeypatch):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    def during_render(bundle, directory):
+        with pytest.raises(module.ReportGenerationError) as error:
+            module.ReportService(db, paths).recover_pending()
+        assert error.value.issues[0].code == "REPORT_GENERATION_BUSY"
+        assert directory.exists()
+        raise OSError("finish injected test")
+    monkeypatch.setattr(service, "_charts", during_render)
+    with pytest.raises(module.ReportGenerationError):
+        service.generate()
+    with db.connection() as c:
+        assert not c.execute("SELECT * FROM report_runs").fetchall()
+
+
+def test_pending_recovery_removes_damaged_published_run(prepared, monkeypatch):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    monkeypatch.setattr(service, "_audit", lambda *args: (_ for _ in ()).throw(SimulatedTermination()))
+    with pytest.raises(SimulatedTermination):
+        service.generate()
+    next(paths.outputs.rglob("*.png")).write_bytes(b"truncated")
+    module.ReportService(db, paths).recover_pending()
+    with db.connection() as c:
+        assert not c.execute("SELECT * FROM report_runs").fetchall()
+    assert not list(paths.outputs.rglob("*.*"))
+
+
+def test_nonregular_source_is_audit_evidence_without_destination_alias_gate(prepared):
+    module = service_module()
+    db, paths = prepared
+    with db.connection() as c:
+        c.execute("INSERT INTO transport_entries(import_batch_id,report_month,unresolved_alias,source_sheet,source_row,transport_day,transport_type,trip_count_text,cost_won,source_alias) VALUES (1,'2026-08','용차 원천','용차',90,1,'nonregular','1',4510000,'용차 원천')")
+        c.commit()
+    bundle, snapshot = module.ReportService(db, paths).prepare()
+    assert bundle.validation.can_generate
+    assert "용차 원천" in snapshot
+    nonregular = next(o for o in bundle.operations if o.record_kind == "nonregular" and o.value_role == "actual")
+    assert "4,510,000" in nonregular.source_locator and "보고 합산 제외" in nonregular.source_locator
+
+
+def test_pending_cleanup_database_failure_remains_recoverable(prepared, monkeypatch):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    monkeypatch.setattr(service, "_charts", lambda *args: (_ for _ in ()).throw(OSError("render failure")))
+    monkeypatch.setattr(service, "_discard_pending", lambda *args: (_ for _ in ()).throw(sqlite3.OperationalError("D:/private database busy")))
+    with pytest.raises(module.ReportGenerationError) as error:
+        service.generate()
+    assert "D:/private" not in str(error.value)
+    with db.connection() as c:
+        assert c.execute("SELECT status FROM report_runs").fetchone()[0] == "pending"
+    module.ReportService(db, paths).recover_pending()
+    with db.connection() as c:
+        assert not c.execute("SELECT * FROM report_runs").fetchall()
+
+
+def test_recovery_preserves_foreign_collision_directory_before_publish(prepared, monkeypatch):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    target = paths.outputs / "2026-08" / "run-20260902-101112"
+    def collision_before_publish(*args):
+        target.mkdir()
+        (target / "existing.txt").write_text("keep", encoding="utf-8")
+        raise SimulatedTermination()
+    monkeypatch.setattr(service, "_rename", collision_before_publish)
+    with pytest.raises(SimulatedTermination):
+        service.generate()
+    module.ReportService(db, paths).recover_pending()
+    assert (target / "existing.txt").read_text(encoding="utf-8") == "keep"
+    with db.connection() as c:
+        assert not c.execute("SELECT * FROM report_runs").fetchall()
+
+
+def test_termination_before_pending_commit_creates_no_staging_directory(prepared, monkeypatch):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths)
+    monkeypatch.setattr(service, "_start_pending", lambda *args: (_ for _ in ()).throw(SimulatedTermination()))
+    with pytest.raises(SimulatedTermination):
+        service.generate()
+    assert not list(paths.outputs.rglob(".run-*"))
+
+
+def test_recovery_before_staging_creation_preserves_foreign_directory(prepared, monkeypatch):
+    module = service_module()
+    db, paths = prepared
+    service = module.ReportService(db, paths, clock=lambda: NOW)
+    original = service._start_pending
+    target = paths.outputs / "2026-08" / "run-20260902-101112"
+    def interrupted_start(*args):
+        original(*args)
+        target.mkdir()
+        (target / "existing.txt").write_text("keep", encoding="utf-8")
+        raise SimulatedTermination()
+    monkeypatch.setattr(service, "_start_pending", interrupted_start)
+    with pytest.raises(SimulatedTermination):
+        service.generate()
+    module.ReportService(db, paths).recover_pending()
+    assert (target / "existing.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_legacy_cost_history_does_not_require_new_historical_supplemental_inputs(prepared):
+    module = service_module()
+    db, paths = prepared
+    with db.connection() as c:
+        c.execute("INSERT INTO destinations(id,name,display_order,active,required_for_report,include_quantity_total) VALUES (13,'과거 비정규',13,0,0,0)")
+        c.execute("UPDATE monthly_actual_costs SET source_type='legacy_workbook' WHERE report_month<'2026-08'")
+        months = [r[0] for r in c.execute("SELECT DISTINCT report_month FROM monthly_actual_costs WHERE report_month<'2026-08'")]
+        for month in months:
+            c.execute("INSERT INTO monthly_actual_costs(report_month,destination_id,cost_won,source_type) VALUES (?,13,300000,'legacy_workbook')", (month,))
+            c.execute("INSERT INTO monthly_plans(report_month,destination_id,quantity_ea_text,cost_won) VALUES (?,13,'0',200000)", (month,))
+        c.execute("DELETE FROM report_supplemental_inputs WHERE report_month<'2026-08'")
+        c.commit()
+    bundle, _ = module.ReportService(db, paths).prepare()
+    assert bundle.validation.can_generate
+    assert bundle.report.charts.actual_cost_won_by_month["2026-07"] == 25500000
+    assert bundle.report.charts.planned_cost_won_by_month["2026-07"] == 24200000
+    assert bundle.report.charts.actual_cost_won_by_month["2026-08"] == 25200000
