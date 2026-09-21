@@ -12,11 +12,40 @@ from contextlib import closing
 from datetime import datetime
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import tempfile
 
 from app.db import Database, _sql_statements
+
+
+_SQL_TOKEN = re.compile(
+    r"""'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]"""
+    r"|--[^\r\n]*|/\*[\s\S]*?\*/|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]"
+)
+
+
+def _application_schema(connection):
+    """Compare schema definitions without root pages, statistics, or formatting.
+
+    Table SQL contains CHECK/UNIQUE/FK constraints omitted by table_info.
+    Explicit indexes, triggers and views must also match the bundled schema.
+    sqlite_* objects are engine-owned (automatic indexes/statistics/sequence).
+    Preserve quoted text verbatim: whitespace/case inside a CHECK literal or
+    trigger error message is part of the schema, not SQL formatting.
+    """
+    return {
+        (kind, name, table): tuple(
+            token if token[0] in "'\"`[" else token.lower()
+            for token in _SQL_TOKEN.findall(sql or "")
+            if not token.startswith(("--", "/*"))
+        )
+        for kind, name, table, sql in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT GLOB 'sqlite_*'"
+        )
+    }
 
 
 class BackupError(ValueError):
@@ -53,11 +82,8 @@ class BackupService:
                 for _, file in migrations:
                     for statement in _sql_statements(file.read_text(encoding="utf-8")):
                         expected.execute(statement)
-                tables = {r[0] for r in expected.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                for table in tables:
-                    query = 'PRAGMA table_info("' + table.replace('"', '""') + '")'
-                    if connection.execute(query).fetchall() != expected.execute(query).fetchall():
-                        raise BackupError("백업에 필요한 앱 테이블·열이 없습니다. 이 앱에서 만든 백업을 선택하세요.")
+                if _application_schema(connection) != _application_schema(expected):
+                    raise BackupError("백업의 앱 스키마(테이블·제약·인덱스·트리거)가 현재 앱과 다릅니다. 이 앱에서 만든 변경되지 않은 정상 백업을 선택하세요.")
                 return migrations[-1][0]
             finally:
                 connection.close()

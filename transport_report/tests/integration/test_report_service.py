@@ -342,3 +342,54 @@ def test_failed_backup_closes_all_connections_and_removes_temporary(prepared, mo
         module.BackupService(db, paths.backups).backup()
     assert set(closed) == set(opened)
     assert not list(paths.backups.iterdir())
+
+
+@pytest.mark.parametrize("statements", [
+    ["DROP TRIGGER report_supplemental_inputs_reject_locked_update"],
+    ["DROP INDEX uq_import_batches_current_month_source"],
+    ["DROP INDEX uq_import_batches_current_month_source",
+     "CREATE INDEX uq_import_batches_current_month_source ON import_batches(report_month, source_type) WHERE is_current = 1"],
+    ["DROP TRIGGER report_supplemental_inputs_reject_locked_update",
+     "CREATE TRIGGER report_supplemental_inputs_reject_locked_update BEFORE UPDATE ON report_supplemental_inputs WHEN 0 BEGIN SELECT RAISE(ABORT, 'report month locked'); END"],
+    ["PRAGMA writable_schema=ON",
+     "UPDATE sqlite_master SET sql=replace(sql, 'planned_sales_won >= 0', 'planned_sales_won >= -1') WHERE type='table' AND name='report_supplemental_inputs'",
+     "PRAGMA writable_schema=OFF"],
+    ["CREATE INDEX extra_sales_index ON monthly_sales(amount_won)"],
+    ["CREATE VIEW extra_sales_view AS SELECT * FROM monthly_sales"],
+], ids=["missing-lock-trigger", "missing-unique-index", "weakened-index", "weakened-lock-trigger", "weakened-table-check", "unexpected-index", "unexpected-view"])
+def test_restore_rejects_changed_application_schema_before_touching_live(prepared, statements):
+    module = backup_module()
+    db, paths = prepared
+    service = module.BackupService(db, paths.backups, clock=lambda: NOW)
+    candidate = service.backup()
+    connection = sqlite3.connect(candidate)
+    try:
+        for statement in statements:
+            connection.execute(statement)
+        connection.commit()
+    finally:
+        connection.close()
+    before = db.path.read_bytes()
+    backups_before = set(paths.backups.iterdir())
+    with pytest.raises(module.BackupError, match="스키마"):
+        service.restore(candidate, exclusive_access=True)
+    assert db.path.read_bytes() == before
+    assert set(paths.backups.iterdir()) == backups_before
+
+
+def test_restore_accepts_sql_formatting_and_sqlite_statistics(prepared):
+    module = backup_module()
+    db, paths = prepared
+    service = module.BackupService(db, paths.backups, clock=lambda: NOW)
+    candidate = service.backup()
+    connection = sqlite3.connect(candidate)
+    try:
+        original = connection.execute("SELECT sql FROM sqlite_master WHERE name='report_supplemental_inputs_reject_locked_update'").fetchone()[0]
+        connection.execute("DROP TRIGGER report_supplemental_inputs_reject_locked_update")
+        connection.execute(original.replace("CREATE TRIGGER", "create /* formatting only */ trigger").replace("BEFORE UPDATE", "before\n\tupdate"))
+        connection.execute("ANALYZE")
+        connection.commit()
+        assert connection.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'").fetchone()
+    finally:
+        connection.close()
+    assert service.restore(candidate, exclusive_access=True).pre_restore_backup.is_file()
