@@ -1282,8 +1282,15 @@ def test_safe_text_preserves_plain_comparison_slash_and_masks_root_only_paths():
     [
         "https://example.com/a/b?next=/c/d#frag/path",
         "https://example.com?next=/a/b#section/path",
+        "https://example.com/a;b=/c/d#frag/path",
+        "https://example.com/a(b)/c?next=/d/e#f/g",
         "ftp://example.com/a/b?next=/c/d#frag/path",
+        "ftp://example.com/a,b=/c/d",
         "ftps://example.com/a/b?next=/c/d#frag/path",
+        "(https://example.com/a;b=/c/d#frag/path),.",
+        "참조,https://example.com/a(b)/c?next=/d/e#f/g,완료.",
+        "(ftp://example.com/a,b=/c/d).",
+        ".https://example.com/a;b=/c/d#frag/path.",
         "계획 /실적 비교",
         "계획/실적",
         "/실적",
@@ -1294,6 +1301,31 @@ def test_safe_text_preserves_full_urls_and_ordinary_slash_phrases(value):
 
     assert _safe_display_text(value) == value
     assert _contains_absolute_path(value) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "safe"),
+    [
+        (
+            r"https://example.com/a;b=/c/d#frag/path D:\secret\private\file.log!A2",
+            "https://example.com/a;b=/c/d#frag/path file.log!A2",
+        ),
+        (
+            r"ftp://example.com/a,b=/c/d \\server\share\private\file.log!B3",
+            "ftp://example.com/a,b=/c/d file.log!B3",
+        ),
+        (
+            "ftps://example.com/a(b)/c?next=/d/e#f/g /home/user/private/file",
+            "ftps://example.com/a(b)/c?next=/d/e#f/g file",
+        ),
+    ],
+)
+def test_safe_text_stops_url_protection_at_whitespace_before_local_path(value, safe):
+    from app.reporting.xlsx_review import _contains_absolute_path, _safe_display_text
+
+    assert _contains_absolute_path(value) is True
+    assert _safe_display_text(value) == safe
+    assert _contains_absolute_path(safe) is False
 
 
 @pytest.mark.parametrize(
@@ -1473,8 +1505,15 @@ def test_saved_workbook_validation_detects_path_leak_independently(
     [
         "https://example.com/a/b?next=/c/d#frag/path",
         "https://example.com?next=/a/b#section/path",
+        "https://example.com/a;b=/c/d#frag/path",
+        "https://example.com/a(b)/c?next=/d/e#f/g",
         "ftp://example.com/a/b?next=/c/d#frag/path",
+        "ftp://example.com/a,b=/c/d",
         "ftps://example.com/a/b?next=/c/d#frag/path",
+        "(https://example.com/a;b=/c/d#frag/path),.",
+        "참조,https://example.com/a(b)/c?next=/d/e#f/g,완료.",
+        "(ftp://example.com/a,b=/c/d).",
+        ".https://example.com/a;b=/c/d#frag/path.",
         "계획 /실적 비교",
         "계획/실적",
         "/실적",

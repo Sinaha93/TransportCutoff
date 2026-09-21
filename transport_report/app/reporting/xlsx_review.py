@@ -67,7 +67,7 @@ _ABSOLUTE_PATH_START = re.compile(
     r"(?i)(?<![\w/\\])(?:[A-Z]:[\\/]|\\\\(?=[^\\/\s])|//(?=[^/\s])|/(?=[^/\s]))"
 )
 _WEB_URL_TOKEN = re.compile(
-    r"(?i)(?<![\w+.-])(?:https?|ftps?)://[^\s\"'<>,;\)\]\}]+"
+    r"(?i)(?<![\w+])(?:https?|ftps?)://[^\s\"'<>]+"
 )
 _LOCATOR_SUFFIX = re.compile(r"(![A-Za-z0-9_$:.\-]+)$")
 _PATH_BOUNDARY = re.compile(r"[\r\n,;\)\]\}>]")
