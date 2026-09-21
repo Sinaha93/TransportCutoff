@@ -27,6 +27,7 @@ try {
         --noconfirm `
         --clean `
         --onedir `
+        --noconsole `
         --name TransportReport `
         --paths $projectRoot `
         app/launcher.py
