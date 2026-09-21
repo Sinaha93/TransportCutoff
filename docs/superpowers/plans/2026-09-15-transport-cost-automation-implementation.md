@@ -806,31 +806,31 @@ git commit -m "feat: generate existing six-slide report format"
 - Create: `transport_report/app/reporting/xlsx_review.py`
 - Create: `transport_report/tests/integration/test_xlsx_review.py`
 
-- [ ] **Step 1: Write the failing workbook test**
+- [x] **Step 1: Write the failing workbook test**
 
 Assert the workbook contains `월간 종합`, `운행실적`, `검증 결과`, and `마스터 기준` sheets, with `월간 종합` first and formula-error strings absent.
 
-- [ ] **Step 2: Run the test and verify failure**
+- [x] **Step 2: Run the test and verify failure**
 
 Run: `python -m pytest tests/integration/test_xlsx_review.py -v`
 
 Expected: FAIL because the exporter is missing.
 
-- [ ] **Step 3: Implement the export**
+- [x] **Step 3: Implement the export**
 
 Write calculated values as typed numbers, not string-formatted numbers. Include source file hash and import time in the input sheet. Freeze headers, apply filters, set sensible widths, and visually distinguish manual inputs, imported values, calculated results, warnings, and errors.
 
-- [ ] **Step 4: Add reconciliation assertions**
+- [x] **Step 4: Add reconciliation assertions**
 
 Reload the saved workbook with `data_only=False` and assert totals equal the report model, dates remain dates, percentages remain numeric, and no `#REF!`, `#DIV/0!`, `#VALUE!`, `#NAME?`, or `#N/A` strings exist.
 
-- [ ] **Step 5: Run Excel export tests**
+- [x] **Step 5: Run Excel export tests**
 
 Run: `python -m pytest tests/integration/test_xlsx_review.py -v`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Excel export**
+- [x] **Step 6: Commit Excel export**
 
 ```powershell
 git add transport_report/app/reporting/xlsx_review.py transport_report/tests/integration/test_xlsx_review.py
