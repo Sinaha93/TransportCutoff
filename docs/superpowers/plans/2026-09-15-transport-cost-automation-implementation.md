@@ -844,17 +844,17 @@ git commit -m "feat: export monthly review workbook"
 - Create: `transport_report/app/services/backup_service.py`
 - Create: `transport_report/tests/integration/test_report_service.py`
 
-- [ ] **Step 1: Write the failing end-to-end service tests**
+- [x] **Step 1: Write the failing end-to-end service tests**
 
 Test that generation is blocked when sales, quantity, alias, prior-year history, or next-month plan is missing. Test that a valid month produces one XLSX, one PPTX, and three chart images under a timestamped output directory.
 
-- [ ] **Step 2: Run the tests and verify failure**
+- [x] **Step 2: Run the tests and verify failure**
 
 Run: `python -m pytest tests/integration/test_report_service.py -v`
 
 Expected: FAIL because report orchestration is missing.
 
-- [ ] **Step 3: Implement report generation transaction**
+- [x] **Step 3: Implement report generation transaction**
 
 The service must:
 
@@ -867,17 +867,17 @@ The service must:
 7. atomically rename the directory to `runtime/outputs/YYYY-MM/run-YYYYMMDD-HHMMSS`;
 8. record file hashes and input revision in `report_runs`.
 
-- [ ] **Step 4: Implement SQLite backup and guarded restore**
+- [x] **Step 4: Implement SQLite backup and guarded restore**
 
 Use SQLite's online backup API. A backup file name contains the timestamp and schema version. Restore first validates the SQLite header and schema version, then creates an automatic pre-restore backup before replacing data.
 
-- [ ] **Step 5: Run service tests**
+- [x] **Step 5: Run service tests**
 
 Run: `python -m pytest tests/integration/test_report_service.py -v`
 
 Expected: PASS for failure cleanup, successful output, audit hashes, backup, and restore.
 
-- [ ] **Step 6: Commit orchestration**
+- [x] **Step 6: Commit orchestration**
 
 ```powershell
 git add transport_report/app/services transport_report/tests/integration/test_report_service.py
